@@ -7,6 +7,7 @@ use std::collections::HashMap;
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum RecipeExtensionConfigInternal {
+
     #[serde(rename = "stdio")]
     Stdio {
         name: String,
@@ -60,6 +61,8 @@ enum RecipeExtensionConfigInternal {
         env_keys: Vec<String>,
         #[serde(default)]
         headers: HashMap<String, String>,
+        #[serde(default)]
+        allowed_headers: Vec<String>,
         timeout: Option<u64>,
         #[serde(default)]
         socket: Option<String>,
@@ -141,6 +144,7 @@ impl From<RecipeExtensionConfigInternal> for ExtensionConfig {
                 envs,
                 env_keys,
                 headers,
+                allowed_headers,
                 timeout,
                 socket,
                 bundled,

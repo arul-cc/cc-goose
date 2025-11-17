@@ -850,16 +850,37 @@ impl ExtensionManager {
                 envs,
                 env_keys,
                 socket,
+                allowed_headers,
                 ..
             } => {
                 let config = Config::global();
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name, config).await?;
                 let resolved_uri = substitute_env_vars(uri, &all_envs);
-                let resolved_headers = headers
+                let mut resolved_headers: HashMap<String, String> = headers
                     .iter()
                     .map(|(k, v)| (k.clone(), substitute_env_vars(v, &all_envs)))
                     .collect();
                 let resolved_socket = socket.as_ref().map(|s| substitute_env_vars(s, &all_envs));
+                // Merge dynamic headers from session if available and allowed
+                if let Some(session_id) = crate::session_context::current_session_id() {
+                    if let Ok(session) = crate::session::SessionManager::instance().get_session(&session_id, false).await {
+                        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
+                            if let Some(headers_obj) = headers_value.as_object() {
+                                for (key, value) in headers_obj {
+                                    let allowed = allowed_headers;
+                                    if !allowed.is_empty() && !allowed.contains(key) {
+                                        tracing::debug!("[EXTENSION_MANAGER] Skipping header '{}' - not in allowed_headers list", key);
+                                        continue;
+                                    }
+                                    if let Some(val_str) = value.as_str() {
+                                        resolved_headers.insert(key.clone(), val_str.to_string());
+                                        tracing::info!("[EXTENSION_MANAGER] Merged header '{}' into HTTP client default headers", key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 create_streamable_http_client(
                     &resolved_uri,
                     *timeout,
@@ -1653,22 +1674,36 @@ impl ExtensionManager {
         let tool_name_str = tool_call.name.to_string();
         let resolved = self.resolve_tool(&ctx.session_id, &tool_name_str).await?;
 
-        if let Some(extension) = self.extensions.lock().await.get(&resolved.extension_name) {
-            if !extension
-                .config
-                .is_tool_available(&resolved.actual_tool_name)
-            {
-                return Err(ErrorData::new(
-                    ErrorCode::RESOURCE_NOT_FOUND,
-                    format!(
-                        "Tool '{}' is not available for extension '{}'",
-                        resolved.actual_tool_name, resolved.extension_name
-                    ),
-                    None,
-                )
-                .into());
+        // Check tool availability and get allowed headers in one lock
+        let allowed_headers = {
+            let extensions = self.extensions.lock().await;
+            if let Some(extension) = extensions.get(&resolved.extension_name) {
+                if !extension
+                    .config
+                    .is_tool_available(&resolved.actual_tool_name)
+                {
+                    return Err(ErrorData::new(
+                        ErrorCode::RESOURCE_NOT_FOUND,
+                        format!(
+                            "Tool '{}' is not available for extension '{}'",
+                            resolved.actual_tool_name, resolved.extension_name
+                        ),
+                        None,
+                    )
+                    .into());
+                }
+
+                // Get allowed headers based on extension type
+                match &extension.config {
+                    ExtensionConfig::StreamableHttp { allowed_headers, .. } => {
+                        Some(allowed_headers.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
             }
-        }
+        };
 
         let arguments = tool_call.arguments.clone();
         let client = resolved.client.clone();
@@ -1685,6 +1720,10 @@ impl ExtensionManager {
             ctx.tool_call_request_id.clone(),
         );
 
+        // Capture session_id before entering async closure to preserve context
+        // We use the passed session_id which ensures the tool runs in the correct session context
+        tracing::debug!("[EXTENSION_MANAGER] Using session_id for tool call: {}", session_id);
+
         let fut = async move {
             tracing::debug!(
                 "dispatch_tool_call: calling client.call_tool tool={} session_id={} working_dir={:?}",
@@ -1693,7 +1732,7 @@ impl ExtensionManager {
                 owned_ctx.working_dir,
             );
             let mut result = client
-                .call_tool(&owned_ctx, &actual_tool_name, arguments, cancellation_token)
+                .call_tool(&owned_ctx, &actual_tool_name, arguments, cancellation_token, allowed_headers)
                 .await
                 .map_err(|e| match e {
                     ServiceError::McpError(error_data) => error_data,
@@ -2087,6 +2126,7 @@ mod tests {
             name: &str,
             _arguments: Option<JsonObject>,
             _cancellation_token: CancellationToken,
+            _allowed_headers: Option<Vec<String>>,
         ) -> Result<CallToolResult, Error> {
             match name {
                 "tool" | "test__tool" | "available_tool" | "hidden_tool" => {

@@ -540,6 +540,7 @@ impl McpClientTrait for AppsManagerClient {
         name: &str,
         arguments: Option<JsonObject>,
         _cancel_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         let session_id = &ctx.session_id;
         let result = match name {
