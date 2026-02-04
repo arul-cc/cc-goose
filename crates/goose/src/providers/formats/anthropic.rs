@@ -288,10 +288,13 @@ fn format_messages_with_options(
             if let Some(content) = message.get_mut(CONTENT_FIELD) {
                 if let Some(content_array) = content.as_array_mut() {
                     if let Some(last_content) = content_array.last_mut() {
-                        last_content.as_object_mut().unwrap().insert(
-                            CACHE_CONTROL_FIELD.to_string(),
-                            json!({ TYPE_FIELD: "ephemeral" }),
-                        );
+                        let disable_cache = std::env::var("ANTHROPIC_DISABLE_CACHE").is_ok();
+                        if !disable_cache {
+                            last_content.as_object_mut().unwrap().insert(
+                                CACHE_CONTROL_FIELD.to_string(),
+                                json!({ TYPE_FIELD: "ephemeral" }),
+                            );
+                        }
                     }
                 }
             }
@@ -332,10 +335,17 @@ pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
     // Add "cache_control" to the last tool spec, if any. This means that all tool definitions,
     // will be cached as a single prefix.
     if let Some(last_tool) = tool_specs.last_mut() {
-        last_tool.as_object_mut().unwrap().insert(
-            CACHE_CONTROL_FIELD.to_string(),
-            json!({ TYPE_FIELD: "ephemeral" }),
-        );
+        let disable_cache = std::env::var("ANTHROPIC_DISABLE_CACHE").is_ok();
+        if !disable_cache {
+            let mut cache_control = json!({ TYPE_FIELD: "ephemeral" });
+            if let Ok(ttl) = std::env::var("ANTHROPIC_CACHE_TTL") {
+                cache_control.as_object_mut().unwrap().insert("ttl".to_string(), json!(ttl));
+            }
+            last_tool.as_object_mut().unwrap().insert(
+                CACHE_CONTROL_FIELD.to_string(),
+                cache_control,
+            );
+        }
     }
 
     tool_specs
@@ -343,11 +353,24 @@ pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
 
 /// Convert system message to Anthropic's API system specification
 pub fn format_system(system: &str) -> Value {
-    json!([{
+    let mut system_obj = json!({
         TYPE_FIELD: TEXT_TYPE,
-        TEXT_TYPE: system,
-        CACHE_CONTROL_FIELD: { TYPE_FIELD: "ephemeral" }
-    }])
+        TEXT_TYPE: system
+    });
+
+    let disable_cache = std::env::var("ANTHROPIC_DISABLE_CACHE").is_ok();
+    if !disable_cache {
+        let mut cache_control = json!({ TYPE_FIELD: "ephemeral" });
+        if let Ok(ttl) = std::env::var("ANTHROPIC_CACHE_TTL") {
+            cache_control.as_object_mut().unwrap().insert("ttl".to_string(), json!(ttl));
+        }
+        system_obj.as_object_mut().unwrap().insert(
+            CACHE_CONTROL_FIELD.to_string(),
+            cache_control
+        );
+    }
+    
+    json!([system_obj])
 }
 
 /// Convert Anthropic's API response to internal Message format
