@@ -246,6 +246,9 @@ pub struct Agent {
     container: Mutex<Option<Container>>,
     goal: Mutex<Option<String>>,
     grind: Mutex<Option<String>>,
+
+    /// Per-session provider overrides, keyed by session_id.
+    pub(super) session_providers: Arc<std::sync::Mutex<HashMap<String, Arc<dyn Provider>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -367,6 +370,7 @@ impl Agent {
             container: Mutex::new(None),
             goal: Mutex::new(None),
             grind: Mutex::new(None),
+            session_providers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -763,6 +767,111 @@ impl Agent {
         match &*self.provider.lock().await {
             Some(provider) => Ok(Arc::clone(provider)),
             None => Err(anyhow!("Provider not set")),
+        }
+    }
+
+    /// Get the provider for a specific session.
+    /// If the session has a per-session provider override, returns that.
+    /// Otherwise falls back to the default shared provider.
+    pub async fn provider_for_session(&self, session_id: &str) -> Result<Arc<dyn Provider>, anyhow::Error> {
+        // Check session-specific providers first.
+        // std::sync::Mutex is used here — lock is held only for a HashMap lookup (nanoseconds).
+        {
+            let providers = self.session_providers.lock()
+                .map_err(|e| anyhow::anyhow!("session_providers lock poisoned: {}", e))?;
+            if let Some(provider) = providers.get(session_id) {
+                tracing::trace!("[SESSION_PROVIDER] Using session-specific provider for {}", session_id);
+                return Ok(Arc::clone(provider));
+            }
+        }
+        // Fall back to default shared provider
+        self.provider().await
+    }
+
+    /// Check session headers and create/cache a session-specific provider if needed.
+    /// Looks for x-provider-name, x-model-name, x-api-key in the session's websocket_headers.
+    /// If all three are present, creates a new provider and caches it for this session.
+    /// If headers changed since last call, recreates the provider.
+    pub async fn ensure_session_provider(&self, session_id: &str) -> Result<()> {
+        tracing::debug!("[SESSION_PROVIDER] ensure_session_provider called for {}", session_id);
+
+        let session = self.config.session_manager.get_session(session_id, false).await?;
+
+        let ws_headers = match session.extension_data.get_extension_state("websocket_headers", "v0") {
+            Some(headers) => headers,
+            None => return Ok(()), // No websocket headers, use default provider
+        };
+
+        let headers_obj = match ws_headers.as_object() {
+            Some(obj) => obj,
+            None => return Ok(()),
+        };
+
+        // Extract provider headers (case-insensitive)
+        let mut provider_name = None;
+        let mut model_name = None;
+        let mut api_key = None;
+
+        for (k, v) in headers_obj {
+            let key_lower = k.to_lowercase();
+            if key_lower == "x-provider-name" {
+                provider_name = v.as_str().map(|s| s.to_string());
+            } else if key_lower == "x-model-name" {
+                model_name = v.as_str().map(|s| s.to_string());
+            } else if key_lower == "x-api-key" {
+                api_key = v.as_str().map(|s| s.to_string());
+            }
+        }
+
+        let (provider_name, model_name, api_key) = match (provider_name, model_name, api_key) {
+            (Some(p), Some(m), Some(k)) => (p, m, k),
+            _ => return Ok(()), // Missing headers, use default provider
+        };
+
+        // Check if we already have a cached provider with the same config.
+        // std::sync::Mutex — held only for a HashMap lookup (nanoseconds).
+        {
+            let providers = self.session_providers.lock()
+                .map_err(|e| anyhow::anyhow!("session_providers lock poisoned: {}", e))?;
+            if let Some(existing) = providers.get(session_id) {
+                let existing_config = existing.get_model_config();
+                if existing.get_name() == provider_name && existing_config.model_name == model_name {
+                    tracing::debug!("[SESSION_PROVIDER] Reusing cached provider for session {}", session_id);
+                    return Ok(()); // Same provider/model, keep using cached
+                }
+            }
+        }
+
+        // Create a new provider for this session (outside any lock)
+        tracing::info!(
+            "[SESSION_PROVIDER] Creating provider for session {}: provider={}, model={}",
+            session_id, provider_name, model_name
+        );
+
+        let provider = crate::providers::create_with_api_key(&provider_name, &model_name, &api_key)?;
+
+        // Brief lock just for the insert (nanoseconds).
+        {
+            let mut providers = self.session_providers.lock()
+                .map_err(|e| anyhow::anyhow!("session_providers lock poisoned: {}", e))?;
+            providers.insert(session_id.to_string(), provider);
+        }
+
+        tracing::info!(
+            "[SESSION_PROVIDER] Provider created and cached for session {}",
+            session_id
+        );
+
+        Ok(())
+    }
+
+    /// Remove the session-specific provider (cleanup on disconnect).
+    pub async fn remove_session_provider(&self, session_id: &str) {
+        let removed = self.session_providers.lock()
+            .map(|mut providers| providers.remove(session_id).is_some())
+            .unwrap_or(false);
+        if removed {
+            tracing::info!("[SESSION_PROVIDER] Removed provider for session {}", session_id);
         }
     }
 
@@ -1533,8 +1642,11 @@ impl Agent {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
 
+        // Resolve the provider once for this request to avoid repeated lock acquisitions.
+        let session_provider = self.provider_for_session(&session_config.id).await?;
+
         let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
+            session_provider.as_ref(),
             &conversation,
             None,
             &session,
@@ -1573,7 +1685,7 @@ impl Agent {
                 );
 
                 match compact_messages(
-                    self.provider().await?.as_ref(),
+                    session_provider.as_ref(),
                     &session_config.id,
                     &conversation_to_compact,
                     false,
@@ -1639,7 +1751,7 @@ impl Agent {
 
         self.reset_retry_attempts().await;
 
-        let provider = self.provider().await?;
+        let provider = self.provider_for_session(&session_config.id).await?;
         let provider_name = provider.get_name().to_string();
         let requested_model = provider.get_model_config().model_name;
         let inference = provider
@@ -1764,6 +1876,8 @@ impl Agent {
                     break;
                 }
 
+
+
                 let conversation_with_moim = super::moim::inject_moim(
                     &session_config.id,
                     conversation.clone(),
@@ -1772,7 +1886,7 @@ impl Agent {
                 ).await;
 
                 let mut stream = Self::stream_response_from_provider(
-                    self.provider().await?,
+                    Arc::clone(&session_provider),
                     &session_config.id,
                     &system_prompt,
                     conversation_with_moim.messages(),
@@ -1818,6 +1932,8 @@ impl Agent {
                     match next {
                         Ok((response, usage)) => {
                             compaction_attempts = 0;
+
+
 
                             if let Some(ref usage) = usage {
                                 self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), usage, false).await?;
@@ -2136,7 +2252,7 @@ impl Agent {
                             );
 
                             match compact_messages(
-                                self.provider().await?.as_ref(),
+                                session_provider.as_ref(),
                                 &session_config.id,
                                 &conversation,
                                 false,
@@ -2454,8 +2570,10 @@ impl Agent {
         let provider_name = provider.get_name().to_string();
         let model_config = provider.get_model_config();
 
-        let mut current_provider = self.provider.lock().await;
-        *current_provider = Some(provider);
+        {
+            let mut current_provider = self.provider.lock().await;
+            *current_provider = Some(provider);
+        }
 
         self.config
             .session_manager
@@ -2703,7 +2821,7 @@ impl Agent {
         let (extension_count, tool_count) = self.total_extension_and_tool_counts(session_id).await;
 
         // Get model name from provider
-        let provider = self.provider().await.map_err(|e| {
+        let provider = self.provider_for_session(session_id).await.map_err(|e| {
             tracing::error!("Failed to get provider for recipe creation: {}", e);
             e
         })?;

@@ -1708,6 +1708,7 @@ impl McpClientTrait for SummonClient {
         name: &str,
         arguments: Option<JsonObject>,
         cancellation_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         let session_id = &ctx.session_id;
         match name {
@@ -2044,7 +2045,7 @@ You review code."#;
 
         let ctx = ToolCallContext::new("test".to_string(), None, None);
         let result = client
-            .call_tool(&ctx, "unknown", None, CancellationToken::new())
+            .call_tool(&ctx, "unknown", None, CancellationToken::new(), None)
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));

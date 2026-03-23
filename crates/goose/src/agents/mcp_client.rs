@@ -173,13 +173,9 @@ impl GooseClient {
         self.working_dir.clone()
     }
 
+    #[cfg(test)]
     async fn set_session_id(&self, session_id: &str) {
-        let mut slot = self.session_id.lock().await;
-        assert!(
-            slot.as_deref().is_none_or(|s| s == session_id),
-            "McpClient received requests from different sessions"
-        );
-        *slot = Some(session_id.to_string());
+        *self.session_id.lock().await = Some(session_id.to_string());
     }
 
     async fn current_session_id(&self) -> Option<String> {
@@ -520,18 +516,24 @@ impl McpClient {
         request: ClientRequest,
         cancel_token: CancellationToken,
     ) -> Result<ServerResult, Error> {
+        // session_id is injected into the request's MCP extensions metadata so the
+        // server (and our own `create_message` callback via `resolve_session_id`) can
+        // identify the originating session without relying on mutable shared state.
         let request = inject_session_context_into_request(request, Some(session_id), working_dir);
-        // The inner mutex is held only for the send; the actual response wait
-        // happens outside the lock so concurrent calls can overlap.
+
+        // Hold the client mutex only long enough to send the request.
+        // The response wait happens outside the lock so concurrent sessions can
+        // send their requests without blocking on each other's responses.
         let handle = {
             let client = self.client.lock().await;
-            client.service().set_session_id(session_id).await;
-            client
+            let result = client
                 .send_cancellable_request(request, PeerRequestOptions::no_options())
-                .await
+                .await;
+            result
         }?;
 
-        await_response(handle, self.timeout, &cancel_token).await
+        let result = await_response(handle, self.timeout, &cancel_token).await;
+        result
     }
 }
 
@@ -589,7 +591,7 @@ impl McpClientTrait for McpClient {
                     let mut req = RequestOptionalParam::with_param(
                         PaginatedRequestParams::default().with_cursor(cursor),
                     );
-                    req.extensions = inject_session_into_extensions(Default::default(), None).await;
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ListResourcesRequest(req)
                 },
                 cancel_token,
@@ -614,7 +616,7 @@ impl McpClientTrait for McpClient {
                 None,
                 {
                     let mut req = Request::new(ReadResourceRequestParams::new(uri.to_string()));
-                    req.extensions = inject_session_into_extensions(Default::default(), None).await;
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ReadResourceRequest(req)
                 },
                 cancel_token,
@@ -641,7 +643,7 @@ impl McpClientTrait for McpClient {
                     let mut req = RequestOptionalParam::with_param(
                         PaginatedRequestParams::default().with_cursor(cursor),
                     );
-                    req.extensions = inject_session_into_extensions(Default::default(), None).await;
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ListToolsRequest(req)
                 },
                 cancel_token,
@@ -666,8 +668,14 @@ impl McpClientTrait for McpClient {
         if let Some(args) = arguments {
             params = params.with_arguments(args);
         }
+        // Inject websocket headers from session, filtered by allowed_headers
+        let extensions = inject_session_headers_into_extensions(
+            Default::default(),
+            &ctx.session_id,
+            allowed_headers,
+        ).await;
         let mut req = Request::new(params);
-        req.extensions = inject_session_into_extensions(Default::default(), allowed_headers).await;
+        req.extensions = extensions;
         let request = ClientRequest::CallToolRequest(req);
 
         let result = self
@@ -699,7 +707,7 @@ impl McpClientTrait for McpClient {
                     let mut req = RequestOptionalParam::with_param(
                         PaginatedRequestParams::default().with_cursor(cursor),
                     );
-                    req.extensions = inject_session_into_extensions(Default::default(), None).await;
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ListPromptsRequest(req)
                 },
                 cancel_token,
@@ -733,7 +741,7 @@ impl McpClientTrait for McpClient {
                 None,
                 {
                     let mut req = Request::new(params);
-                    req.extensions = inject_session_into_extensions(Default::default(), None).await;
+                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::GetPromptRequest(req)
                 },
                 cancel_token,
@@ -795,49 +803,40 @@ fn inject_session_context_into_extensions(
 }
 
 /// Injects dynamic headers from session into extensions, filtered by allowed_headers.
-async fn inject_session_into_extensions(
+async fn inject_session_headers_into_extensions(
     mut extensions: rmcp::model::Extensions,
+    session_id: &str,
     allowed_headers: Option<Vec<String>>,
 ) -> rmcp::model::Extensions {
     use rmcp::model::Meta;
 
-    let session_id_opt = crate::session_context::current_session_id();
+    let mut meta_map = extensions
+        .get::<Meta>()
+        .map(|meta| meta.0.clone())
+        .unwrap_or_default();
 
-    if let Some(session_id) = session_id_opt {
-        let mut meta_map = extensions
-            .get::<Meta>()
-            .map(|meta| meta.0.clone())
-            .unwrap_or_default();
-
-        // JsonObject is case-sensitive, so we use retain for case-insensitive removal
-        meta_map.retain(|k, _| !k.eq_ignore_ascii_case(SESSION_ID_HEADER));
-
-        meta_map.insert(SESSION_ID_HEADER.to_string(), Value::String(session_id.clone()));
-
-        // Inject dynamic headers from session if available
-        if let Ok(session) = crate::session::SessionManager::instance().get_session(&session_id, false).await {
-            if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
-                if let Some(headers_obj) = headers_value.as_object() {
-                    let mut headers_map = serde_json::Map::new();
-                    for (key, value) in headers_obj {
-                        // Filter by allowed_headers if provided
-                        if let Some(ref allowed) = allowed_headers {
-                            if !allowed.is_empty() && !allowed.contains(key) {
-                                continue;
-                            }
+    // Inject dynamic headers from session if available
+    if let Ok(session) = crate::session::SessionManager::instance().get_session(session_id, false).await {
+        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
+            if let Some(headers_obj) = headers_value.as_object() {
+                let mut headers_map = serde_json::Map::new();
+                for (key, value) in headers_obj {
+                    // Filter by allowed_headers if provided
+                    if let Some(ref allowed) = allowed_headers {
+                        if !allowed.is_empty() && !allowed.contains(key) {
+                            continue;
                         }
-                        headers_map.insert(key.clone(), value.clone());
                     }
-                    if !headers_map.is_empty() {
-                        meta_map.insert("websocket_headers".to_string(), Value::Object(headers_map));
-                    }
+                    headers_map.insert(key.clone(), value.clone());
+                }
+                if !headers_map.is_empty() {
+                    meta_map.insert("websocket_headers".to_string(), Value::Object(headers_map));
                 }
             }
         }
-
-        extensions.insert(Meta(meta_map));
     }
 
+    extensions.insert(Meta(meta_map));
     extensions
 }
 
