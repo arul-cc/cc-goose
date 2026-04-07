@@ -408,6 +408,7 @@ impl McpClientTrait for AcpTools {
         name: &str,
         arguments: Option<rmcp::model::JsonObject>,
         cancellation_token: CancellationToken,
+        allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, McpError> {
         match name {
             "read" if self.fs_read => self
@@ -428,7 +429,7 @@ impl McpClientTrait for AcpTools {
                 .map(|r| r.with_acp_aware_meta()),
             _ => {
                 self.inner
-                    .call_tool(ctx, name, arguments, cancellation_token)
+                    .call_tool(ctx, name, arguments, cancellation_token, allowed_headers)
                     .await
             }
         }

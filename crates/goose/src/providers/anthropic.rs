@@ -277,6 +277,9 @@ impl AnthropicProvider {
             }
         }
 
+        println!("Anthropic Request payload: {}", payload);
+        eprintln!("Anthropic Request payload: {:?}", payload);
+
         Ok(request.api_post(payload).await?)
     }
 

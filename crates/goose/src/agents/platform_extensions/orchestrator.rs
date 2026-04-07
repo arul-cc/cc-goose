@@ -614,6 +614,7 @@ impl McpClientTrait for OrchestratorClient {
         name: &str,
         arguments: Option<JsonObject>,
         cancel_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         let result = match name {
             "list_sessions" => self.handle_list_sessions(arguments).await,

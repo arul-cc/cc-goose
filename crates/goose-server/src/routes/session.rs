@@ -16,6 +16,7 @@ use goose::session::nostr_share;
 use goose::session::session_manager::{SessionInsights, SessionType};
 use goose::session::{EnabledExtensionsState, Session};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -611,6 +612,53 @@ async fn get_session_extensions(
     Ok(Json(SessionExtensionsResponse { extensions }))
 }
 
+#[utoipa::path(
+    put,
+    path = "/sessions/{session_id}/extension_data",
+    request_body = HashMap<String, Value>,
+    params(
+        ("session_id" = String, Path, description = "Unique identifier for the session")
+    ),
+    responses(
+        (status = 200, description = "Extension data updated successfully"),
+        (status = 401, description = "Unauthorized - Invalid or missing API key"),
+        (status = 404, description = "Session not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("api_key" = [])
+    ),
+    tag = "Session Management"
+)]
+async fn update_extension_data(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(incoming): Json<HashMap<String, Value>>,
+) -> Result<StatusCode, StatusCode> {
+    // Get existing session to merge extension data
+    let session = state
+        .session_manager()
+        .get_session(&session_id, false)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Merge incoming keys into existing extension_data
+    let mut merged = session.extension_data;
+    for (key, value) in incoming {
+        merged.extension_states.insert(key, value);
+    }
+
+    state
+        .session_manager()
+        .update(&session_id)
+        .extension_data(merged)
+        .apply()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::OK)
+}
+
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/sessions", get(list_sessions))
@@ -640,6 +688,10 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route(
             "/sessions/{session_id}/extensions",
             get(get_session_extensions),
+        )
+        .route(
+            "/sessions/{session_id}/extension_data",
+            put(update_extension_data),
         )
         .with_state(state)
 }

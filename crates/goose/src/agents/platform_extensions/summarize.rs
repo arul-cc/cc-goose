@@ -103,6 +103,7 @@ impl McpClientTrait for SummarizeClient {
         name: &str,
         arguments: Option<JsonObject>,
         _cancellation_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         if name != "summarize" {
             return Ok(CallToolResult::error(vec![Content::text(format!(

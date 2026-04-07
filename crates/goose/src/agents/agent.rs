@@ -1642,6 +1642,13 @@ impl Agent {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
 
+        // Create/update session-specific provider from websocket headers if available.
+        // This reads x-provider-name, x-model-name, x-api-key from session's websocket_headers
+        // and creates a per-session provider so different users can use different LLM backends.
+        if let Err(e) = self.ensure_session_provider(&session_config.id).await {
+            tracing::warn!("[SESSION_PROVIDER] Failed to set session provider: {}", e);
+        }
+
         // Resolve the provider once for this request to avoid repeated lock acquisitions.
         let session_provider = self.provider_for_session(&session_config.id).await?;
 

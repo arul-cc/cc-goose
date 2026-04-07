@@ -510,6 +510,144 @@ pub(crate) fn substitute_env_vars(value: &str, env_map: &HashMap<String, String>
 const GOOSE_USER_AGENT: reqwest::header::HeaderValue =
     reqwest::header::HeaderValue::from_static(concat!("goose/", env!("CARGO_PKG_VERSION")));
 
+/// A wrapper around `reqwest::Client` that dynamically injects session-specific
+/// headers (from `extension_data["websocket_headers.v0"]`) on every HTTP request.
+///
+/// This makes header forwarding multi-tenant safe: each request reads the current
+/// session's headers at call time, so different users get their own headers.
+#[derive(Clone, Debug)]
+struct DynamicHeaderClient {
+    inner: reqwest::Client,
+    /// The session ID to read headers from. Set when creating per-session clients.
+    session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Only headers in this list (case-insensitive) are forwarded.
+    allowed_headers: Vec<String>,
+}
+
+impl DynamicHeaderClient {
+    fn new(inner: reqwest::Client, allowed_headers: Vec<String>) -> Self {
+        Self {
+            inner,
+            session_id: Arc::new(tokio::sync::Mutex::new(None)),
+            allowed_headers,
+        }
+    }
+
+    /// Set the session ID for this client so it knows which session's headers to read.
+    async fn set_session_id(&self, sid: String) {
+        let mut lock = self.session_id.lock().await;
+        *lock = Some(sid);
+    }
+
+    /// Read the current session's websocket headers, filtered by allowed_headers.
+    /// Returns them as HTTP HeaderName/HeaderValue pairs ready to inject.
+    async fn get_dynamic_headers(&self) -> HashMap<axum::http::HeaderName, axum::http::HeaderValue> {
+        let mut result = HashMap::new();
+
+        let sid = {
+            let lock = self.session_id.lock().await;
+            match lock.as_ref() {
+                Some(s) => s.clone(),
+                None => return result,
+            }
+        };
+
+        if self.allowed_headers.is_empty() {
+            return result;
+        }
+
+        let allowed_lower: Vec<String> = self.allowed_headers.iter().map(|h| h.to_lowercase()).collect();
+
+        let session = match crate::session::SessionManager::instance().get_session(&sid, false).await {
+            Ok(s) => s,
+            Err(_) => return result,
+        };
+
+        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
+            if let Some(headers_obj) = headers_value.as_object() {
+                for (key, value) in headers_obj {
+                    if !allowed_lower.contains(&key.to_lowercase()) {
+                        continue;
+                    }
+                    if let Some(val_str) = value.as_str() {
+                        if let (Ok(hname), Ok(hval)) = (
+                            axum::http::HeaderName::try_from(key.as_str()),
+                            axum::http::HeaderValue::from_str(val_str),
+                        ) {
+                            eprintln!("[DynamicHeaderClient] Injecting header '{}' for session {}", key, sid);
+                            result.insert(hname, hval);
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[DynamicHeaderClient] Injecting {} headers for session {}",
+            result.len(), sid
+        );
+
+        result
+    }
+
+    /// Merge dynamic session headers into the custom_headers map.
+    async fn merge_headers(&self, custom_headers: &mut HashMap<axum::http::HeaderName, axum::http::HeaderValue>) {
+        let dynamic = self.get_dynamic_headers().await;
+        custom_headers.extend(dynamic);
+    }
+}
+
+impl rmcp::transport::streamable_http_client::StreamableHttpClient for DynamicHeaderClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_token: Option<String>,
+        mut custom_headers: HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) -> Result<
+        rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+        StreamableHttpError<Self::Error>,
+    > {
+        self.merge_headers(&mut custom_headers).await;
+        self.inner
+            .post_message(uri, message, session_id, auth_token, custom_headers)
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_token: Option<String>,
+        mut custom_headers: HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        self.merge_headers(&mut custom_headers).await;
+        self.inner
+            .delete_session(uri, session_id, auth_token, custom_headers)
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_token: Option<String>,
+        mut custom_headers: HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<sse_stream::Sse, rmcp::transport::streamable_http_client::SseError>>,
+        StreamableHttpError<Self::Error>,
+    > {
+        self.merge_headers(&mut custom_headers).await;
+        self.inner
+            .get_stream(uri, session_id, last_event_id, auth_token, custom_headers)
+            .await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_with_auth(
     auth_manager: rmcp::transport::AuthorizationManager,
@@ -571,6 +709,8 @@ async fn create_streamable_http_client(
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
     roots_dir: &std::path::Path,
+    allowed_headers: &[String],
+    session_id: Option<&str>,
 ) -> ExtensionResult<Box<dyn McpClientTrait>> {
     #[cfg(unix)]
     if let Some(socket_path) = socket {
@@ -620,8 +760,14 @@ async fn create_streamable_http_client(
         .build()
         .map_err(|_| ExtensionError::ConfigError("could not construct http client".to_string()))?;
 
+    // Wrap in DynamicHeaderClient to inject session headers per-request
+    let dynamic_client = DynamicHeaderClient::new(http_client, allowed_headers.to_vec());
+    if let Some(sid) = session_id {
+        dynamic_client.set_session_id(sid.to_string()).await;
+    }
+
     let transport = StreamableHttpClientTransport::with_client(
-        http_client,
+        dynamic_client,
         StreamableHttpClientTransportConfig::with_uri(uri),
     );
 
@@ -861,30 +1007,12 @@ impl ExtensionManager {
                 let config = Config::global();
                 let all_envs = merge_environments(envs, env_keys, &sanitized_name, config).await?;
                 let resolved_uri = substitute_env_vars(uri, &all_envs);
-                let mut resolved_headers: HashMap<String, String> = headers
+                let resolved_headers: HashMap<String, String> = headers
                     .iter()
                     .map(|(k, v)| (k.clone(), substitute_env_vars(v, &all_envs)))
                     .collect();
                 let resolved_socket = socket.as_ref().map(|s| substitute_env_vars(s, &all_envs));
-                // Merge dynamic headers from session if available and allowed
-                if let Some(session_id) = crate::session_context::current_session_id() {
-                    if let Ok(session) = crate::session::SessionManager::instance().get_session(&session_id, false).await {
-                        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
-                            if let Some(headers_obj) = headers_value.as_object() {
-                                for (key, value) in headers_obj {
-                                    if !allowed_headers.is_empty() && !allowed_headers.contains(key) {
-                                        tracing::debug!("[EXTENSION_MANAGER] Skipping header '{}' - not in allowed_headers list", key);
-                                        continue;
-                                    }
-                                    if let Some(val_str) = value.as_str() {
-                                        resolved_headers.insert(key.clone(), val_str.to_string());
-                                        tracing::info!("[EXTENSION_MANAGER] Merged header '{}' into HTTP client default headers", key);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let session_id = crate::session_context::current_session_id();
                 let client = create_streamable_http_client(
                     &resolved_uri,
                     *timeout,
@@ -896,6 +1024,8 @@ impl ExtensionManager {
                     self.client_name.clone(),
                     self.mcp_client_capabilities(),
                     &effective_working_dir,
+                    allowed_headers,
+                    session_id.as_deref(),
                 )
                 .await?;
                 (client, Some(resolved_headers))
@@ -1129,7 +1259,7 @@ impl ExtensionManager {
     }
 
     pub async fn update_working_dir(&self, new_dir: &std::path::Path) {
-        let extensions = self.extensions.lock().await;
+        let extensions = self.extensions.read().await;
         for (name, ext) in extensions.iter() {
             if let Err(e) = ext.client.update_working_dir(new_dir.to_path_buf()).await {
                 tracing::warn!(extension = %name, error = %e, "failed to update roots");
@@ -1314,6 +1444,18 @@ impl ExtensionManager {
                 };
 
                 let expose_unprefixed = is_unprefixed_extension(&config);
+
+                // Debug: log available_tools filter for this extension
+                let available_tools_debug = match &config {
+                    crate::agents::extension::ExtensionConfig::StreamableHttp { available_tools, .. } => {
+                        format!("{:?}", available_tools)
+                    }
+                    _ => "N/A (not StreamableHttp)".to_string(),
+                };
+                eprintln!(
+                    "[EXTENSION_TOOLS] Extension '{}': available_tools filter = {}, total tools from server = {}",
+                    name, available_tools_debug, client_tools.tools.len()
+                );
 
                 loop {
                     for mut tool in client_tools.tools {
@@ -1737,10 +1879,8 @@ impl ExtensionManager {
         );
 
         // Capture session_id before entering async closure to preserve context
-        // We use the passed session_id which ensures the tool runs in the correct session context
-        tracing::debug!("[EXTENSION_MANAGER] Using session_id for tool call: {}", session_id);
+        tracing::debug!("[EXTENSION_MANAGER] Using session_id for tool call: {}", ctx.session_id);
 
-        let fut_session_id = session_id.clone();
         let fut = async move {
             tracing::debug!(
                 "dispatch_tool_call: calling client.call_tool tool={} session_id={} working_dir={:?}",
@@ -1962,8 +2102,12 @@ impl ExtensionManager {
             }
         };
 
+        // For StreamableHttp extensions, use per-session clients so each session
+        // gets its own MCP session-id. The DynamicHeaderClient wrapper reads
+        // websocket headers from the session on every HTTP request, making this
+        // multi-tenant safe (different users get their own headers per-request).
         if let Some(sid) = session_id {
-            if let ExtensionConfig::StreamableHttp { uri, timeout, name, .. } = &config {
+            if let ExtensionConfig::StreamableHttp { uri, timeout, name, allowed_headers, .. } = &config {
                 {
                     let lock = session_clients.lock().await;
                     if let Some(c) = lock.get(sid) {
@@ -1972,10 +2116,15 @@ impl ExtensionManager {
                 }
 
                 let headers = resolved_headers.unwrap_or_default();
+
                 let capability = GooseMcpClientCapabilities {
                     mcpui: self.capabilities.mcpui,
                 };
 
+                let roots_dir = std::env::var("GOOSE_WORKING_DIR")
+                    .ok()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 match create_streamable_http_client(
                     uri,
                     *timeout,
@@ -1984,6 +2133,9 @@ impl ExtensionManager {
                     self.provider.clone(),
                     self.client_name.clone(),
                     capability,
+                    &roots_dir,
+                    allowed_headers,
+                    Some(sid),
                 ).await {
                     Ok(new_client) => {
                         let arc_client: McpClientBox = Arc::from(new_client);
@@ -2729,13 +2881,13 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(em.extensions.lock().await.len(), 1);
+        assert_eq!(em.extensions.read().await.len(), 1);
 
         // Calling add_extension with the same config must be a no-op (Ok, count unchanged).
         let result = em.add_extension(config, None, None, None).await;
         assert!(result.is_ok(), "identical config should be a no-op");
         assert_eq!(
-            em.extensions.lock().await.len(),
+            em.extensions.read().await.len(),
             1,
             "extension must not be removed on no-op"
         );
@@ -2775,7 +2927,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(em.extensions.lock().await.len(), 1);
+        assert_eq!(em.extensions.read().await.len(), 1);
 
         // add_extension with changed config attempts to create a new client (fails here
         // because Frontend configs cannot be added as server extensions), but must preserve
@@ -2783,7 +2935,7 @@ mod tests {
         let result = em.add_extension(config_b, None, None, None).await;
         assert!(result.is_err(), "Frontend add_extension must return Err");
         assert_eq!(
-            em.extensions.lock().await.len(),
+            em.extensions.read().await.len(),
             1,
             "old extension must be preserved when replacement client creation fails"
         );
