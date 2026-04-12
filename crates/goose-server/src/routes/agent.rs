@@ -326,6 +326,37 @@ async fn start_agent(
             }
         })?;
 
+    if let Some(ref recipe) = session.recipe {
+        match build_recipe_with_parameter_values(
+            recipe,
+            session.user_recipe_values.clone().unwrap_or_default(),
+        )
+        .await
+        {
+            Ok(Some(recipe)) => {
+                let agent = state
+                    .get_agent_for_route(session.id.clone())
+                    .await
+                    .map_err(|status| ErrorResponse {
+                        message: format!("Failed to get agent: {}", status),
+                        status,
+                    })?;
+                if let Some(prompt) = apply_recipe_to_agent(&agent, &recipe, true).await {
+                    agent
+                        .extend_system_prompt("recipe".to_string(), prompt)
+                        .await;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ErrorResponse {
+                    message: e.to_string(),
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                });
+            }
+        }
+    }
+
     // Eagerly start loading extensions in the background
     let session_for_spawn = session.clone();
     let state_for_spawn = state.clone();
