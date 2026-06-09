@@ -7,7 +7,6 @@ use std::collections::HashMap;
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum RecipeExtensionConfigInternal {
-
     #[serde(rename = "stdio")]
     Stdio {
         name: String,
