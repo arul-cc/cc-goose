@@ -20,20 +20,28 @@ use goose::config::{
     PermissionManager,
 };
 use goose::model::ModelConfig;
+#[cfg(feature = "telemetry")]
 use goose::posthog::{get_telemetry_choice, TELEMETRY_ENABLED_KEY};
 use goose::providers::base::ConfigKey;
-use goose::providers::formats::anthropic::supports_adaptive_thinking;
 use goose::providers::provider_test::test_provider_configuration;
 use goose::providers::{create, providers, retry_operation, RetryConfig};
 use goose::session::SessionType;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 
 // useful for light themes where there is no discernible colour contrast between
 // cursor-selected and cursor-unselected items.
 const MULTISELECT_VISIBILITY_HINT: &str = "<";
 
 pub async fn handle_configure() -> anyhow::Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "goose configure requires an interactive terminal.\n\
+             If you installed via 'curl ... | bash', run 'goose configure' separately after installation."
+        );
+    }
+
     let config = Config::global();
 
     if !config.exists() {
@@ -43,6 +51,7 @@ pub async fn handle_configure() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "telemetry")]
 pub fn configure_telemetry_consent_dialog() -> anyhow::Result<bool> {
     let config = Config::global();
 
@@ -113,6 +122,7 @@ async fn handle_first_time_setup(config: &Config) -> anyhow::Result<()> {
     );
     println!();
 
+    #[cfg(feature = "telemetry")]
     configure_telemetry_consent_dialog()?;
 
     println!();
@@ -316,7 +326,7 @@ async fn handle_existing_config() -> anyhow::Result<()> {
         "remove" => remove_extension_dialog(),
         "settings" => configure_settings_dialog().await,
         "providers" => configure_provider_dialog().await.map(|_| ()),
-        "custom_providers" => configure_custom_provider_dialog(),
+        "custom_providers" => configure_custom_provider_dialog().await,
         _ => unreachable!(),
     }
 }
@@ -726,15 +736,13 @@ pub async fn configure_provider_dialog() -> anyhow::Result<bool> {
 
     let spin = spinner();
     spin.start("Attempting to fetch supported models...");
-    let models_res = {
-        let temp_model_config =
-            ModelConfig::new(&provider_meta.default_model)?.with_canonical_limits(provider_name);
-        let temp_provider = create(provider_name, temp_model_config, Vec::new()).await?;
-        retry_operation(&RetryConfig::default(), || async {
-            temp_provider.fetch_recommended_models().await
-        })
-        .await
-    };
+    let temp_model_config =
+        ModelConfig::new(&provider_meta.default_model)?.with_canonical_limits(provider_name);
+    let temp_provider = create(provider_name, temp_model_config, Vec::new()).await?;
+    let models_res = retry_operation(&RetryConfig::default(), || async {
+        temp_provider.fetch_recommended_models().await
+    })
+    .await;
     spin.stop(style("Model fetch complete").green());
 
     // Select a model: on fetch error show styled error and abort; if models available, show list; otherwise free-text input
@@ -754,58 +762,24 @@ pub async fn configure_provider_dialog() -> anyhow::Result<bool> {
         }
     };
 
-    if model.to_lowercase().starts_with("gemini-3") {
-        let thinking_level: &str = cliclack::select("Select thinking level for Gemini 3:")
-            .item("low", "Low - Better latency, lighter reasoning", "")
-            .item("high", "High - Deeper reasoning, higher latency", "")
-            .interact()?;
-        config.set_gemini3_thinking_level(thinking_level)?;
-    }
+    {
+        let supports_thinking = match temp_provider.fetch_model_info(&model).await {
+            Ok(model_info) => model_info.reasoning,
+            Err(_) => goose::model::ModelConfig::new(&model)
+                .map(|c| c.is_reasoning_model())
+                .unwrap_or(false),
+        };
 
-    if model.to_lowercase().starts_with("claude-") {
-        let supports_adaptive = supports_adaptive_thinking(&model);
-
-        let mut thinking_select = cliclack::select("Select extended thinking mode for Claude:");
-        if supports_adaptive {
-            thinking_select = thinking_select.item(
-                "adaptive",
-                "Adaptive - Claude decides when and how much to think (recommended)",
-                "",
-            );
-        }
-        thinking_select = thinking_select
-            .item("enabled", "Enabled - Fixed token budget for thinking", "")
-            .item("disabled", "Disabled - No extended thinking", "");
-        if supports_adaptive {
-            thinking_select = thinking_select.initial_value("adaptive");
-        } else {
-            thinking_select = thinking_select.initial_value("disabled");
-        }
-        let thinking_type: &str = thinking_select.interact()?;
-        config.set_claude_thinking_type(thinking_type)?;
-
-        if thinking_type == "adaptive" {
-            let effort: &str = cliclack::select("Select adaptive thinking effort level:")
-                .item("low", "Low - Minimal thinking, fastest responses", "")
+        if supports_thinking {
+            let effort: &str = cliclack::select("Select thinking effort:")
+                .item("off", "Off - No extended thinking", "")
+                .item("low", "Low - Better latency, lighter reasoning", "")
                 .item("medium", "Medium - Moderate thinking", "")
-                .item("high", "High - Deep reasoning (default)", "")
-                .item(
-                    "max",
-                    "Max - No constraints on thinking depth (Opus 4.6 only)",
-                    "",
-                )
-                .initial_value("high")
+                .item("high", "High - Deep reasoning", "")
+                .item("max", "Max - No constraints on thinking depth", "")
+                .initial_value("off")
                 .interact()?;
-            config.set_claude_thinking_effort(effort)?;
-        } else if thinking_type == "enabled" {
-            let budget: String = cliclack::input("Enter thinking budget (tokens):")
-                .default_input("16000")
-                .validate(|input: &String| match input.parse::<i32>() {
-                    Ok(n) if n > 0 => Ok(()),
-                    _ => Err("Please enter a valid positive number"),
-                })
-                .interact()?;
-            config.set_claude_thinking_budget(budget.parse::<i32>()?)?;
+            config.set_goose_thinking_effort(effort)?;
         }
     }
 
@@ -821,14 +795,17 @@ pub async fn configure_provider_dialog() -> anyhow::Result<bool> {
     match test_provider_configuration(provider_name, &model, toolshim_enabled, toolshim_model).await
     {
         Ok(()) => {
-            config.set_goose_provider(provider_name)?;
-            config.set_goose_model(&model)?;
+            goose::config::set_active_provider(config, provider_name, &model)?;
             print_config_file_saved()?;
             Ok(true)
         }
         Err(e) => {
             spin.stop(style(e.to_string()).red());
-            cliclack::outro(style("Failed to configure provider: init chat completion request with tool did not succeed.").on_red().white())?;
+            cliclack::outro(
+                style(format!("Failed to configure provider: {e}"))
+                    .on_red()
+                    .white(),
+            )?;
             Ok(false)
         }
     }
@@ -1082,9 +1059,13 @@ fn configure_stdio_extension() -> anyhow::Result<()> {
 
     let timeout = prompt_extension_timeout()?;
 
-    let mut parts = command_str.split_whitespace();
-    let cmd = parts.next().unwrap_or("").to_string();
-    let args: Vec<String> = parts.map(String::from).collect();
+    let mut parts = goose::utils::split_command_args(&command_str)?;
+    let cmd = if parts.is_empty() {
+        String::new()
+    } else {
+        parts.remove(0)
+    };
+    let args = parts;
 
     let description = prompt_extension_description()?;
     let (envs, env_keys) = collect_env_vars()?;
@@ -1142,8 +1123,10 @@ fn configure_streamable_http_extension() -> anyhow::Result<()> {
             headers,
             description,
             timeout: Some(timeout),
+            socket: None,
             bundled: None,
             available_tools: Vec::new(),
+            allowed_headers: Vec::new(),
         },
     });
 
@@ -1243,13 +1226,21 @@ pub fn remove_extension_dialog() -> anyhow::Result<()> {
 }
 
 pub async fn configure_settings_dialog() -> anyhow::Result<()> {
-    let setting_type = cliclack::select("What setting would you like to configure?")
-        .item("goose_mode", "goose mode", "Configure goose mode")
-        .item(
+    #[allow(unused_mut)]
+    let mut setting_select = cliclack::select("What setting would you like to configure?").item(
+        "goose_mode",
+        "goose mode",
+        "Configure goose mode",
+    );
+    #[cfg(feature = "telemetry")]
+    {
+        setting_select = setting_select.item(
             "telemetry",
             "Telemetry",
             "Enable or disable anonymous usage data collection",
-        )
+        );
+    }
+    let setting_type = setting_select
         .item(
             "tool_permission",
             "Tool Permission",
@@ -1288,6 +1279,7 @@ pub async fn configure_settings_dialog() -> anyhow::Result<()> {
         "goose_mode" => {
             configure_goose_mode_dialog()?;
         }
+        #[cfg(feature = "telemetry")]
         "telemetry" => {
             configure_telemetry_dialog()?;
         }
@@ -1325,7 +1317,9 @@ pub fn configure_goose_mode_dialog() -> anyhow::Result<()> {
     let config = Config::global();
 
     if std::env::var("GOOSE_MODE").is_ok() {
-        let _ = cliclack::log::info("Notice: GOOSE_MODE environment variable is set and will override the configuration here.");
+        let _ = cliclack::log::info(
+            "Notice: GOOSE_MODE environment variable is set and will override the configuration here.",
+        );
     }
 
     let mode = cliclack::select("Which goose mode would you like to configure?")
@@ -1362,11 +1356,14 @@ pub fn configure_goose_mode_dialog() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "telemetry")]
 pub fn configure_telemetry_dialog() -> anyhow::Result<()> {
     let config = Config::global();
 
     if std::env::var("GOOSE_TELEMETRY_OFF").is_ok() {
-        let _ = cliclack::log::info("Notice: GOOSE_TELEMETRY_OFF environment variable is set and will override the configuration here.");
+        let _ = cliclack::log::info(
+            "Notice: GOOSE_TELEMETRY_OFF environment variable is set and will override the configuration here.",
+        );
     }
 
     let current_choice = get_telemetry_choice();
@@ -1397,7 +1394,9 @@ pub fn configure_tool_output_dialog() -> anyhow::Result<()> {
     let config = Config::global();
 
     if std::env::var("GOOSE_CLI_MIN_PRIORITY").is_ok() {
-        let _ = cliclack::log::info("Notice: GOOSE_CLI_MIN_PRIORITY environment variable is set and will override the configuration here.");
+        let _ = cliclack::log::info(
+            "Notice: GOOSE_CLI_MIN_PRIORITY environment variable is set and will override the configuration here.",
+        );
     }
     let tool_log_level = cliclack::select("Which tool output would you like to show?")
         .item("high", "High Importance", "")
@@ -1428,7 +1427,9 @@ pub fn configure_keyring_dialog() -> anyhow::Result<()> {
     let config = Config::global();
 
     if std::env::var("GOOSE_DISABLE_KEYRING").is_ok() {
-        let _ = cliclack::log::info("Notice: GOOSE_DISABLE_KEYRING environment variable is set and will override the configuration here.");
+        let _ = cliclack::log::info(
+            "Notice: GOOSE_DISABLE_KEYRING environment variable is set and will override the configuration here.",
+        );
     }
 
     let currently_disabled = config.get_param::<String>("GOOSE_DISABLE_KEYRING").is_ok();
@@ -1440,7 +1441,11 @@ pub fn configure_keyring_dialog() -> anyhow::Result<()> {
     };
 
     let _ = cliclack::log::info(format!("Current secret storage: {}", current_status));
-    let _ = cliclack::log::warning("Note: Disabling the keyring stores secrets in a plain text file (~/.config/goose/secrets.yaml)");
+    let secrets_path = Paths::config_dir().join("secrets.yaml");
+    let _ = cliclack::log::warning(format!(
+        "Note: Disabling the keyring stores secrets in a plain text file ({})",
+        secrets_path.display()
+    ));
 
     let storage_option = cliclack::select("How would you like to store secrets?")
         .item(
@@ -1466,9 +1471,10 @@ pub fn configure_keyring_dialog() -> anyhow::Result<()> {
         "file" => {
             // Set the disable flag to use file storage
             config.set_param("GOOSE_DISABLE_KEYRING", Value::String("true".to_string()))?;
-            cliclack::outro(
-                "Secret storage set to file (~/.config/goose/secrets.yaml). Keep this file secure!",
-            )?;
+            cliclack::outro(format!(
+                "Secret storage set to file ({}). Keep this file secure!",
+                secrets_path.display(),
+            ))?;
             let _ =
                 cliclack::log::info("You may need to restart goose for this change to take effect");
         }
@@ -1557,6 +1563,7 @@ pub async fn configure_tool_permissions_dialog() -> anyhow::Result<()> {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             "Tool Permission Configuration".to_string(),
             SessionType::Hidden,
+            agent.config.goose_mode,
         )
         .await?;
 
@@ -1815,7 +1822,9 @@ pub async fn handle_openrouter_auth() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("⚠️  Configuration test failed: {}", e);
-                    eprintln!("Your settings have been saved, but there may be an issue with the connection.");
+                    eprintln!(
+                        "Your settings have been saved, but there may be an issue with the connection."
+                    );
                 }
             }
         }
@@ -1886,7 +1895,9 @@ pub async fn handle_tetrate_auth() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("⚠️  Configuration test failed: {}", e);
-                    eprintln!("Your settings have been saved, but there may be an issue with the connection.");
+                    eprintln!(
+                        "Your settings have been saved, but there may be an issue with the connection."
+                    );
                 }
             }
         }
@@ -1944,6 +1955,7 @@ fn collect_custom_headers() -> anyhow::Result<Option<std::collections::HashMap<S
 }
 
 fn add_provider() -> anyhow::Result<()> {
+    let config = Config::global();
     let provider_type = cliclack::select("What type of API is this?")
         .item(
             "openai_compatible",
@@ -2015,26 +2027,53 @@ fn add_provider() -> anyhow::Result<()> {
         .initial_value(true)
         .interact()?;
 
+    let base_path_input: String = cliclack::input("API base path (optional, press Enter to skip):")
+        .placeholder("e.g., v1/chat/completions or project_id/v1")
+        .required(false)
+        .interact()?;
+
+    let base_path = if base_path_input.trim().is_empty() {
+        None
+    } else {
+        Some(base_path_input)
+    };
+
     let headers = collect_custom_headers()?;
 
-    create_custom_provider(CreateCustomProviderParams {
+    let provider_config = create_custom_provider(CreateCustomProviderParams {
         engine: provider_type.to_string(),
         display_name: display_name.clone(),
         api_url,
-        api_key,
+        api_key: requires_auth.then_some(api_key),
         models,
         supports_streaming: Some(supports_streaming),
         headers,
         requires_auth,
         catalog_provider_id: None,
-        base_path: None,
+        base_path,
+        preserves_thinking: None,
     })?;
+
+    if !provider_config.models.is_empty() {
+        let model_items: Vec<_> = provider_config
+            .models
+            .iter()
+            .map(|m| (m.name.as_str(), m.name.as_str(), ""))
+            .collect();
+        if let Ok(model) = cliclack::select("Which model should be the default?")
+            .items(&model_items)
+            .interact()
+        {
+            config.set_goose_provider(&provider_config.name)?;
+            config.set_goose_model(model)?;
+        }
+    }
 
     cliclack::outro(format!("Custom provider added: {}", display_name))?;
     Ok(())
 }
 
-fn remove_provider() -> anyhow::Result<()> {
+async fn remove_provider() -> anyhow::Result<()> {
     let custom_providers_dir = goose::config::declarative_providers::custom_providers_dir();
     let custom_providers = if custom_providers_dir.exists() {
         goose::config::declarative_providers::load_custom_providers(&custom_providers_dir)?
@@ -2057,12 +2096,17 @@ fn remove_provider() -> anyhow::Result<()> {
         .filter_mode()
         .interact()?;
 
+    // Clean up provider-specific cache files (e.g., OAuth tokens) before removing config
+    if let Err(e) = goose::providers::cleanup_provider(selected_id).await {
+        tracing::warn!("Failed to clean up provider cache: {}", e);
+    }
+
     remove_custom_provider(selected_id)?;
     cliclack::outro(format!("Removed custom provider: {}", selected_id))?;
     Ok(())
 }
 
-pub fn configure_custom_provider_dialog() -> anyhow::Result<()> {
+pub async fn configure_custom_provider_dialog() -> anyhow::Result<()> {
     let action = cliclack::select("What would you like to do?")
         .item(
             "add",
@@ -2078,7 +2122,7 @@ pub fn configure_custom_provider_dialog() -> anyhow::Result<()> {
 
     match action {
         "add" => add_provider(),
-        "remove" => remove_provider(),
+        "remove" => remove_provider().await,
         _ => unreachable!(),
     }?;
 

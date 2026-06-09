@@ -1,18 +1,25 @@
 use crate::config::Config;
+#[cfg(feature = "local-inference")]
 use crate::dictation::whisper::LOCAL_WHISPER_MODEL_CONFIG_KEY;
 use crate::providers::api_client::{ApiClient, AuthMethod};
+use crate::providers::openai::parse_openai_base_url;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "local-inference")]
 use std::sync::Mutex;
 use std::time::Duration;
 use utoipa::ToSchema;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENAI_VERSIONLESS_TRANSCRIPTIONS_PATH: &str = "audio/transcriptions";
+type OpenAiDictationTarget = (String, Vec<(String, String)>, String);
 
+#[cfg(feature = "local-inference")]
 static LOCAL_TRANSCRIBER: once_cell::sync::Lazy<
     Mutex<Option<(String, super::whisper::WhisperTranscriber)>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(None));
 
+#[cfg(feature = "local-inference")]
 const WHISPER_TOKENIZER_JSON: &str = include_str!("whisper_data/tokens.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, ToSchema)]
@@ -21,6 +28,7 @@ pub enum DictationProvider {
     OpenAI,
     ElevenLabs,
     Groq,
+    #[cfg(feature = "local-inference")]
     Local,
 }
 
@@ -66,19 +74,39 @@ pub const PROVIDERS: &[DictationProviderDef] = &[
         uses_provider_config: false,
         settings_path: None,
     },
-    DictationProviderDef {
-        provider: DictationProvider::Local,
-        config_key: LOCAL_WHISPER_MODEL_CONFIG_KEY,
-        default_base_url: "",
-        endpoint_path: "",
-        host_key: None,
-        description: "Uses local Whisper model for transcription. No API key needed.",
-        uses_provider_config: false,
-        settings_path: None,
-    },
 ];
 
+#[cfg(feature = "local-inference")]
+pub const LOCAL_PROVIDER_DEF: DictationProviderDef = DictationProviderDef {
+    provider: DictationProvider::Local,
+    config_key: LOCAL_WHISPER_MODEL_CONFIG_KEY,
+    default_base_url: "",
+    endpoint_path: "",
+    host_key: None,
+    description: "Uses local Whisper model for transcription. No API key needed.",
+    uses_provider_config: false,
+    settings_path: None,
+};
+
+/// Returns all provider definitions, including Local when the `local-inference` feature is enabled.
+pub fn all_providers() -> Vec<&'static DictationProviderDef> {
+    #[cfg(not(feature = "local-inference"))]
+    {
+        PROVIDERS.iter().collect()
+    }
+    #[cfg(feature = "local-inference")]
+    {
+        let mut all: Vec<&DictationProviderDef> = PROVIDERS.iter().collect();
+        all.push(&LOCAL_PROVIDER_DEF);
+        all
+    }
+}
+
 pub fn get_provider_def(provider: DictationProvider) -> &'static DictationProviderDef {
+    #[cfg(feature = "local-inference")]
+    if provider == DictationProvider::Local {
+        return &LOCAL_PROVIDER_DEF;
+    }
     PROVIDERS
         .iter()
         .find(|def| def.provider == provider)
@@ -89,6 +117,7 @@ pub fn is_configured(provider: DictationProvider) -> bool {
     let config = Config::global();
 
     match provider {
+        #[cfg(feature = "local-inference")]
         DictationProvider::Local => config
             .get(LOCAL_WHISPER_MODEL_CONFIG_KEY, false)
             .ok()
@@ -102,6 +131,7 @@ pub fn is_configured(provider: DictationProvider) -> bool {
     }
 }
 
+#[cfg(feature = "local-inference")]
 pub async fn transcribe_local(audio_bytes: Vec<u8>) -> Result<String> {
     tokio::task::spawn_blocking(move || {
         let config = Config::global();
@@ -152,7 +182,25 @@ pub async fn transcribe_local(audio_bytes: Vec<u8>) -> Result<String> {
     })?
 }
 
-fn build_api_client(provider: DictationProvider) -> Result<ApiClient> {
+fn openai_dictation_target(raw_url: &str) -> Result<OpenAiDictationTarget> {
+    let (host, query_params, has_v1) = parse_openai_base_url(raw_url)?;
+    let endpoint_path = if has_v1 {
+        "v1/audio/transcriptions".to_string()
+    } else {
+        OPENAI_VERSIONLESS_TRANSCRIPTIONS_PATH.to_string()
+    };
+    Ok((host, query_params, endpoint_path))
+}
+
+fn resolve_openai_base_url_target(raw_url: Option<&str>) -> Result<Option<OpenAiDictationTarget>> {
+    raw_url
+        .map(str::trim)
+        .filter(|raw_url| !raw_url.is_empty())
+        .map(openai_dictation_target)
+        .transpose()
+}
+
+fn build_api_client(provider: DictationProvider) -> Result<(ApiClient, String)> {
     let config = Config::global();
     let def = get_provider_def(provider);
 
@@ -161,14 +209,35 @@ fn build_api_client(provider: DictationProvider) -> Result<ApiClient> {
         anyhow::anyhow!("{} not configured", def.config_key)
     })?;
 
-    let base_url = if let Some(host_key) = def.host_key {
-        config
+    let (base_url, query_params, endpoint_path) = if provider == DictationProvider::OpenAI {
+        let openai_base_url = config.get_param::<String>("OPENAI_BASE_URL").ok();
+
+        if let Ok(host) = std::env::var("OPENAI_HOST") {
+            (host, vec![], def.endpoint_path.to_string())
+        } else if let Some(target) = resolve_openai_base_url_target(openai_base_url.as_deref())? {
+            target
+        } else if let Ok(host) = config.get_param::<String>("OPENAI_HOST") {
+            (host, vec![], def.endpoint_path.to_string())
+        } else {
+            (
+                def.default_base_url.to_string(),
+                vec![],
+                def.endpoint_path.to_string(),
+            )
+        }
+    } else if let Some(host_key) = def.host_key {
+        let base_url = config
             .get(host_key, false)
             .ok()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| def.default_base_url.to_string())
+            .unwrap_or_else(|| def.default_base_url.to_string());
+        (base_url, vec![], def.endpoint_path.to_string())
     } else {
-        def.default_base_url.to_string()
+        (
+            def.default_base_url.to_string(),
+            vec![],
+            def.endpoint_path.to_string(),
+        )
     };
 
     let auth = match provider {
@@ -178,13 +247,18 @@ fn build_api_client(provider: DictationProvider) -> Result<ApiClient> {
             header_name: "xi-api-key".to_string(),
             key: api_key,
         },
+        #[cfg(feature = "local-inference")]
         DictationProvider::Local => anyhow::bail!("Local provider should not use API client"),
     };
 
-    ApiClient::with_timeout(base_url, auth, REQUEST_TIMEOUT).map_err(|e| {
+    let mut client = ApiClient::with_timeout(base_url, auth, REQUEST_TIMEOUT).map_err(|e| {
         tracing::error!("Failed to create API client: {}", e);
         e
-    })
+    })?;
+    if !query_params.is_empty() {
+        client = client.with_query(query_params);
+    }
+    Ok((client, endpoint_path))
 }
 
 pub async fn transcribe_with_provider(
@@ -195,8 +269,7 @@ pub async fn transcribe_with_provider(
     extension: &str,
     mime_type: &str,
 ) -> Result<String> {
-    let client = build_api_client(provider)?;
-    let def = get_provider_def(provider);
+    let (client, endpoint_path) = build_api_client(provider)?;
 
     let part = reqwest::multipart::Part::bytes(audio_bytes)
         .file_name(format!("audio.{}", extension))
@@ -211,7 +284,7 @@ pub async fn transcribe_with_provider(
         .text(model_param, model_value);
 
     let response = client
-        .request(None, def.endpoint_path)
+        .request(None, &endpoint_path)
         .multipart_post(form)
         .await
         .map_err(|e| {
@@ -245,4 +318,51 @@ pub async fn transcribe_with_provider(
         .to_string();
 
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        openai_dictation_target, resolve_openai_base_url_target,
+        OPENAI_VERSIONLESS_TRANSCRIPTIONS_PATH,
+    };
+
+    #[test]
+    fn openai_dictation_target_preserves_prefix_and_query_params() {
+        let (host, query_params, endpoint_path) = openai_dictation_target(
+            "https://user:pass@gateway.example.com/openai/v1?api-version=2024-02-01",
+        )
+        .unwrap();
+        assert_eq!(host, "https://user:pass@gateway.example.com/openai");
+        assert_eq!(
+            query_params,
+            vec![("api-version".to_string(), "2024-02-01".to_string())]
+        );
+        assert_eq!(endpoint_path, "v1/audio/transcriptions");
+    }
+
+    #[test]
+    fn openai_dictation_target_uses_versionless_endpoint_without_v1() {
+        let (host, query_params, endpoint_path) =
+            openai_dictation_target("https://gateway.example.com/custom/api").unwrap();
+        assert_eq!(host, "https://gateway.example.com/custom/api");
+        assert!(query_params.is_empty());
+        assert_eq!(endpoint_path, OPENAI_VERSIONLESS_TRANSCRIPTIONS_PATH);
+    }
+
+    #[test]
+    fn openai_dictation_target_keeps_v1_endpoint_for_bare_host() {
+        let (host, query_params, endpoint_path) =
+            openai_dictation_target("https://api.openai.com").unwrap();
+        assert_eq!(host, "https://api.openai.com");
+        assert!(query_params.is_empty());
+        assert_eq!(endpoint_path, "v1/audio/transcriptions");
+    }
+
+    #[test]
+    fn resolve_openai_base_url_target_ignores_blank_values() {
+        assert!(resolve_openai_base_url_target(Some("   "))
+            .unwrap()
+            .is_none());
+    }
 }

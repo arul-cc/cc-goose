@@ -2,10 +2,11 @@ import { useMemo, useRef } from 'react';
 import ImagePreview from './ImagePreview';
 import { formatMessageTimestamp } from '../utils/timeUtils';
 import MarkdownContent from './MarkdownContent';
+import ThinkingContent from './ThinkingContent';
 import ToolCallWithResponse from './ToolCallWithResponse';
 import {
   getTextAndImageContent,
-  getReasoningContent,
+  getThinkingContent,
   getToolRequests,
   getToolResponses,
   getToolConfirmationContent,
@@ -47,26 +48,8 @@ export default function GooseMessage({
 }: GooseMessageProps) {
   const contentRef = useRef<HTMLDivElement | null>(null);
 
-  let { textContent, imagePaths } = getTextAndImageContent(message);
-  const reasoningContent = getReasoningContent(message);
-
-  const splitChainOfThought = (text: string): { displayText: string; cotText: string | null } => {
-    const regex = /<think>([\s\S]*?)<\/think>/i;
-    const match = text.match(regex);
-    if (!match) {
-      return { displayText: text, cotText: null };
-    }
-
-    const cotRaw = match[1].trim();
-    const displayText = text.replace(regex, '').trim();
-
-    return {
-      displayText,
-      cotText: cotRaw || null,
-    };
-  };
-
-  const { displayText, cotText } = splitChainOfThought(textContent);
+  const { textContent: displayText, imagePaths } = getTextAndImageContent(message);
+  const thinkingContent = getThinkingContent(message);
 
   const timestamp = useMemo(() => formatMessageTimestamp(message.created), [message.created]);
   const toolRequests = getToolRequests(message);
@@ -131,26 +114,16 @@ export default function GooseMessage({
   return (
     <div className="goose-message flex w-[90%] justify-start min-w-0">
       <div className="flex flex-col w-full min-w-0">
-        {reasoningContent && (
-          <details className="mb-2">
-            <summary className="cursor-pointer text-xs text-textSubtle select-none">
-              Show reasoning
-            </summary>
-            <div className="mt-2 text-sm">
-              <MarkdownContent content={reasoningContent} />
-            </div>
-          </details>
-        )}
-
-        {cotText && (
-          <details className="bg-background-secondary border border-border-primary rounded p-2 mb-2">
-            <summary className="cursor-pointer text-sm text-text-secondary select-none">
-              Show thinking
-            </summary>
-            <div className="mt-2">
-              <MarkdownContent content={cotText} />
-            </div>
-          </details>
+        {thinkingContent && (
+          <ThinkingContent
+            content={thinkingContent}
+            isExpanded={
+              isStreaming &&
+              !displayText.trim() &&
+              imagePaths.length === 0 &&
+              toolRequests.length === 0
+            }
+          />
         )}
 
         {(displayText.trim() || imagePaths.length > 0) && (

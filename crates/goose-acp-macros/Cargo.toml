@@ -1,6 +1,7 @@
 [package]
 name = "goose-acp-macros"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -11,9 +12,8 @@ description.workspace = true
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full", "extra-traits"] }
+quote = { version = "1.0.40", default-features = false }
+syn = { version = "2.0.104", default-features = false, features = ["full", "extra-traits"] }
 
 [lints]
 workspace = true

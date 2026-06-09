@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-use super::base::{
-    ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata, ProviderUsage,
-};
-use super::errors::ProviderError;
+use super::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
 use super::retry::{ProviderRetry, RetryConfig};
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
@@ -14,9 +11,12 @@ use aws_sdk_bedrockruntime::config::ProvideCredentials;
 use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::{types as bedrock, Client};
 use futures::future::BoxFuture;
+use goose_providers::conversation::token_usage::ProviderUsage;
+use goose_providers::errors::ProviderError;
 use reqwest::header::HeaderValue;
 use rmcp::model::Tool;
 use serde_json::Value;
+use smithy_transport_reqwest::ReqwestHttpClient;
 
 use super::formats::bedrock::{
     from_bedrock_message, from_bedrock_usage, to_bedrock_message_with_caching,
@@ -98,7 +98,8 @@ impl BedrockProvider {
         };
 
         // Use load_defaults() which supports AWS SSO, profiles, and environment variables
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .http_client(ReqwestHttpClient::new());
 
         if let Ok(profile_name) = config.get_param::<String>("AWS_PROFILE") {
             if !profile_name.is_empty() {
@@ -181,12 +182,12 @@ impl BedrockProvider {
             .get_param::<u64>("BEDROCK_MAX_RETRY_INTERVAL_MS")
             .unwrap_or(BEDROCK_DEFAULT_MAX_RETRY_INTERVAL_MS);
 
-        RetryConfig {
+        RetryConfig::new(
             max_retries,
             initial_interval_ms,
             backoff_multiplier,
             max_interval_ms,
-        }
+        )
     }
 
     fn should_enable_caching(&self) -> bool {
@@ -232,15 +233,7 @@ impl BedrockProvider {
         let visible_messages: Vec<&Message> =
             messages.iter().filter(|m| m.is_agent_visible()).collect();
 
-        // Cache the earliest messages (not most recent) because prompt caching
-        // requires exact prefix matching — caching recent messages would shift
-        // positions each turn, causing misses.
-        const MESSAGE_CACHE_BUDGET: usize = 3;
-        let cache_count = if enable_caching {
-            visible_messages.len().min(MESSAGE_CACHE_BUDGET)
-        } else {
-            0
-        };
+        let last_idx = visible_messages.len().saturating_sub(1);
 
         let mut request = self
             .client
@@ -251,7 +244,9 @@ impl BedrockProvider {
                 visible_messages
                     .iter()
                     .enumerate()
-                    .map(|(idx, m)| to_bedrock_message_with_caching(m, idx < cache_count))
+                    .map(|(idx, m)| {
+                        to_bedrock_message_with_caching(m, enable_caching && idx == last_idx)
+                    })
                     .collect::<Result<_>>()?,
             ));
 
@@ -323,7 +318,7 @@ impl ProviderDef for BedrockProvider {
             BEDROCK_DOC_LINK,
             vec![
                 ConfigKey::new("AWS_PROFILE", false, false, Some("default"), true),
-                ConfigKey::new("AWS_REGION", false, false, None, true),
+                ConfigKey::new("AWS_REGION", true, false, Some("us-east-1"), true),
                 ConfigKey::new("AWS_BEARER_TOKEN_BEDROCK", false, true, None, true),
                 ConfigKey::new("BEDROCK_ENABLE_CACHING", false, false, Some("false"), false),
             ],
@@ -356,10 +351,6 @@ impl Provider for BedrockProvider {
         Ok(BEDROCK_KNOWN_MODELS.iter().map(|s| s.to_string()).collect())
     }
 
-    #[tracing::instrument(
-        skip(self, model_config, system, messages, tools),
-        fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
-    )]
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -456,10 +447,17 @@ mod tests {
             .iter()
             .find(|k| k.name == "AWS_REGION")
             .expect("AWS_REGION config key should exist");
-        assert!(!aws_region.required, "AWS_REGION should not be required");
+        assert!(
+            aws_region.required,
+            "AWS_REGION is required for Bedrock to be marked as configured"
+        );
         assert!(
             !aws_region.secret,
             "AWS_REGION should not be marked as secret"
+        );
+        assert!(
+            aws_region.default.is_some(),
+            "AWS_REGION should have a default value"
         );
 
         let bearer_token = meta

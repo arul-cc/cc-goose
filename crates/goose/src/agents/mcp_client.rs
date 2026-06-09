@@ -1,23 +1,22 @@
 use crate::action_required_manager::ActionRequiredManager;
+use crate::agents::tool_execution::ToolCallContext;
 use crate::agents::types::SharedProvider;
 use crate::session_context::{SESSION_ID_HEADER, WORKING_DIR_HEADER};
 use rmcp::model::{
     CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ErrorCode,
-    ExtensionCapabilities, Extensions, JsonObject, Meta, SamplingMessageContent,
+    ExtensionCapabilities, Extensions, JsonObject, ListRootsResult, LoggingMessageNotification,
+    Meta, Root, SamplingMessageContent,
 };
 /// MCP client implementation for Goose
 use rmcp::{
     model::{
-        CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotification,
-        CancelledNotificationMethod, CancelledNotificationParam, ClientCapabilities, ClientInfo,
-        ClientRequest, CreateMessageRequestParams, CreateMessageResult, GetPromptRequest,
-        GetPromptRequestParams, GetPromptResult, Implementation, InitializeResult,
-        ListPromptsRequest, ListPromptsResult, ListResourcesRequest, ListResourcesResult,
-        ListToolsRequest, ListToolsResult, LoggingMessageNotification,
-        LoggingMessageNotificationMethod, PaginatedRequestParams, ProgressNotification,
-        ProgressNotificationMethod, ProtocolVersion, ReadResourceRequest,
-        ReadResourceRequestParams, ReadResourceResult, RequestId, Role, SamplingMessage,
-        ServerNotification, ServerResult,
+        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
+        ClientInfo, ClientRequest, CreateMessageRequestParams, CreateMessageResult,
+        GetPromptRequestParams, GetPromptResult, Implementation, InitializeRequestParams,
+        InitializeResult, ListPromptsResult, ListResourcesResult, ListToolsResult, Notification,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+        Request, RequestId, RequestOptionalParam, Role, SamplingMessage, ServerNotification,
+        ServerResult,
     },
     service::{
         ClientInitializeError, PeerRequestOptions, RequestContext, RequestHandle, RunningService,
@@ -27,7 +26,7 @@ use rmcp::{
     ClientHandler, ErrorData, Peer, RoleClient, ServiceError, ServiceExt,
 };
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{
     mpsc::{self, Sender},
     Mutex,
@@ -37,6 +36,34 @@ use tokio_util::sync::CancellationToken;
 pub type BoxError = Box<dyn std::error::Error + Sync + Send>;
 
 pub type Error = rmcp::ServiceError;
+
+const MCP_APPS_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+const MCP_APPS_UI_MIME_TYPE: &str = "text/html;profile=mcp-app";
+
+fn default_mcp_apps_ui_extensions() -> ExtensionCapabilities {
+    let mut extensions = ExtensionCapabilities::new();
+    let mut ui_extension_settings = JsonObject::new();
+    ui_extension_settings.insert(
+        "mimeTypes".to_string(),
+        serde_json::json!([MCP_APPS_UI_MIME_TYPE]),
+    );
+    extensions.insert(MCP_APPS_UI_EXTENSION_ID.to_string(), ui_extension_settings);
+    extensions
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GooseMcpHostInfo {
+    pub explicit_extensions: bool,
+    pub extensions: ExtensionCapabilities,
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
+}
+
+impl GooseMcpHostInfo {
+    pub fn mcpui_enabled(&self) -> bool {
+        self.extensions.contains_key(MCP_APPS_UI_EXTENSION_ID)
+    }
+}
 
 #[async_trait::async_trait]
 pub trait McpClientTrait: Send + Sync {
@@ -49,14 +76,21 @@ pub trait McpClientTrait: Send + Sync {
 
     async fn call_tool(
         &self,
-        session_id: &str,
+        ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
-        working_dir: Option<&str>,
         cancel_token: CancellationToken,
+        allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error>;
 
     fn get_info(&self) -> Option<&InitializeResult>;
+
+    /// Return the extension's current instructions. The default reads from
+    /// `get_info()`, but platform extensions can override this to provide
+    /// dynamically computed instructions (e.g. freshly discovered skills).
+    fn get_instructions(&self) -> Option<String> {
+        self.get_info().and_then(|info| info.instructions.clone())
+    }
 
     async fn list_resources(
         &self,
@@ -102,17 +136,19 @@ pub trait McpClientTrait: Send + Sync {
     async fn get_moim(&self, _session_id: &str) -> Option<String> {
         None
     }
+
+    async fn update_working_dir(&self, _new_dir: PathBuf) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct GooseClient {
     notification_handlers: Arc<Mutex<Vec<Sender<ServerNotification>>>>,
     provider: SharedProvider,
-    /// Fallback session_id for server-initiated callbacks (e.g. sampling/createMessage)
-    /// that don't include the session_id in their MCP extensions metadata.
-    /// Set once on first request; never cleared (the id is invariant per McpClient).
     session_id: Mutex<Option<String>>,
     client_name: String,
     capabilities: GooseMcpClientCapabilities,
+    working_dir: Arc<tokio::sync::RwLock<PathBuf>>,
 }
 
 impl GooseClient {
@@ -121,6 +157,7 @@ impl GooseClient {
         provider: SharedProvider,
         client_name: String,
         capabilities: GooseMcpClientCapabilities,
+        working_dir: PathBuf,
     ) -> Self {
         GooseClient {
             notification_handlers: handlers,
@@ -128,16 +165,17 @@ impl GooseClient {
             session_id: Mutex::new(None),
             client_name,
             capabilities,
+            working_dir: Arc::new(tokio::sync::RwLock::new(working_dir)),
         }
     }
 
+    pub fn shared_working_dir(&self) -> Arc<tokio::sync::RwLock<PathBuf>> {
+        self.working_dir.clone()
+    }
+
+    #[cfg(test)]
     async fn set_session_id(&self, session_id: &str) {
-        let mut slot = self.session_id.lock().await;
-        assert!(
-            slot.as_deref().is_none_or(|s| s == session_id),
-            "McpClient received requests from different sessions"
-        );
-        *slot = Some(session_id.to_string());
+        *self.session_id.lock().await = Some(session_id.to_string());
     }
 
     async fn current_session_id(&self) -> Option<String> {
@@ -158,9 +196,57 @@ impl GooseClient {
             .and_then(|(_, value)| value.as_str())
             .map(|value| value.to_string())
     }
+
+    fn resolved_extensions(&self) -> ExtensionCapabilities {
+        if let Some(host_info) = &self.capabilities.host_info {
+            if host_info.explicit_extensions {
+                return host_info.extensions.clone();
+            }
+        }
+
+        if self.capabilities.mcpui {
+            return default_mcp_apps_ui_extensions();
+        }
+
+        ExtensionCapabilities::new()
+    }
+
+    fn resolved_client_info(&self) -> Implementation {
+        let name = self
+            .capabilities
+            .host_info
+            .as_ref()
+            .and_then(|host_info| host_info.client_name.clone())
+            .unwrap_or_else(|| self.client_name.clone());
+        let version = self
+            .capabilities
+            .host_info
+            .as_ref()
+            .and_then(|host_info| host_info.client_version.clone())
+            .unwrap_or_else(|| {
+                std::env::var("GOOSE_MCP_CLIENT_VERSION")
+                    .unwrap_or(env!("CARGO_PKG_VERSION").to_owned())
+            });
+
+        Implementation::new(name, version)
+    }
+}
+
+fn working_dir_roots(dir: &std::path::Path) -> ListRootsResult {
+    let uri = url::Url::from_file_path(dir)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|()| format!("file://{}", dir.display()));
+    ListRootsResult::new(vec![Root::new(uri).with_name("working_directory")])
 }
 
 impl ClientHandler for GooseClient {
+    async fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<ListRootsResult, ErrorData> {
+        Ok(working_dir_roots(&self.working_dir.read().await))
+    }
+
     async fn on_progress(
         &self,
         params: rmcp::model::ProgressNotificationParam,
@@ -171,13 +257,9 @@ impl ClientHandler for GooseClient {
             .await
             .iter()
             .for_each(|handler| {
-                let _ = handler.try_send(ServerNotification::ProgressNotification(
-                    ProgressNotification {
-                        params: params.clone(),
-                        method: ProgressNotificationMethod,
-                        extensions: context.extensions.clone(),
-                    },
-                ));
+                let mut not = Notification::new(params.clone());
+                not.extensions = context.extensions.clone();
+                let _ = handler.try_send(ServerNotification::ProgressNotification(not));
             });
     }
 
@@ -191,13 +273,10 @@ impl ClientHandler for GooseClient {
             .await
             .iter()
             .for_each(|handler| {
-                let _ = handler.try_send(ServerNotification::LoggingMessageNotification(
-                    LoggingMessageNotification {
-                        params: params.clone(),
-                        method: LoggingMessageNotificationMethod,
-                        extensions: context.extensions.clone(),
-                    },
-                ));
+                let mut notification = LoggingMessageNotification::new(params.clone());
+                notification.extensions = context.extensions.clone();
+                let _ =
+                    handler.try_send(ServerNotification::LoggingMessageNotification(notification));
             });
     }
 
@@ -260,10 +339,8 @@ impl ClientHandler for GooseClient {
                 )
             })?;
 
-        Ok(CreateMessageResult {
-            model: usage.model,
-            stop_reason: Some(CreateMessageResult::STOP_REASON_END_TURN.to_string()),
-            message: SamplingMessage::new(
+        Ok(CreateMessageResult::new(
+            SamplingMessage::new(
                 Role::Assistant,
                 if let Some(content) = response.content.first() {
                     match content {
@@ -283,7 +360,9 @@ impl ClientHandler for GooseClient {
                     SamplingMessageContent::text("")
                 },
             ),
-        })
+            usage.model,
+        )
+        .with_stop_reason(CreateMessageResult::STOP_REASON_END_TURN))
     }
 
     async fn create_elicitation(
@@ -314,9 +393,8 @@ impl ClientHandler for GooseClient {
         ActionRequiredManager::global()
             .request_and_wait(message, schema_value, Duration::from_secs(300))
             .await
-            .map(|user_data| CreateElicitationResult {
-                action: ElicitationAction::Accept,
-                content: Some(user_data),
+            .map(|user_data| {
+                CreateElicitationResult::new(ElicitationAction::Accept).with_content(user_data)
             })
             .map_err(|e| {
                 ErrorData::new(
@@ -328,46 +406,25 @@ impl ClientHandler for GooseClient {
     }
 
     fn get_info(&self) -> ClientInfo {
-        let mut extensions = ExtensionCapabilities::new();
+        let extensions = self.resolved_extensions();
 
-        if self.capabilities.mcpui {
-            // Build MCP Apps UI extension capability
-            // See: https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
-            let mut ui_extension_settings = JsonObject::new();
-            ui_extension_settings.insert(
-                "mimeTypes".to_string(),
-                serde_json::json!(["text/html;profile=mcp-app"]),
-            );
-            extensions.insert(
-                "io.modelcontextprotocol/ui".to_string(),
-                ui_extension_settings,
-            );
-        }
-
-        ClientInfo {
-            meta: None,
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ClientCapabilities::builder()
+        InitializeRequestParams::new(
+            ClientCapabilities::builder()
+                .enable_roots()
                 .enable_extensions_with(extensions)
                 .enable_sampling()
                 .enable_elicitation()
                 .build(),
-            client_info: Implementation {
-                name: self.client_name.clone(),
-                version: std::env::var("GOOSE_MCP_CLIENT_VERSION")
-                    .unwrap_or(env!("CARGO_PKG_VERSION").to_owned()),
-                icons: None,
-                title: None,
-                description: None,
-                website_url: None,
-            },
-        }
+            self.resolved_client_info(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_03_26)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct GooseMcpClientCapabilities {
     pub mcpui: bool,
+    pub host_info: Option<GooseMcpHostInfo>,
 }
 
 /// The MCP client is the interface for MCP operations.
@@ -386,6 +443,7 @@ impl McpClient {
         provider: SharedProvider,
         client_name: String,
         capabilities: GooseMcpClientCapabilities,
+        working_dir: PathBuf,
     ) -> Result<Self, ClientInitializeError>
     where
         T: IntoTransport<RoleClient, E, A>,
@@ -398,6 +456,7 @@ impl McpClient {
             None,
             client_name,
             capabilities,
+            working_dir,
         )
         .await
     }
@@ -409,6 +468,7 @@ impl McpClient {
         docker_container: Option<String>,
         client_name: String,
         capabilities: GooseMcpClientCapabilities,
+        working_dir: PathBuf,
     ) -> Result<Self, ClientInitializeError>
     where
         T: IntoTransport<RoleClient, E, A>,
@@ -422,6 +482,7 @@ impl McpClient {
             provider,
             client_name.clone(),
             capabilities.clone(),
+            working_dir,
         );
         let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> =
             client.serve(transport).await?;
@@ -440,6 +501,14 @@ impl McpClient {
         self.docker_container.as_deref()
     }
 
+    async fn do_update_working_dir(&self, new_dir: PathBuf) -> Result<(), Error> {
+        let client = self.client.lock().await;
+        let shared = client.service().shared_working_dir();
+        *shared.write().await = new_dir;
+        client.peer().notify_roots_list_changed().await?;
+        Ok(())
+    }
+
     async fn send_request_with_context(
         &self,
         session_id: &str,
@@ -447,18 +516,24 @@ impl McpClient {
         request: ClientRequest,
         cancel_token: CancellationToken,
     ) -> Result<ServerResult, Error> {
+        // session_id is injected into the request's MCP extensions metadata so the
+        // server (and our own `create_message` callback via `resolve_session_id`) can
+        // identify the originating session without relying on mutable shared state.
         let request = inject_session_context_into_request(request, Some(session_id), working_dir);
-        // The inner mutex is held only for the send; the actual response wait
-        // happens outside the lock so concurrent calls can overlap.
+
+        // Hold the client mutex only long enough to send the request.
+        // The response wait happens outside the lock so concurrent sessions can
+        // send their requests without blocking on each other's responses.
         let handle = {
             let client = self.client.lock().await;
-            client.service().set_session_id(session_id).await;
-            client
+            let result = client
                 .send_cancellable_request(request, PeerRequestOptions::no_options())
-                .await
+                .await;
+            result
         }?;
 
-        await_response(handle, self.timeout, &cancel_token).await
+        let result = await_response(handle, self.timeout, &cancel_token).await;
+        result
     }
 }
 
@@ -491,12 +566,7 @@ async fn send_cancel_message(
     reason: Option<String>,
 ) -> Result<(), ServiceError> {
     peer.send_notification(
-        CancelledNotification {
-            params: CancelledNotificationParam { request_id, reason },
-            method: CancelledNotificationMethod,
-            extensions: Default::default(),
-        }
-        .into(),
+        Notification::new(CancelledNotificationParam { request_id, reason }).into(),
     )
     .await
 }
@@ -517,11 +587,14 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ListResourcesRequest(ListResourcesRequest {
-                    params: Some(PaginatedRequestParams { meta: None, cursor }),
-                    method: Default::default(),
-                    extensions: Default::default(),
-                }),
+                {
+                    let mut req = RequestOptionalParam::with_param(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    );
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ListResourcesRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -542,14 +615,12 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ReadResourceRequest(ReadResourceRequest {
-                    params: ReadResourceRequestParams {
-                        meta: None,
-                        uri: uri.to_string(),
-                    },
-                    method: Default::default(),
-                    extensions: Default::default(),
-                }),
+                {
+                    let mut req = Request::new(ReadResourceRequestParams::new(uri.to_string()));
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ReadResourceRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -570,11 +641,14 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ListToolsRequest(ListToolsRequest {
-                    params: Some(PaginatedRequestParams { meta: None, cursor }),
-                    method: Default::default(),
-                    extensions: Default::default(),
-                }),
+                {
+                    let mut req = RequestOptionalParam::with_param(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    );
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ListToolsRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -587,25 +661,34 @@ impl McpClientTrait for McpClient {
 
     async fn call_tool(
         &self,
-        session_id: &str,
+        ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
-        working_dir: Option<&str>,
         cancel_token: CancellationToken,
+        allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
-        let request = ClientRequest::CallToolRequest(CallToolRequest {
-            params: CallToolRequestParams {
-                meta: None,
-                task: None,
-                name: name.to_string().into(),
-                arguments,
-            },
-            method: Default::default(),
-            extensions: Default::default(),
-        });
+        let mut params = CallToolRequestParams::new(name.to_string());
+        if let Some(args) = arguments {
+            params = params.with_arguments(args);
+        }
+        // Inject websocket headers from session, filtered by allowed_headers
+        let extensions = inject_session_headers_into_extensions(
+            Default::default(),
+            &ctx.session_id,
+            allowed_headers,
+        )
+        .await;
+        let mut req = Request::new(params);
+        req.extensions = extensions;
+        let request = ClientRequest::CallToolRequest(req);
 
         let result = self
-            .send_request_with_context(session_id, working_dir, request, cancel_token)
+            .send_request_with_context(
+                &ctx.session_id,
+                ctx.working_dir_str(),
+                request,
+                cancel_token,
+            )
             .await;
 
         match result? {
@@ -624,11 +707,14 @@ impl McpClientTrait for McpClient {
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::ListPromptsRequest(ListPromptsRequest {
-                    params: Some(PaginatedRequestParams { meta: None, cursor }),
-                    method: Default::default(),
-                    extensions: Default::default(),
-                }),
+                {
+                    let mut req = RequestOptionalParam::with_param(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    );
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::ListPromptsRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -650,19 +736,20 @@ impl McpClientTrait for McpClient {
             Value::Object(map) => Some(map),
             _ => None,
         };
+        let mut params = GetPromptRequestParams::new(name.to_string());
+        if let Some(args) = arguments {
+            params = params.with_arguments(args);
+        }
         let res = self
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::GetPromptRequest(GetPromptRequest {
-                    params: GetPromptRequestParams {
-                        meta: None,
-                        name: name.to_string(),
-                        arguments,
-                    },
-                    method: Default::default(),
-                    extensions: Default::default(),
-                }),
+                {
+                    let mut req = Request::new(params);
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
+                    ClientRequest::GetPromptRequest(req)
+                },
                 cancel_token,
             )
             .await?;
@@ -677,6 +764,10 @@ impl McpClientTrait for McpClient {
         let (tx, rx) = mpsc::channel(16);
         self.notification_subscribers.lock().await.push(tx);
         rx
+    }
+
+    async fn update_working_dir(&self, new_dir: PathBuf) -> Result<(), Error> {
+        self.do_update_working_dir(new_dir).await
     }
 }
 
@@ -711,6 +802,87 @@ fn inject_session_context_into_extensions(
             WORKING_DIR_HEADER.to_string(),
             Value::String(working_dir.to_string()),
         );
+    }
+
+    extensions.insert(Meta(meta_map));
+    extensions
+}
+
+/// Injects dynamic headers from session into extensions, filtered by allowed_headers.
+///
+/// Only headers whose names appear in `allowed_headers` (case-insensitive) are
+/// forwarded. If `allowed_headers` is `None` or empty, **no** headers are forwarded.
+async fn inject_session_headers_into_extensions(
+    mut extensions: rmcp::model::Extensions,
+    session_id: &str,
+    allowed_headers: Option<Vec<String>>,
+) -> rmcp::model::Extensions {
+    use rmcp::model::Meta;
+
+    eprintln!("[MCP_CLIENT DEBUG] inject_session_headers_into_extensions called for session '{}', allowed_headers: {:?}", session_id, allowed_headers);
+
+    let mut meta_map = extensions
+        .get::<Meta>()
+        .map(|meta| meta.0.clone())
+        .unwrap_or_default();
+
+    // Build a lowercase set of allowed header names for case-insensitive matching.
+    // If allowed_headers is None or empty, no headers are forwarded.
+    let allowed_lower: Vec<String> = match &allowed_headers {
+        Some(list) if !list.is_empty() => list.iter().map(|h| h.to_lowercase()).collect(),
+        _ => {
+            eprintln!(
+                "[MCP_CLIENT DEBUG] No allowed_headers configured — skipping all websocket headers"
+            );
+            tracing::debug!(
+                "[MCP_CLIENT] No allowed_headers configured — skipping all websocket headers"
+            );
+            extensions.insert(Meta(meta_map));
+            return extensions;
+        }
+    };
+
+    // Inject dynamic headers from session if available
+    if let Ok(session) = crate::session::SessionManager::instance()
+        .get_session(session_id, false)
+        .await
+    {
+        if let Some(headers_value) = session
+            .extension_data
+            .get_extension_state("websocket_headers", "v0")
+        {
+            if let Some(headers_obj) = headers_value.as_object() {
+                let mut headers_map = serde_json::Map::new();
+                for (key, value) in headers_obj {
+                    // Case-insensitive comparison: stored keys are lowercase (from Go),
+                    // config values may be mixed-case (e.g., "X-Origin-Host").
+                    if !allowed_lower.contains(&key.to_lowercase()) {
+                        tracing::debug!(
+                            "[MCP_CLIENT] Skipping header '{}' — not in allowed_headers",
+                            key
+                        );
+                        continue;
+                    }
+                    headers_map.insert(key.clone(), value.clone());
+                }
+                tracing::debug!(
+                    "[MCP_CLIENT] Forwarding {} of {} websocket headers to MCP extension",
+                    headers_map.len(),
+                    headers_obj.len()
+                );
+                if !headers_map.is_empty() {
+                    eprintln!(
+                        "[MCP_CLIENT DEBUG] Injecting websocket_headers into _meta: {:?}",
+                        headers_map.keys().collect::<Vec<_>>()
+                    );
+                    meta_map.insert("websocket_headers".to_string(), Value::Object(headers_map));
+                } else {
+                    eprintln!(
+                        "[MCP_CLIENT DEBUG] No matching websocket headers found after filtering"
+                    );
+                }
+            }
+        }
     }
 
     extensions.insert(Meta(meta_map));
@@ -766,8 +938,14 @@ mod tests {
 
     fn new_client(platform: GoosePlatform) -> GooseClient {
         let capabilities = match platform {
-            GoosePlatform::GooseDesktop => GooseMcpClientCapabilities { mcpui: true },
-            GoosePlatform::GooseCli => GooseMcpClientCapabilities { mcpui: false },
+            GoosePlatform::GooseDesktop => GooseMcpClientCapabilities {
+                mcpui: true,
+                host_info: None,
+            },
+            GoosePlatform::GooseCli => GooseMcpClientCapabilities {
+                mcpui: false,
+                host_info: None,
+            },
         };
 
         GooseClient::new(
@@ -775,6 +953,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             platform.to_string(),
             capabilities,
+            std::env::current_dir().unwrap_or_default(),
         )
     }
 
@@ -791,72 +970,41 @@ mod tests {
     }
 
     fn list_resources_request(extensions: Extensions) -> ClientRequest {
-        ClientRequest::ListResourcesRequest(ListResourcesRequest {
-            params: Some(PaginatedRequestParams {
-                meta: None,
-                cursor: None,
-            }),
-            method: Default::default(),
-            extensions,
-        })
+        let mut req = RequestOptionalParam::with_param(PaginatedRequestParams::default());
+        req.extensions = extensions;
+        ClientRequest::ListResourcesRequest(req)
     }
 
     fn read_resource_request(extensions: Extensions) -> ClientRequest {
-        ClientRequest::ReadResourceRequest(ReadResourceRequest {
-            params: ReadResourceRequestParams {
-                meta: None,
-                uri: "test://resource".to_string(),
-            },
-            method: Default::default(),
-            extensions,
-        })
+        let mut req = Request::new(ReadResourceRequestParams::new(
+            "test://resource".to_string(),
+        ));
+        req.extensions = extensions;
+        ClientRequest::ReadResourceRequest(req)
     }
 
     fn list_tools_request(extensions: Extensions) -> ClientRequest {
-        ClientRequest::ListToolsRequest(ListToolsRequest {
-            params: Some(PaginatedRequestParams {
-                meta: None,
-                cursor: None,
-            }),
-            method: Default::default(),
-            extensions,
-        })
+        let mut req = RequestOptionalParam::with_param(PaginatedRequestParams::default());
+        req.extensions = extensions;
+        ClientRequest::ListToolsRequest(req)
     }
 
     fn call_tool_request(extensions: Extensions) -> ClientRequest {
-        ClientRequest::CallToolRequest(CallToolRequest {
-            params: CallToolRequestParams {
-                meta: None,
-                task: None,
-                name: "tool".to_string().into(),
-                arguments: None,
-            },
-            method: Default::default(),
-            extensions,
-        })
+        let mut req = Request::new(CallToolRequestParams::new("tool".to_string()));
+        req.extensions = extensions;
+        ClientRequest::CallToolRequest(req)
     }
 
     fn list_prompts_request(extensions: Extensions) -> ClientRequest {
-        ClientRequest::ListPromptsRequest(ListPromptsRequest {
-            params: Some(PaginatedRequestParams {
-                meta: None,
-                cursor: None,
-            }),
-            method: Default::default(),
-            extensions,
-        })
+        let mut req = RequestOptionalParam::with_param(PaginatedRequestParams::default());
+        req.extensions = extensions;
+        ClientRequest::ListPromptsRequest(req)
     }
 
     fn get_prompt_request(extensions: Extensions) -> ClientRequest {
-        ClientRequest::GetPromptRequest(GetPromptRequest {
-            params: GetPromptRequestParams {
-                meta: None,
-                name: "prompt".to_string(),
-                arguments: None,
-            },
-            method: Default::default(),
-            extensions,
-        })
+        let mut req = Request::new(GetPromptRequestParams::new("prompt".to_string()));
+        req.extensions = extensions;
+        ClientRequest::GetPromptRequest(req)
     }
 
     #[test_case(
@@ -1015,5 +1163,111 @@ mod tests {
             .expect("ui extension should have mimeTypes");
 
         assert_eq!(mime_types, &json!(["text/html;profile=mcp-app"]));
+    }
+
+    #[test]
+    fn test_client_capabilities_advertise_roots() {
+        let client = new_client(GoosePlatform::GooseCli);
+        let info = ClientHandler::get_info(&client);
+        assert!(
+            info.capabilities.roots.is_some(),
+            "client should advertise roots capability"
+        );
+    }
+
+    #[test]
+    fn test_explicit_host_info_passes_through_client_identity() {
+        let client = GooseClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+            GoosePlatform::GooseDesktop.to_string(),
+            GooseMcpClientCapabilities {
+                mcpui: true,
+                host_info: Some(GooseMcpHostInfo {
+                    explicit_extensions: true,
+                    extensions: ExtensionCapabilities::new(),
+                    client_name: Some("goose2".to_string()),
+                    client_version: Some("0.1.0".to_string()),
+                }),
+            },
+            std::env::current_dir().unwrap_or_default(),
+        );
+
+        let info = ClientHandler::get_info(&client);
+        assert_eq!(info.client_info.name, "goose2");
+        assert_eq!(info.client_info.version, "0.1.0");
+        let extensions = info
+            .capabilities
+            .extensions
+            .expect("client should still serialize an extensions object");
+        assert!(
+            !extensions.contains_key(MCP_APPS_UI_EXTENSION_ID),
+            "explicit empty host extensions should disable platform fallback"
+        );
+    }
+
+    #[test]
+    fn test_explicit_host_extensions_override_platform_fallback() {
+        let client = GooseClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+            GoosePlatform::GooseCli.to_string(),
+            GooseMcpClientCapabilities {
+                mcpui: false,
+                host_info: Some(GooseMcpHostInfo {
+                    explicit_extensions: true,
+                    extensions: default_mcp_apps_ui_extensions(),
+                    client_name: Some("goose2".to_string()),
+                    client_version: Some("0.1.0".to_string()),
+                }),
+            },
+            std::env::current_dir().unwrap_or_default(),
+        );
+
+        let info = ClientHandler::get_info(&client);
+        let extensions = info
+            .capabilities
+            .extensions
+            .expect("capabilities should have explicit host extensions");
+
+        assert!(extensions.contains_key(MCP_APPS_UI_EXTENSION_ID));
+        assert_eq!(info.client_info.name, "goose2");
+    }
+
+    #[test]
+    fn test_host_identity_does_not_disable_platform_fallback_without_explicit_extensions() {
+        let client = GooseClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+            GoosePlatform::GooseDesktop.to_string(),
+            GooseMcpClientCapabilities {
+                mcpui: true,
+                host_info: Some(GooseMcpHostInfo {
+                    explicit_extensions: false,
+                    extensions: ExtensionCapabilities::new(),
+                    client_name: Some("goose2".to_string()),
+                    client_version: Some("0.1.0".to_string()),
+                }),
+            },
+            std::env::current_dir().unwrap_or_default(),
+        );
+
+        let info = ClientHandler::get_info(&client);
+        let extensions = info
+            .capabilities
+            .extensions
+            .expect("platform fallback should still advertise MCP Apps UI");
+
+        assert!(extensions.contains_key(MCP_APPS_UI_EXTENSION_ID));
+        assert_eq!(info.client_info.name, "goose2");
+    }
+
+    #[test]
+    fn test_working_dir_roots_returns_current_dir_as_root() {
+        let dir = PathBuf::from("/tmp/test-project");
+        let result = working_dir_roots(&dir);
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.roots[0].uri, "file:///tmp/test-project");
+        assert_eq!(result.roots[0].name.as_deref(), Some("working_directory"));
     }
 }

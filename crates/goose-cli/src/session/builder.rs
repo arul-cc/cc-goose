@@ -5,7 +5,7 @@ use super::CliSession;
 use console::style;
 use goose::agents::{Agent, Container, ExtensionError};
 use goose::config::resolve_extensions_for_new_session;
-use goose::config::{get_all_extensions, Config, ExtensionConfig};
+use goose::config::{Config, ExtensionConfig, GooseMode};
 use goose::providers::create;
 use goose::recipe::Recipe;
 use goose::session::session_manager::SessionType;
@@ -147,119 +147,9 @@ impl Default for SessionBuilderConfig {
     }
 }
 
-/// Offers to help debug an extension failure by creating a minimal debugging session
-async fn offer_extension_debugging_help(
-    extension_name: &str,
-    error_message: &str,
-    provider: Arc<dyn goose::providers::base::Provider>,
-    interactive: bool,
-) -> Result<(), anyhow::Error> {
-    // Only offer debugging help in interactive mode
-    if !interactive {
-        return Ok(());
-    }
-
-    let help_prompt = format!(
-        "Would you like me to help debug the '{}' extension failure?",
-        extension_name
-    );
-
-    let should_help = match cliclack::confirm(help_prompt)
-        .initial_value(false)
-        .interact()
-    {
-        Ok(choice) => choice,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(());
-            } else {
-                return Err(e.into());
-            }
-        }
-    };
-
-    if !should_help {
-        return Ok(());
-    }
-
-    println!("{}", style("🔧 Starting debugging session...").cyan());
-
-    // Create a debugging prompt with context about the extension failure
-    let debug_prompt = format!(
-        "I'm having trouble starting an extension called '{}'. Here's the error I encountered:\n\n{}\n\nCan you help me diagnose what might be wrong and suggest how to fix it? Please consider common issues like:\n- Missing dependencies or tools\n- Configuration problems\n- Network connectivity (for remote extensions)\n- Permission issues\n- Path or environment variable problems",
-        extension_name,
-        error_message
-    );
-
-    // Create a minimal agent for debugging
-    let debug_agent = Agent::new();
-
-    let session = debug_agent
-        .config
-        .session_manager
-        .create_session(
-            std::env::current_dir()?,
-            "CLI Session".to_string(),
-            SessionType::Hidden,
-        )
-        .await?;
-
-    debug_agent.update_provider(provider, &session.id).await?;
-
-    // Add the developer extension if available to help with debugging
-    let extensions = get_all_extensions();
-    for ext_wrapper in extensions {
-        if ext_wrapper.enabled && ext_wrapper.config.name() == "developer" {
-            if let Err(e) = debug_agent
-                .add_extension(ext_wrapper.config, &session.id)
-                .await
-            {
-                // If we can't add developer extension, continue without it
-                eprintln!(
-                    "Note: Could not load developer extension for debugging: {}",
-                    e
-                );
-            }
-            break;
-        }
-    }
-
-    let mut debug_session = CliSession::new(
-        debug_agent,
-        session.id,
-        false,
-        None,
-        None,
-        None,
-        None,
-        "text".to_string(),
-    )
-    .await;
-
-    // Process the debugging request
-    println!("{}", style("Analyzing the extension failure...").yellow());
-    match debug_session.headless(debug_prompt).await {
-        Ok(_) => {
-            println!(
-                "{}",
-                style("✅ Debugging session completed. Check the suggestions above.").green()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "{}",
-                style(format!("❌ Debugging session failed: {}", e)).red()
-            );
-        }
-    }
-    Ok(())
-}
-
 async fn load_extensions(
     agent: Agent,
     extensions_to_load: Vec<(String, ExtensionConfig)>,
-    provider_for_debug: Arc<dyn goose::providers::base::Provider>,
-    interactive: bool,
     session_id: &str,
 ) -> Arc<Agent> {
     let mut set = JoinSet::new();
@@ -293,21 +183,21 @@ async fn load_extensions(
     let spinner = cliclack::spinner();
     spinner.start(get_message(&waiting_ids));
 
-    let mut offer_debug: Vec<(usize, anyhow::Error)> = Vec::new();
+    let mut failed: Vec<(usize, anyhow::Error)> = Vec::new();
     while let Some(result) = set.join_next().await {
         match result {
             Ok((id, Ok(_))) => {
                 waiting_ids.remove(&id);
                 spinner.set_message(get_message(&waiting_ids));
             }
-            Ok((id, Err(e))) => offer_debug.push((id, e.into())),
+            Ok((id, Err(e))) => failed.push((id, e.into())),
             Err(e) => tracing::error!("failed to add extension: {}", e),
         }
     }
 
     spinner.clear();
 
-    for (id, err) in offer_debug {
+    for (id, err) in failed {
         let label = extensions_to_load
             .get(id)
             .map(|e| e.0.clone())
@@ -320,17 +210,14 @@ async fn load_extensions(
             ))
             .yellow()
         );
-
-        if let Err(debug_err) = offer_extension_debugging_help(
-            &label,
-            &err.to_string(),
-            Arc::clone(&provider_for_debug),
-            interactive,
-        )
-        .await
-        {
-            eprintln!("Note: Could not start debugging session: {}", debug_err);
-        }
+        eprintln!(
+            "{}",
+            style(format!(
+                "  Hint: once the session starts, ask goose to help debug the '{}' extension",
+                label
+            ))
+            .dim()
+        );
     }
 
     agent_ptr
@@ -359,7 +246,10 @@ fn resolve_provider_and_model(
         .or(saved_provider)
         .or_else(|| recipe_settings.and_then(|s| s.goose_provider.clone()))
         .or_else(|| config.get_goose_provider().ok())
-        .expect("No provider configured. Run 'goose configure' first");
+        .unwrap_or_else(|| {
+            output::render_error("No provider configured. Run 'goose configure' first.");
+            process::exit(1);
+        });
 
     let model_name = session_config
         .model
@@ -367,7 +257,10 @@ fn resolve_provider_and_model(
         .or_else(|| saved_model_config.as_ref().map(|mc| mc.model_name.clone()))
         .or_else(|| recipe_settings.and_then(|s| s.goose_model.clone()))
         .or_else(|| config.get_goose_model().ok())
-        .expect("No model configured. Run 'goose configure' first");
+        .unwrap_or_else(|| {
+            output::render_error("No model configured. Run 'goose configure' first.");
+            process::exit(1);
+        });
 
     let model_config = if session_config.resume
         && saved_model_config
@@ -375,6 +268,7 @@ fn resolve_provider_and_model(
             .is_some_and(|mc| mc.model_name == model_name)
     {
         let mut config = saved_model_config.unwrap();
+        config.normalize_effort_suffix();
         if let Some(temp) = recipe_settings.and_then(|s| s.temperature) {
             config = config.with_temperature(Some(temp));
         }
@@ -400,13 +294,25 @@ fn resolve_provider_and_model(
 async fn resolve_session_id(
     session_config: &SessionBuilderConfig,
     session_manager: &goose::session::session_manager::SessionManager,
+    goose_mode: GooseMode,
 ) -> String {
     if session_config.no_session {
-        let working_dir = std::env::current_dir().expect("Could not get working directory");
+        let working_dir = std::env::current_dir().unwrap_or_else(|e| {
+            output::render_error(&format!("Could not get working directory: {}", e));
+            process::exit(1);
+        });
         let session = session_manager
-            .create_session(working_dir, "CLI Session".to_string(), SessionType::Hidden)
+            .create_session(
+                working_dir,
+                "CLI Session".to_string(),
+                SessionType::Hidden,
+                goose_mode,
+            )
             .await
-            .expect("Could not create session");
+            .unwrap_or_else(|e| {
+                output::render_error(&format!("Could not create session: {}", e));
+                process::exit(1);
+            });
         session.id
     } else if session_config.resume {
         if let Some(ref session_id) = session_config.session_id {
@@ -445,7 +351,10 @@ async fn handle_resumed_session_workdir(agent: &Agent, session_id: &str, interac
             process::exit(1);
         });
 
-    let current_workdir = std::env::current_dir().expect("Failed to get current working directory");
+    let current_workdir = std::env::current_dir().unwrap_or_else(|e| {
+        output::render_error(&format!("Failed to get current working directory: {}", e));
+        process::exit(1);
+    });
     if current_workdir == session.working_dir {
         return;
     }
@@ -461,7 +370,10 @@ async fn handle_resumed_session_workdir(agent: &Agent, session_id: &str, interac
         ))
         .initial_value(true)
         .interact()
-        .expect("Failed to get user input");
+        .unwrap_or_else(|e| {
+            output::render_error(&format!("Failed to get user input: {}", e));
+            process::exit(1);
+        });
 
         if change_workdir {
             if !session.working_dir.exists() {
@@ -524,8 +436,6 @@ async fn collect_extension_configs(
 async fn resolve_and_load_extensions(
     agent: Agent,
     extensions: Vec<ExtensionConfig>,
-    provider_for_debug: Arc<dyn goose::providers::base::Provider>,
-    interactive: bool,
     session_id: &str,
 ) -> Arc<Agent> {
     for warning in goose::config::get_warnings() {
@@ -537,14 +447,7 @@ async fn resolve_and_load_extensions(
         .map(|cfg| (cfg.name(), cfg))
         .collect();
 
-    load_extensions(
-        agent,
-        extensions_to_load,
-        provider_for_debug,
-        interactive,
-        session_id,
-    )
-    .await
+    load_extensions(agent, extensions_to_load, session_id).await
 }
 
 async fn configure_session_prompts(
@@ -566,13 +469,19 @@ async fn configure_session_prompts(
 
     let system_prompt_file: Option<String> = config.get_param("GOOSE_SYSTEM_PROMPT_FILE_PATH").ok();
     if let Some(ref path) = system_prompt_file {
-        let override_prompt =
-            std::fs::read_to_string(path).expect("Failed to read system prompt file");
+        let override_prompt = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            output::render_error(&format!(
+                "Failed to read system prompt file '{}': {}",
+                path, e
+            ));
+            process::exit(1);
+        });
         session.agent.override_system_prompt(override_prompt).await;
     }
 }
 
 pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
+    #[cfg(feature = "telemetry")]
     goose::posthog::set_session_context("cli", session_config.resume);
 
     let config = Config::global();
@@ -606,7 +515,8 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
         .apply_recipe_components(recipe.and_then(|r| r.response.clone()), true)
         .await;
 
-    let session_id = resolve_session_id(&session_config, &session_manager).await;
+    let session_id =
+        resolve_session_id(&session_config, &session_manager, agent.config.goose_mode).await;
 
     if session_config.resume {
         handle_resumed_session_workdir(&agent, &session_id, session_config.interactive).await;
@@ -634,30 +544,27 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                 "Error {}.\n\
                 Please check your system keychain and run 'goose configure' again.\n\
                 If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
-                For more info, see: https://block.github.io/goose/docs/troubleshooting/#keychainkeyring-errors",
+                For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
                 e
             ));
             process::exit(1);
         }
     };
-    let provider_for_display = Arc::clone(&new_provider);
-
-    if let Some(lead_worker) = new_provider.as_lead_worker() {
-        let (lead_model, worker_model) = lead_worker.get_model_info();
-        tracing::info!(
-            "🤖 Lead/Worker Mode Enabled: Lead model (first 3 turns): {}, Worker model (turn 4+): {}, Auto-fallback on failures: Enabled",
-            lead_model,
-            worker_model
-        );
-    } else {
-        tracing::info!("🤖 Using model: {}", resolved.model_name);
-    }
+    tracing::info!("🤖 Using model: {}", resolved.model_name);
 
     agent
         .update_provider(new_provider, &session_id)
         .await
         .unwrap_or_else(|e| {
             output::render_error(&format!("Failed to initialize agent: {}", e));
+            process::exit(1);
+        });
+
+    agent
+        .update_goose_mode(agent.config.goose_mode, &session_id)
+        .await
+        .unwrap_or_else(|e| {
+            output::render_error(&format!("Failed to set session mode: {}", e));
             process::exit(1);
         });
 
@@ -673,14 +580,7 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
     }
 
     // Extensions are loaded after session creation because we may change directory when resuming
-    let agent_ptr = resolve_and_load_extensions(
-        agent,
-        extensions_for_provider,
-        Arc::clone(&provider_for_display),
-        session_config.interactive,
-        &session_id,
-    )
-    .await;
+    let agent_ptr = resolve_and_load_extensions(agent, extensions_for_provider, &session_id).await;
 
     let edit_mode = config
         .get_param::<String>("EDIT_MODE")
@@ -716,7 +616,6 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
             &resolved.provider_name,
             &resolved.model_name,
             &Some(session_id),
-            Some(&provider_for_display),
         );
     }
     session
@@ -785,21 +684,6 @@ mod tests {
         assert!(!config.interactive);
         assert!(!config.quiet);
         assert!(!config.fork);
-    }
-
-    #[tokio::test]
-    async fn test_offer_extension_debugging_help_function_exists() {
-        // This test just verifies the function compiles and can be called
-        // We can't easily test the interactive parts without mocking
-
-        // We can't actually test the full function without a real provider and user interaction
-        // But we can at least verify it compiles and the function signature is correct
-        let extension_name = "test-extension";
-        let error_message = "test error";
-
-        // This test mainly serves as a compilation check
-        assert_eq!(extension_name, "test-extension");
-        assert_eq!(error_message, "test error");
     }
 
     #[test]

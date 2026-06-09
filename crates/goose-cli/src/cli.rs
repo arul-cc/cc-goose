@@ -1,15 +1,22 @@
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell as ClapShell};
+use clap_complete_nushell::Nushell as ClapNushell;
+use goose::agents::GoosePlatform;
 use goose::builtin_extension::register_builtin_extensions;
-use goose::config::Config;
+use goose::config::{Config, GooseMode};
+#[cfg(feature = "telemetry")]
 use goose::posthog::get_telemetry_choice;
 use goose::recipe::Recipe;
+use goose::source_roots::SourceRoot;
 use goose_mcp::mcp_server_runner::{serve, McpCommand};
 use goose_mcp::{AutoVisualiserRouter, ComputerControllerServer, MemoryServer, TutorialServer};
 
-use crate::commands::configure::{configure_telemetry_consent_dialog, handle_configure};
+#[cfg(feature = "telemetry")]
+use crate::commands::configure::configure_telemetry_consent_dialog;
+use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
+use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
 use crate::commands::project::{handle_project_default, handle_projects_interactive};
 use crate::commands::recipe::{handle_deeplink, handle_list, handle_open, handle_validate};
 use crate::commands::term::{
@@ -22,6 +29,7 @@ use crate::commands::schedule::{
     handle_schedule_sessions,
 };
 use crate::commands::session::{handle_session_list, handle_session_remove};
+use crate::commands::skills::handle_skills_list;
 use crate::recipes::extract_from_cli::extract_recipe_info_from_cli;
 use crate::recipes::recipe::{explain_recipe, render_recipe_as_yaml};
 use crate::session::{build_session, SessionBuilderConfig};
@@ -31,6 +39,17 @@ use goose::session::SessionManager;
 use std::io::Read;
 use std::path::PathBuf;
 use tracing::warn;
+
+const GOOSE_SERVER_SECRET_KEY_ENV: &str = "GOOSE_SERVER__SECRET_KEY";
+
+fn generate_serve_secret_key() -> String {
+    use rand::distributions::{Alphanumeric, DistString};
+
+    format!(
+        "goose-acp-{}",
+        Alphanumeric.sample_string(&mut rand::thread_rng(), 32)
+    )
+}
 
 #[derive(Parser)]
 #[command(name = "goose", author, version, display_name = "", about, long_about = None)]
@@ -356,6 +375,7 @@ async fn get_or_create_session_id(
     identifier: Option<Identifier>,
     resume: bool,
     no_session: bool,
+    goose_mode: GooseMode,
 ) -> Result<Option<String>> {
     if no_session {
         return Ok(None);
@@ -399,6 +419,7 @@ async fn get_or_create_session_id(
                     std::env::current_dir()?,
                     "CLI Session".to_string(),
                     SessionType::User,
+                    goose_mode,
                 )
                 .await?;
             return Ok(Some(session.id));
@@ -411,7 +432,12 @@ async fn get_or_create_session_id(
         let has_user_provided_name = id.name.is_some();
         let name = id.name.unwrap_or_else(|| "CLI Session".to_string());
         let session = session_manager
-            .create_session(std::env::current_dir()?, name.clone(), SessionType::User)
+            .create_session(
+                std::env::current_dir()?,
+                name.clone(),
+                SessionType::User,
+                goose_mode,
+            )
             .await?;
 
         if has_user_provided_name {
@@ -518,6 +544,32 @@ enum SessionCommand {
             default_value = "markdown"
         )]
         format: String,
+
+        #[arg(
+            long = "nostr",
+            help = "Publish the JSON session export as an encrypted Nostr event and print a Goose share link"
+        )]
+        nostr: bool,
+
+        #[arg(
+            long = "relay",
+            value_name = "RELAY",
+            help = "Nostr relay URL to publish to (can be specified multiple times)",
+            action = clap::ArgAction::Append
+        )]
+        relays: Vec<String>,
+    },
+    #[command(
+        about = "Import a session from JSON, a Claude Code / Codex / Pi .jsonl, or an encrypted Nostr share link"
+    )]
+    Import {
+        #[arg(
+            help = "Path to a goose session export, a Claude Code, Codex, or Pi .jsonl transcript, or a goose://sessions/nostr share link"
+        )]
+        input: String,
+
+        #[arg(long = "nostr", help = "Treat input as an encrypted Nostr share link")]
+        nostr: bool,
     },
     #[command(name = "diagnostics")]
     Diagnostics {
@@ -552,6 +604,14 @@ enum SchedulerCommand {
             help = "Recipe source (path to file, or base64 encoded recipe string)"
         )]
         recipe_source: String,
+        #[arg(
+            long,
+            value_name = "KEY=VALUE",
+            help = "Recipe parameter in KEY=VALUE format (can be specified multiple times)",
+            action = clap::ArgAction::Append,
+            value_parser = parse_key_val,
+        )]
+        params: Vec<(String, String)>,
     },
     #[command(about = "List all scheduled jobs")]
     List {},
@@ -619,6 +679,36 @@ enum GatewayCommand {
         #[arg(help = "Gateway type to generate pairing code for")]
         gateway_type: String,
     },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Install a plugin from a git repository URL
+    #[command(about = "Install a plugin from a git repository URL")]
+    Install {
+        #[arg(
+            long,
+            help = "Automatically update this plugin before plugin skills are loaded"
+        )]
+        auto_update: bool,
+
+        #[arg(help = "URL to a git repository containing a supported plugin")]
+        url: String,
+    },
+
+    /// Update an installed git-backed plugin
+    #[command(about = "Update an installed git-backed plugin")]
+    Update {
+        #[arg(help = "Name of the installed plugin to update")]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    /// List all skills available to the goose agent
+    #[command(about = "List all skills available to the goose agent")]
+    List,
 }
 
 #[derive(Subcommand)]
@@ -699,7 +789,12 @@ enum Command {
         /// Show verbose information including current configuration
         #[arg(short, long, help = "Show verbose information including config.yaml")]
         verbose: bool,
+        #[arg(long, help = "Test provider connection and show status")]
+        check: bool,
     },
+
+    #[command(about = "Check that your Goose setup is working")]
+    Doctor {},
 
     /// Manage system prompts and behaviors
     #[command(about = "Run one of the mcp servers bundled with goose")]
@@ -718,6 +813,26 @@ enum Command {
             help = "Add builtin extensions by name (e.g., 'developer' or multiple: 'developer,github')",
             long_help = "Add one or more builtin extensions that are bundled with goose by specifying their names, comma-separated",
             value_delimiter = ','
+        )]
+        builtins: Vec<String>,
+    },
+
+    /// Start ACP server over HTTP and WebSocket
+    #[command(about = "Start ACP server over HTTP and WebSocket")]
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        #[arg(long, default_value = "3284")]
+        port: u16,
+
+        #[arg(
+            long = "with-builtin",
+            value_name = "NAME",
+            help = "Add builtin extensions by name (e.g., 'developer' or multiple: 'developer,github')",
+            long_help = "Add one or more builtin extensions that are bundled with goose by specifying their names, comma-separated",
+            value_delimiter = ',',
+            action = clap::ArgAction::Append
         )]
         builtins: Vec<String>,
     },
@@ -807,6 +922,20 @@ enum Command {
         command: RecipeCommand,
     },
 
+    /// Skill utilities
+    #[command(about = "Skill utilities")]
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+
+    /// Manage plugins
+    #[command(about = "Manage plugins")]
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+
     /// Manage scheduled jobs
     #[command(about = "Manage scheduled jobs", visible_alias = "sched")]
     Schedule {
@@ -825,6 +954,7 @@ enum Command {
     },
 
     /// Update the goose CLI version
+    #[cfg(feature = "update")]
     #[command(about = "Update the goose CLI version")]
     Update {
         /// Update to canary version
@@ -841,49 +971,14 @@ enum Command {
         reconfigure: bool,
     },
 
-    /// Start a web server with a chat interface
-    #[command(about = "Experimental: Start a web server with a chat interface")]
-    Web {
-        /// Port to run the web server on
-        #[arg(
-            short,
-            long,
-            default_value = "3000",
-            help = "Port to run the web server on"
-        )]
-        port: u16,
-
-        /// Host to bind the web server to
-        #[arg(
-            long,
-            default_value = "127.0.0.1",
-            help = "Host to bind the web server to"
-        )]
-        host: String,
-
-        /// Open browser automatically
-        #[arg(long, help = "Open browser automatically when server starts")]
-        open: bool,
-
-        /// Authentication token for both Basic Auth (password) and Bearer token
-        #[arg(long, help = "Authentication token to secure the web interface")]
-        auth_token: Option<String>,
-
-        /// Allow running without authentication when exposed on the network (unsafe)
-        #[arg(
-            long,
-            help = "Skip auth requirement when exposed on the network (unsafe)"
-        )]
-        no_auth: bool,
-    },
-
     /// Terminal-integrated session (one session per terminal)
     #[command(
         about = "Terminal-integrated goose session",
         long_about = "Runs a goose session tied to your terminal window.\n\
                       Each terminal maintains its own persistent session that resumes automatically.\n\n\
                       Setup:\n  \
-                        eval \"$(goose term init zsh)\"  # Add to ~/.zshrc\n\n\
+                        eval \"$(goose term init zsh)\"  # zsh/bash\n  \
+                        let init = ($nu.cache-dir | path join \"goose-term-init.nu\"); ^goose term init nu | save --force $init; source $init\n\n\
                       Usage:\n  \
                         goose term run \"list files in this directory\"\n  \
                         @goose \"create a python script\"  # using alias\n  \
@@ -893,7 +988,30 @@ enum Command {
         #[command(subcommand)]
         command: TermCommand,
     },
+
+    /// Launch the goose terminal UI (TUI)
+    #[cfg(feature = "tui")]
+    #[command(
+        about = "Launch the goose terminal UI",
+        long_about = "Launch the goose terminal UI (the @aaif/goose npm package).\n\
+                      \n\
+                      Resolution order:\n  \
+                      1. GOOSE_TUI_SCRIPT, if set to an existing dist/tui.js\n  \
+                      2. A local checkout's ui/text/dist/tui.js (dev workflow)\n  \
+                      3. `npx --yes --package <spec> -- goose-tui` (deployed installs)\n\
+                      \n\
+                      Override the npm spec via GOOSE_TUI_NPM_SPEC (default: @aaif/goose@latest).\n\
+                      Local script mode requires `node` on PATH; npx mode requires `npx` on PATH.\n\
+                      Any extra arguments are passed through to the TUI."
+    )]
+    Tui {
+        /// Arguments forwarded to the TUI
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Manage local inference models
+    #[cfg(feature = "local-inference")]
     #[command(about = "Manage local inference models", visible_alias = "lm")]
     LocalModels {
         #[command(subcommand)]
@@ -901,13 +1019,114 @@ enum Command {
     },
 
     /// Generate completions for various shells
-    #[command(about = "Generate the autocompletion script for the specified shell")]
+    #[command(
+        about = "Generate the autocompletion script or Nushell module for the specified shell"
+    )]
     Completion {
         #[arg(value_enum)]
-        shell: ClapShell,
+        shell: CompletionShell,
 
         #[arg(long, default_value = "goose", help = "Provide a custom binary name")]
         bin_name: String,
+    },
+
+    /// Local code review.
+    ///
+    /// Discovers `**/.agents/checks/*.md` subagent reviewers and
+    /// `**/.agents/REVIEW.md` scoped prompt overrides, builds a review
+    /// request from the working tree (or an explicit diff range), and
+    /// runs the review through goose.
+    #[command(about = "Review the current diff using goose")]
+    Review {
+        /// Diff range to review (e.g. "main...HEAD"). Defaults to the working
+        /// tree vs HEAD.
+        #[arg(value_name = "RANGE")]
+        range: Option<String>,
+
+        /// Path to a Markdown file with a custom base review prompt. Replaces
+        /// the embedded default prompt.
+        #[arg(long = "prompt", value_name = "FILE")]
+        prompt: Option<PathBuf>,
+
+        /// Default model used for the main review agent and for any check
+        /// that does not declare its own `model:` in frontmatter.
+        #[arg(long = "model", value_name = "MODEL")]
+        model: Option<String>,
+
+        /// Provider for the main review agent.
+        #[arg(long = "provider", value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// Force every discovered check to use this model, regardless of
+        /// the check's own `model:` field.
+        #[arg(long = "override-model", value_name = "MODEL")]
+        override_model: Option<String>,
+
+        /// Default `turn-limit` for orchestrated main-pass subprocesses and
+        /// for checks that do not declare their own. Does not cap the legacy
+        /// `--no-orchestrate` in-process main agent.
+        #[arg(long = "turn-limit", value_name = "N")]
+        turn_limit: Option<usize>,
+
+        /// Print the assembled review prompt and discovered checks instead of
+        /// running the review.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Suppress non-result output from the underlying agent.
+        #[arg(long, short = 'q')]
+        quiet: bool,
+
+        /// Disable the Rust-driven parallel orchestrator and fall back to
+        /// the single-prompt path that asks the main agent to delegate
+        /// each check via `delegate(... async: true ...)`. The default
+        /// orchestrator dispatches one `goose run` subprocess per check
+        /// (capped at 4 concurrent), bounding wall-clock to the slowest
+        /// single check rather than waiting on the model to issue
+        /// dispatches.
+        #[arg(long = "no-orchestrate")]
+        no_orchestrate: bool,
+
+        /// Additional free-form instructions to prepend to the review
+        /// (e.g. PR intent, commit-message context, "this is a refactor,
+        /// flag any behavior change"). Mirrors `amp review --instructions`
+        /// for drop-in compatibility with existing reviewer wrappers.
+        #[arg(long = "instructions", short = 'i', value_name = "TEXT")]
+        instructions: Option<String>,
+
+        /// Restrict the review to a specific set of files. Other files in
+        /// the diff are still passed to the agent for context but are
+        /// excluded from the assembled diff sent to checks. Mirrors
+        /// `amp review --files`.
+        #[arg(long = "files", short = 'f', value_name = "FILE", num_args = 1..)]
+        files: Vec<String>,
+
+        /// Only run checks whose `name` matches one of these. Other
+        /// discovered checks are skipped. Mirrors `amp review --check-filter`.
+        #[arg(long = "check-filter", short = 'c', value_name = "NAME", num_args = 1..)]
+        check_filter: Vec<String>,
+
+        /// Alternate directory to search for `.agents/checks/*.md` instead
+        /// of the repo root. Mirrors `amp review --check-scope`.
+        #[arg(long = "check-scope", short = 's', value_name = "DIR")]
+        check_scope: Option<PathBuf>,
+
+        /// Skip the main correctness pass and only run check subagents.
+        /// Mirrors `amp review --checks-only`.
+        #[arg(long = "checks-only")]
+        checks_only: bool,
+
+        /// Print only the diff summary; skip the full review.
+        /// Mirrors `amp review --summary-only`.
+        #[arg(long = "summary-only")]
+        summary_only: bool,
+
+        /// Minimum severity to display. Findings below this rank are
+        /// dropped from the output. Default is `medium`, matching
+        /// Amp's CLI which hides `low` from review output. Pass
+        /// `--severity low` to surface every finding.
+        #[arg(long = "severity", value_name = "LEVEL", default_value = "medium")]
+        severity: String,
     },
 
     #[command(
@@ -921,6 +1140,7 @@ enum Command {
     },
 }
 
+#[cfg(feature = "local-inference")]
 #[derive(Subcommand)]
 enum LocalModelsCommand {
     /// Search HuggingFace for GGUF models
@@ -963,11 +1183,16 @@ enum TermCommand {
                       Setup:\n  \
                         echo 'eval \"$(goose term init zsh)\"' >> ~/.zshrc\n  \
                         source ~/.zshrc\n\n\
+                        Nushell:\n  \
+                        let init = ($nu.cache-dir | path join \"goose-term-init.nu\")\n  \
+                        ^goose term init nu | save --force $init\n  \
+                        source $init\n\n\
                       With --default (anything typed that isn't a command goes to goose):\n  \
-                        echo 'eval \"$(goose term init zsh --default)\"' >> ~/.zshrc"
+                        echo 'eval \"$(goose term init zsh --default)\"' >> ~/.zshrc\n  \
+                        ^goose term init nu --default | save --force $init"
     )]
     Init {
-        /// Shell type (bash, zsh, fish, powershell)
+        /// Shell type (bash, zsh, fish, nu, powershell)
         #[arg(value_enum)]
         shell: Shell,
 
@@ -978,7 +1203,7 @@ enum TermCommand {
         #[arg(
             long = "default",
             help = "Make goose the default handler for unknown commands",
-            long_help = "When enabled, anything you type that isn't a valid command will be sent to goose. Only supported for zsh and bash."
+            long_help = "When enabled, anything you type that isn't a valid command will be sent to goose. Supported for zsh, bash, and nu."
         )]
         default: bool,
     },
@@ -1021,6 +1246,31 @@ enum CliProviderVariant {
     Ollama,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionShell {
+    Bash,
+    Elvish,
+    Fish,
+    #[value(alias = "pwsh")]
+    Powershell,
+    #[value(alias = "nushell")]
+    Nu,
+    Zsh,
+}
+
+impl CompletionShell {
+    fn generate(self, cmd: &mut clap::Command, bin_name: &str, writer: &mut dyn std::io::Write) {
+        match self {
+            CompletionShell::Bash => generate(ClapShell::Bash, cmd, bin_name, writer),
+            CompletionShell::Elvish => generate(ClapShell::Elvish, cmd, bin_name, writer),
+            CompletionShell::Fish => generate(ClapShell::Fish, cmd, bin_name, writer),
+            CompletionShell::Powershell => generate(ClapShell::PowerShell, cmd, bin_name, writer),
+            CompletionShell::Nu => generate(ClapNushell, cmd, bin_name, writer),
+            CompletionShell::Zsh => generate(ClapShell::Zsh, cmd, bin_name, writer),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InputConfig {
     pub contents: Option<String>,
@@ -1030,21 +1280,29 @@ pub struct InputConfig {
 fn get_command_name(command: &Option<Command>) -> &'static str {
     match command {
         Some(Command::Configure {}) => "configure",
+        Some(Command::Doctor {}) => "doctor",
         Some(Command::Info { .. }) => "info",
         Some(Command::Mcp { .. }) => "mcp",
         Some(Command::Acp { .. }) => "acp",
+        Some(Command::Serve { .. }) => "serve",
         Some(Command::Session { .. }) => "session",
         Some(Command::Project {}) => "project",
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Schedule { .. }) => "schedule",
+        #[cfg(feature = "update")]
         Some(Command::Update { .. }) => "update",
         Some(Command::Recipe { .. }) => "recipe",
-        Some(Command::Web { .. }) => "web",
+        Some(Command::Skills { .. }) => "skills",
+        Some(Command::Plugin { .. }) => "plugin",
         Some(Command::Term { .. }) => "term",
+        #[cfg(feature = "tui")]
+        Some(Command::Tui { .. }) => "tui",
+        #[cfg(feature = "local-inference")]
         Some(Command::LocalModels { .. }) => "local-models",
         Some(Command::Completion { .. }) => "completion",
+        Some(Command::Review { .. }) => "review",
         Some(Command::ValidateExtensions { .. }) => "validate-extensions",
         None => "default_session",
     }
@@ -1059,6 +1317,59 @@ async fn handle_mcp_command(server: McpCommand) -> Result<()> {
         McpCommand::Memory => serve(MemoryServer::new()).await?,
         McpCommand::Tutorial => serve(TutorialServer::new()).await?,
     }
+    Ok(())
+}
+
+async fn handle_serve_command(host: String, port: u16, builtins: Vec<String>) -> Result<()> {
+    use goose::acp::server_factory::{AcpServer, AcpServerFactoryConfig};
+    use goose::acp::transport::create_router;
+    use goose::config::paths::Paths;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tracing::info;
+
+    let builtins = if builtins.is_empty() {
+        vec!["developer".to_string()]
+    } else {
+        builtins
+    };
+
+    let additional_source_roots = Config::global()
+        .get_param::<String>("ADDITIONAL_AGENT_SOURCE_ROOTS")
+        .ok()
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let path = path.canonicalize().unwrap_or(path);
+            SourceRoot::read_only(path)
+        })
+        .collect();
+
+    let server = Arc::new(AcpServer::new(AcpServerFactoryConfig {
+        builtins,
+        data_dir: Paths::data_dir(),
+        config_dir: Paths::config_dir(),
+        goose_platform: GoosePlatform::GooseCli,
+        additional_source_roots,
+    }));
+    let secret_key = std::env::var(GOOSE_SERVER_SECRET_KEY_ENV)
+        .ok()
+        .map(|secret| secret.trim().to_string())
+        .filter(|secret| !secret.is_empty())
+        .unwrap_or_else(generate_serve_secret_key);
+    let router = create_router(server, secret_key);
+
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    info!("Starting ACP server on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -1084,6 +1395,8 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             identifier,
             output,
             format,
+            nostr,
+            relays,
         } => {
             let session_manager = SessionManager::instance();
             let session_identifier = if let Some(id) = identifier {
@@ -1101,8 +1414,17 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
                     }
                 }
             };
-            crate::commands::session::handle_session_export(session_identifier, output, format)
-                .await?;
+            crate::commands::session::handle_session_export(
+                session_identifier,
+                output,
+                format,
+                nostr,
+                relays,
+            )
+            .await?;
+        }
+        SessionCommand::Import { input, nostr } => {
+            crate::commands::session::handle_session_import(input, nostr).await?;
         }
         SessionCommand::Diagnostics { identifier, output } => {
             let session_manager = SessionManager::instance();
@@ -1135,6 +1457,7 @@ async fn handle_interactive_session(
     session_opts: SessionOptions,
     extension_opts: ExtensionOptions,
 ) -> Result<()> {
+    #[cfg(feature = "telemetry")]
     if get_telemetry_choice().is_none() {
         configure_telemetry_consent_dialog()?;
     }
@@ -1166,7 +1489,8 @@ async fn handle_interactive_session(
         }
     }
 
-    let mut session_id = get_or_create_session_id(identifier, resume, false).await?;
+    let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
+    let mut session_id = get_or_create_session_id(identifier, resume, false, goose_mode).await?;
 
     if fork {
         if let Some(id) = session_id {
@@ -1358,6 +1682,7 @@ async fn handle_run_command(
     output_opts: OutputOptions,
     model_opts: ModelOptions,
 ) -> Result<()> {
+    #[cfg(feature = "telemetry")]
     if run_behavior.interactive && get_telemetry_choice().is_none() {
         configure_telemetry_consent_dialog()?;
     }
@@ -1379,8 +1704,14 @@ async fn handle_run_command(
         }
     }
 
-    let session_id =
-        get_or_create_session_id(identifier, run_behavior.resume, run_behavior.no_session).await?;
+    let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
+    let session_id = get_or_create_session_id(
+        identifier,
+        run_behavior.resume,
+        run_behavior.no_session,
+        goose_mode,
+    )
+    .await?;
 
     let mut session = build_session(SessionBuilderConfig {
         session_id,
@@ -1452,7 +1783,8 @@ async fn handle_schedule_command(command: SchedulerCommand) -> Result<()> {
             schedule_id,
             cron,
             recipe_source,
-        } => handle_schedule_add(schedule_id, cron, recipe_source).await,
+            params,
+        } => handle_schedule_add(schedule_id, cron, recipe_source, params).await,
         SchedulerCommand::List {} => handle_schedule_list().await,
         SchedulerCommand::Remove { schedule_id } => handle_schedule_remove(schedule_id).await,
         SchedulerCommand::Sessions { schedule_id, limit } => {
@@ -1462,6 +1794,13 @@ async fn handle_schedule_command(command: SchedulerCommand) -> Result<()> {
         SchedulerCommand::ServicesStatus {} => handle_schedule_services_status().await,
         SchedulerCommand::ServicesStop {} => handle_schedule_services_stop().await,
         SchedulerCommand::CronHelp {} => handle_schedule_cron_help().await,
+    }
+}
+
+fn handle_plugin_subcommand(command: PluginCommand) -> Result<()> {
+    match command {
+        PluginCommand::Install { url, auto_update } => handle_plugin_install(&url, auto_update),
+        PluginCommand::Update { name } => handle_plugin_update(&name),
     }
 }
 
@@ -1483,6 +1822,12 @@ fn handle_recipe_subcommand(command: RecipeCommand) -> Result<()> {
     }
 }
 
+async fn handle_skills_subcommand(command: SkillsCommand) -> Result<()> {
+    match command {
+        SkillsCommand::List => handle_skills_list().await,
+    }
+}
+
 async fn handle_term_subcommand(command: TermCommand) -> Result<()> {
     match command {
         TermCommand::Init {
@@ -1496,10 +1841,11 @@ async fn handle_term_subcommand(command: TermCommand) -> Result<()> {
     }
 }
 
+#[cfg(feature = "local-inference")]
 async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> {
     use goose::providers::local_inference::hf_models;
     use goose::providers::local_inference::local_model_registry::{
-        get_registry, model_id_from_repo, LocalModelEntry,
+        get_registry, mmproj_local_path, model_id_from_repo, LocalModelEntry,
     };
 
     match command {
@@ -1536,10 +1882,28 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
         }
         LocalModelsCommand::Download { spec } => {
             println!("Resolving {}...", spec);
-            let (repo_id, file) = hf_models::resolve_model_spec(&spec).await?;
+            let (repo_id, resolved) = hf_models::resolve_model_spec_full(&spec).await?;
+            if resolved.files.len() > 1 {
+                anyhow::bail!(
+                    "Model '{}' is sharded ({} files) — download it from the desktop UI",
+                    spec,
+                    resolved.files.len()
+                );
+            }
+            let mmproj = resolved.mmproj;
+            let file = resolved.files.into_iter().next().unwrap();
             let model_id = model_id_from_repo(&repo_id, &file.quantization);
             let local_path =
                 goose::config::paths::Paths::in_data_dir("models").join(&file.filename);
+            let mmproj_path = mmproj
+                .as_ref()
+                .map(|mmproj| mmproj_local_path(&repo_id, &mmproj.filename));
+            let mmproj_source_url = mmproj.as_ref().map(|mmproj| mmproj.download_url.clone());
+            let mmproj_size_bytes = mmproj.as_ref().map_or(0, |mmproj| mmproj.size_bytes);
+            let mut download_files = vec![(file.download_url.clone(), local_path.clone())];
+            if let Some(mmproj) = mmproj {
+                download_files.push((mmproj.download_url, mmproj_path.clone().unwrap()));
+            }
 
             println!(
                 "Downloading {} ({})...",
@@ -1564,6 +1928,11 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                 source_url: file.download_url.clone(),
                 settings: Default::default(),
                 size_bytes: file.size_bytes,
+                mmproj_path,
+                mmproj_source_url,
+                mmproj_size_bytes,
+                mmproj_checked: true,
+                shard_files: vec![],
             };
 
             {
@@ -1575,11 +1944,16 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
 
             // Download
             let manager = goose::download_manager::get_download_manager();
+            let hf_token = goose::providers::huggingface_auth::resolve_token_async()
+                .await
+                .ok()
+                .flatten();
             manager
-                .download_model(
+                .download_model_sharded_with_bearer_token(
                     format!("{}-model", model_id),
-                    file.download_url,
-                    local_path,
+                    download_files,
+                    file.size_bytes + mmproj_size_bytes,
+                    hf_token,
                     None,
                 )
                 .await?;
@@ -1662,11 +2036,13 @@ async fn handle_default_session() -> Result<()> {
         return handle_configure().await;
     }
 
+    #[cfg(feature = "telemetry")]
     if get_telemetry_choice().is_none() {
         configure_telemetry_consent_dialog()?;
     }
 
-    let session_id = get_or_create_session_id(None, false, false).await?;
+    let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
+    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
 
     let mut session = build_session(SessionBuilderConfig {
         session_id,
@@ -1713,13 +2089,19 @@ pub async fn cli() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Completion { shell, bin_name }) => {
             let mut cmd = Cli::command();
-            generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+            shell.generate(&mut cmd, &bin_name, &mut std::io::stdout());
             Ok(())
         }
         Some(Command::Configure {}) => handle_configure().await,
-        Some(Command::Info { verbose }) => handle_info(verbose),
+        Some(Command::Doctor {}) => crate::commands::doctor::handle_doctor().await,
+        Some(Command::Info { verbose, check }) => handle_info(verbose, check).await,
         Some(Command::Mcp { server }) => handle_mcp_command(server).await,
-        Some(Command::Acp { builtins }) => goose_acp::server::run(builtins).await,
+        Some(Command::Acp { builtins }) => goose::acp::server::run(builtins).await,
+        Some(Command::Serve {
+            host,
+            port,
+            builtins,
+        }) => handle_serve_command(host, port, builtins).await,
         Some(Command::Session {
             command: Some(cmd), ..
         }) => handle_session_subcommand(cmd).await,
@@ -1772,6 +2154,7 @@ pub async fn cli() -> anyhow::Result<()> {
         }
         Some(Command::Gateway { command }) => handle_gateway_command(command).await,
         Some(Command::Schedule { command }) => handle_schedule_command(command).await,
+        #[cfg(feature = "update")]
         Some(Command::Update {
             canary,
             reconfigure,
@@ -1780,15 +2163,52 @@ pub async fn cli() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Recipe { command }) => handle_recipe_subcommand(command),
-        Some(Command::Web {
-            port,
-            host,
-            open,
-            auth_token,
-            no_auth,
-        }) => crate::commands::web::handle_web(port, host, open, auth_token, no_auth).await,
+        Some(Command::Skills { command }) => handle_skills_subcommand(command).await,
+        Some(Command::Plugin { command }) => handle_plugin_subcommand(command),
         Some(Command::Term { command }) => handle_term_subcommand(command).await,
+        #[cfg(feature = "tui")]
+        Some(Command::Tui { args }) => crate::commands::tui::handle_tui(args),
+        #[cfg(feature = "local-inference")]
         Some(Command::LocalModels { command }) => handle_local_models_command(command).await,
+        Some(Command::Review {
+            range,
+            prompt,
+            model,
+            provider,
+            override_model,
+            turn_limit,
+            dry_run,
+            quiet,
+            no_orchestrate,
+            instructions,
+            files,
+            check_filter,
+            check_scope,
+            checks_only,
+            summary_only,
+            severity,
+        }) => {
+            use crate::commands::review::{handle_review, ReviewOptions};
+            handle_review(ReviewOptions {
+                range,
+                prompt_file: prompt,
+                default_model: model,
+                provider,
+                override_model,
+                default_turn_limit: turn_limit,
+                dry_run,
+                quiet,
+                no_orchestrate,
+                instructions,
+                files,
+                check_filter,
+                check_scope,
+                checks_only,
+                summary_only,
+                severity,
+            })
+            .await
+        }
         Some(Command::ValidateExtensions { file }) => {
             use goose::agents::validate_extensions::validate_bundled_extensions;
             match validate_bundled_extensions(&file) {
@@ -1803,5 +2223,64 @@ pub async fn cli() -> anyhow::Result<()> {
             }
         }
         None => handle_default_session().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_command_accepts_nushell_alias() {
+        let cli = Cli::try_parse_from(["goose", "completion", "nushell"]).expect("parse failed");
+
+        match cli.command {
+            Some(Command::Completion {
+                shell: CompletionShell::Nu,
+                ..
+            }) => {}
+            _ => panic!("expected nu completion shell"),
+        }
+    }
+
+    #[test]
+    fn nushell_completion_generation_emits_module() {
+        let mut cmd = Cli::command();
+        let mut buffer = Vec::new();
+
+        CompletionShell::Nu.generate(&mut cmd, "goose", &mut buffer);
+
+        let script = String::from_utf8(buffer).expect("utf8");
+        assert!(script.contains("module completions"));
+        assert!(script.contains("export extern goose"));
+        assert!(script.contains("export use completions *"));
+    }
+
+    #[test]
+    fn term_init_help_mentions_nushell() {
+        let mut cmd = Cli::command();
+        let term = cmd.find_subcommand_mut("term").expect("term command");
+        let init = term.find_subcommand_mut("init").expect("init command");
+        let mut buffer = Vec::new();
+
+        init.write_long_help(&mut buffer).expect("write help");
+
+        let help = String::from_utf8(buffer).expect("utf8");
+        assert!(help.contains("goose term init nu"));
+        assert!(help.contains("Supported for zsh, bash, and nu"));
+    }
+
+    #[test]
+    fn completion_help_lists_nu() {
+        let mut cmd = Cli::command();
+        let completion = cmd
+            .find_subcommand_mut("completion")
+            .expect("completion command");
+        let mut buffer = Vec::new();
+
+        completion.write_long_help(&mut buffer).expect("write help");
+
+        let help = String::from_utf8(buffer).expect("utf8");
+        assert!(help.contains("nu"));
     }
 }

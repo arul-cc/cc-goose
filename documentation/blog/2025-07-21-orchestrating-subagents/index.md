@@ -36,7 +36,7 @@ I decided to create a digital resource that teaches foundational concepts like A
 
 ## Meet the Subagents
 
-[Subagents](/docs/guides/subagents) are individual AI instances that take on specific tasks. Each one runs in its own session, which helps preserve the main context window and keeps your primary Goose conversation uncluttered and focused on high-level orchestration. I think of subagents as temporary teammates. Goose assigns each subagent a job and deallocates it when the work is complete.
+[Subagents](/docs/guides/context-engineering/subagents) are individual AI instances that take on specific tasks. Each one runs in its own session, which helps preserve the main context window and keeps your primary Goose conversation uncluttered and focused on high-level orchestration. I think of subagents as temporary teammates. Goose assigns each subagent a job and deallocates it when the work is complete.
 
 For this project, I turned my subagents into an on-demand dev squad, and I assigned them the following roles:
 
@@ -56,7 +56,7 @@ As of version 1.10.0, subagents are no longer experimental and don't require ena
 
 ## Instructing My Team
 
-There are a few ways to create subagents in Goose. You can use natural language prompts, define them through [recipes](/docs/guides/recipes/), or even spin up [external subagents](/docs/guides/subagents/#external-subagents) like Codex or Claude Code.
+There are a few ways to create subagents in Goose. You can use natural language prompts, define them through [recipes](/docs/guides/recipes/), or even spin up [external subagents](/docs/guides/context-engineering/subagents/#external-subagents) like Codex or Claude Code.
 
 I took the natural language prompt approach because it felt convenient to directly configure a subagent through one prompt. Here’s the prompt I used:
   
@@ -102,7 +102,7 @@ This happened because each subagent wasn't aware of the other subagents' plan. T
 
 ## A Better Prompt Strategy
 
-This time, I took a different approach.I told Goose to spin up one subagent to analyze the UI and come up with a shared design plan. Once the plan was ready, Goose could then spawn four more subagents to implement the plan in parallel.
+This time, I took a different approach. I told Goose to spin up one subagent to analyze the UI and come up with a shared design plan. Once the plan was ready, Goose could then spawn four more subagents to implement the plan in parallel.
 
 ```
 Can you take a look at the UI? The color scheme is all over the place. I want it to be unified but also have a playground theme like a real-life playground. Not just the colors but the elements as well.
@@ -171,17 +171,17 @@ What will you build with subagents?
 
 [Download Goose](/)
 
-[Learn about subagents](/docs/guides/subagents)
+[Learn about subagents](/docs/guides/context-engineering/subagents)
 
 <head>
   <meta property="og:title" content="Orchestrating 6 Subagents to Build a Collaborative API Playground for Kids" />
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://block.github.io/goose/blog/2025/07/21/orchestrating-subagents" />
+  <meta property="og:url" content="https://goose-docs.ai/blog/2025/07/21/orchestrating-subagents" />
   <meta property="og:description" content="Delegating backend, frontend, docs, and tests so six subagents could build collaborative API tool for kids." />
-  <meta property="og:image" content="https://block.github.io/goose/assets/images/built-by-subagents-869a01d4b147ebdb54334dcc22dc521e.png" />
+  <meta property="og:image" content="https://goose-docs.ai/assets/images/built-by-subagents-869a01d4b147ebdb54334dcc22dc521e.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta property="twitter:domain" content="block.github.io/goose" />
+  <meta property="twitter:domain" content="goose-docs.ai" />
   <meta name="twitter:title" content="Orchestrating 6 Subagents to Build a Collaborative API Playground for Kids" />
   <meta name="twitter:description" content="Delegating backend, frontend, docs, and tests so six subagents could build collaborative API tool for kids." />
-  <meta name="twitter:image" content="https://block.github.io/goose/assets/images/built-by-subagents-869a01d4b147ebdb54334dcc22dc521e.png" />
+  <meta name="twitter:image" content="https://goose-docs.ai/assets/images/built-by-subagents-869a01d4b147ebdb54334dcc22dc521e.png" />
 </head>

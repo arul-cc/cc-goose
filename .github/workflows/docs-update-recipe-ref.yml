@@ -41,16 +41,16 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # Fetch all history for version comparison
           fetch-tags: true  # Fetch all tags so we can checkout version tags
       
       - name: Fetch upstream tags (for forks)
-        if: github.repository != 'block/goose'
+        if: github.repository != 'aaif-goose/goose'
         run: |
           # Add upstream remote and fetch tags (only needed when testing in forks)
-          git remote add upstream https://github.com/block/goose.git || git remote set-url upstream https://github.com/block/goose.git
+          git remote add upstream https://github.com/aaif-goose/goose.git || git remote set-url upstream https://github.com/aaif-goose/goose.git
           git fetch upstream --tags --force
           echo "✅ Fetched tags from upstream (fork mode)"
           echo "Total tags available: $(git tag | wc -l)"
@@ -68,7 +68,7 @@ jobs:
       - name: Install goose CLI
         run: |
           mkdir -p /home/runner/.local/bin
-          curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh \
+          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh \
             | CONFIGURE=false GOOSE_BIN_DIR=/home/runner/.local/bin bash
           echo "/home/runner/.local/bin" >> $GITHUB_PATH
           goose --version
@@ -191,7 +191,7 @@ jobs:
         if: |
           steps.extract.outputs.has_changes == 'true' && 
           (github.event.inputs.dry_run != 'true' || github.event_name == 'release')
-        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0  # v8.1.0
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
         with:
           branch: docs/auto-recipe-reference-${{ steps.versions.outputs.new_version }}
           delete-branch: true

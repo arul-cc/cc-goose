@@ -1,8 +1,7 @@
 use super::api_client::{ApiClient, AuthMethod};
 use super::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
-use super::errors::ProviderError;
 use super::openai_compatible::{
-    handle_response_openai_compat, handle_status_openai_compat, map_http_error_to_provider_error,
+    handle_response_openai_compat, handle_status, map_http_error_to_provider_error,
     stream_openai_compat,
 };
 use super::retry::ProviderRetry;
@@ -12,13 +11,15 @@ use crate::conversation::message::Message;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use goose_providers::errors::ProviderError;
+use goose_providers::images::ImageFormat;
 
 use crate::model::ModelConfig;
-use crate::providers::formats::openai::create_request;
+use goose_providers::formats::openai::{create_request, ModelConfigParams};
 use rmcp::model::Tool;
 use serde_json::Value;
 
-const TETRATE_PROVIDER_NAME: &str = "tetrate";
+pub const TETRATE_PROVIDER_NAME: &str = "tetrate";
 pub const TETRATE_DOC_URL: &str = "https://router.tetrate.ai";
 pub const TETRATE_BILLING_URL: &str = "https://router.tetrate.ai/billing";
 
@@ -55,7 +56,7 @@ impl TetrateProvider {
 
         let auth = AuthMethod::BearerToken(api_key);
         let api_client = ApiClient::new(host, auth)?
-            .with_header("HTTP-Referer", "https://block.github.io/goose")?
+            .with_header("HTTP-Referer", "https://goose-docs.ai")?
             .with_header("X-Title", "goose")?;
 
         Ok(Self {
@@ -76,7 +77,7 @@ impl TetrateProvider {
         }
     }
 
-    fn error_from_tetrate_error_payload(payload: Value) -> ProviderError {
+    fn error_from_tetrate_error_payload(payload: Value, url: &str) -> ProviderError {
         let code = payload
             .get("error")
             .and_then(|e| e.get("code"))
@@ -84,7 +85,7 @@ impl TetrateProvider {
             .unwrap_or(500) as u16;
         let status = reqwest::StatusCode::from_u16(code)
             .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-        Self::enrich_credits_error(map_http_error_to_provider_error(status, Some(payload)))
+        Self::enrich_credits_error(map_http_error_to_provider_error(status, Some(payload), url))
     }
 }
 
@@ -139,11 +140,17 @@ impl Provider for TetrateProvider {
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
         let payload = create_request(
-            model_config,
+            ModelConfigParams {
+                model_name: model_config.model_name.as_str(),
+                thinking_effort: model_config.thinking_effort(),
+                temperature: model_config.temperature,
+                max_tokens: model_config.max_tokens,
+                request_params: model_config.request_params.as_ref(),
+            },
             system,
             messages,
             tools,
-            &super::utils::ImageFormat::OpenAi,
+            &ImageFormat::OpenAi,
             true,
         )?;
 
@@ -155,7 +162,7 @@ impl Provider for TetrateProvider {
                     .api_client
                     .response_post(Some(session_id), "v1/chat/completions", &payload)
                     .await?;
-                let resp = handle_status_openai_compat(resp)
+                let resp = handle_status(resp)
                     .await
                     .map_err(Self::enrich_credits_error)?;
 
@@ -173,7 +180,10 @@ impl Provider for TetrateProvider {
                         .await
                         .map_err(Self::enrich_credits_error)?;
                     if body.get("error").is_some() {
-                        return Err(Self::error_from_tetrate_error_payload(body));
+                        return Err(Self::error_from_tetrate_error_payload(
+                            body,
+                            "v1/chat/completions",
+                        ));
                     }
 
                     return Err(ProviderError::ExecutionError(
@@ -203,7 +213,7 @@ impl Provider for TetrateProvider {
 
         // Tetrate can return errors in 200 OK responses, so check explicitly
         if json.get("error").is_some() {
-            return Err(Self::error_from_tetrate_error_payload(json));
+            return Err(Self::error_from_tetrate_error_payload(json, "v1/models"));
         }
 
         let arr = json.get("data").and_then(|v| v.as_array()).ok_or_else(|| {
@@ -257,7 +267,7 @@ mod tests {
                 "message": "Insufficient credits"
             }
         });
-        match TetrateProvider::error_from_tetrate_error_payload(payload) {
+        match TetrateProvider::error_from_tetrate_error_payload(payload, "test") {
             ProviderError::CreditsExhausted {
                 details,
                 top_up_url,
@@ -277,7 +287,7 @@ mod tests {
                 "message": "Invalid API key"
             }
         });
-        match TetrateProvider::error_from_tetrate_error_payload(payload) {
+        match TetrateProvider::error_from_tetrate_error_payload(payload, "test") {
             ProviderError::Authentication(msg) => {
                 assert!(msg.contains("Invalid API key"));
             }

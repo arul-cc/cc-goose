@@ -36,7 +36,7 @@
   {
     "id": "apify",
     "name": "Apify",
-    "description": "Extract data from any website with thousands of scrapers, crawlers, and automations on Apify Store ⚡",
+    "description": "Extract data from any website with thousands of scrapers, crawlers, and automations on Apify Store \u26a1",
     "command": "npx -y @apify/actors-mcp-server",
     "link": "https://github.com/apify/apify-mcp-server",
     "installation_notes": "Install using npx. Requires an Apify API token.",
@@ -72,7 +72,7 @@
     "name": "Auto Visualiser",
     "description": "Automatic data visualisation via MCP-UI",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose-mcp/src/autovisualiser",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose-mcp/src/autovisualiser",
     "installation_notes": "This is a built-in extension that comes with goose. No installation required.",
     "is_builtin": true,
     "endorsed": true,
@@ -168,7 +168,7 @@
     "name": "Computer Controller",
     "description": "Built-in computer controls for webscraping, file caching, and automations",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose-mcp/src/computercontroller",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose-mcp/src/computercontroller",
     "installation_notes": "This is a built-in extension that comes with goose. No installation required.",
     "is_builtin": true,
     "endorsed": true,
@@ -234,7 +234,7 @@
     "name": "Code Mode",
     "description": "Execute JavaScript code to interact with MCP tools efficiently",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose/src/agents/platform_extensions/code_execution.rs",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose/src/agents/platform_extensions/code_execution.rs",
     "installation_notes": "This is a built-in platform extension that comes with goose. No installation required.",
     "is_builtin": true,
     "endorsed": true,
@@ -245,7 +245,7 @@
     "name": "Developer",
     "description": "Built-in developer tools for file editing and shell command execution",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose-mcp/src/developer",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose-mcp/src/developer",
     "installation_notes": "This is a built-in extension that comes with goose and is enabled by default. No installation required.",
     "is_builtin": true,
     "endorsed": true,
@@ -276,6 +276,23 @@
       {
         "name": "ELEVENLABS_API_KEY",
         "description": "Required environment variable",
+        "required": true
+      }
+    ]
+  },
+  {
+    "id": "exa",
+    "name": "Exa Search",
+    "description": "AI-powered web search with neural and keyword capabilities",
+    "command": "npx -y exa-mcp-server",
+    "link": "https://github.com/exa-labs/exa-mcp-server",
+    "installation_notes": "Install using npx package manager. Requires Exa API key.",
+    "is_builtin": false,
+    "endorsed": false,
+    "environmentVariables": [
+      {
+        "name": "EXA_API_KEY",
+        "description": "API key for Exa web search service",
         "required": true
       }
     ]
@@ -312,17 +329,6 @@
     "is_builtin": false,
     "endorsed": true,
     "type": "streamable-http",
-    "environmentVariables": []
-  },
-  {
-    "id": "filesystem",
-    "name": "Filesystem",
-    "description": "File system operations and management (requires updating local paths)",
-    "command": "npx -y @modelcontextprotocol/server-filesystem /path/to/dir1 /path/to/dir2",
-    "link": "https://github.com/modelcontextprotocol/servers",
-    "installation_notes": "Install using npx package manager. Update the placeholder paths before running the 'goose session' command. If installing from the link, you must update the paths from the Extensions page before activating the extension.",
-    "is_builtin": false,
-    "endorsed": true,
     "environmentVariables": []
   },
   {
@@ -410,6 +416,34 @@
     "environmentVariables": []
   },
   {
+    "id": "linux-mcp-server",
+    "name": "Linux MCP Server",
+    "description": "Tools to allow LLM clients to interact with Linux systems remotely",
+    "command": "uvx linux-mcp-server",
+    "documentation": "https://rhel-lightspeed.github.io/linux-mcp-server/clients/#environment-variables",
+    "link": "https://github.com/rhel-lightspeed/linux-mcp-server",
+    "installation_notes": "Install using uvx package manager. Note: This is a read-only mcp server for discovering and interacting with remote/local systems.",
+    "is_builtin": false,
+    "endorsed": false,
+    "environmentVariables": [
+      {
+        "name": "LINUX_MCP_USER",
+        "description": "Default username for SSH connections",
+        "required": false
+      },
+      {
+        "name": "LINUX_MCP_SSH_KEY_PATH",
+        "description": "Path to SSH private key",
+        "required": false
+      },
+      {
+        "name": "LINUX_MCP_VERIFY_HOST_KEYS",
+        "description": "Verify remote host identity via known_hosts",
+        "required": false
+      }
+    ]
+  },
+  {
     "id": "mbot-mcp",
     "name": "MBot",
     "description": "Control a MakeBlock mbot2 rover through MQTT (requires local setup)",
@@ -442,7 +476,7 @@
     "name": "Memory",
     "description": "Built-in memory system for persistent context and information storage",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose-mcp/src/memory",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose-mcp/src/memory",
     "installation_notes": "This is a built-in extension that comes with goose. No installation required.",
     "is_builtin": true,
     "endorsed": true,
@@ -606,6 +640,26 @@
     ]
   },
   {
+    "id": "rendex-mcp",
+    "name": "Rendex",
+    "description": "Capture screenshots, generate PDFs, and render HTML to images via AI agents",
+    "url": "https://mcp.rendex.dev/mcp",
+    "link": "https://github.com/copperline-labs/rendex-mcp",
+    "installation_notes": "This is a remote extension that requires a Rendex API key from https://rendex.dev/dashboard/keys as a Request Header e.g Authorization: Bearer <YOUR_RENDEX_API_KEY>. Free tier includes 500 calls/month, no credit card required.",
+    "is_builtin": false,
+    "endorsed": false,
+    "environmentVariables": [],
+    "headers": [
+      {
+        "name": "Authorization",
+        "description": "Bearer <YOUR_RENDEX_API_KEY>",
+        "required": true
+      }
+    ],
+    "show_install_command": false,
+    "type": "streamable-http"
+  },
+  {
     "id": "repomix-mcp",
     "name": "Repomix",
     "description": "Repository analysis and code organization",
@@ -666,7 +720,7 @@
     "name": "Summon",
     "description": "Load skills and delegate tasks to subagents",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose/src/agents/platform_extensions/summon.rs",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose/src/agents/platform_extensions/summon.rs",
     "installation_notes": "This is a built-in platform extension that comes with goose. No installation required.",
     "is_builtin": true,
     "endorsed": true,
@@ -729,7 +783,7 @@
     "name": "Top of Mind",
     "description": "Inject persistent instructions into goose's working memory every turn",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose/src/agents/platform_extensions/tom.rs",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose/src/agents/platform_extensions/tom.rs",
     "installation_notes": "This is a built-in platform extension that comes with goose and is enabled by default. Configure via GOOSE_MOIM_MESSAGE_TEXT or GOOSE_MOIM_MESSAGE_FILE environment variables.",
     "is_builtin": true,
     "endorsed": true,
@@ -751,7 +805,7 @@
     "name": "Tutorial",
     "description": "Built-in tutorial and learning management system",
     "command": "",
-    "link": "https://github.com/block/goose/tree/main/crates/goose-mcp/src/tutorial",
+    "link": "https://github.com/aaif-goose/goose/tree/main/crates/goose-mcp/src/tutorial",
     "installation_notes": "This is a built-in extension that comes with goose. No installation required.",
     "is_builtin": true,
     "endorsed": false,
@@ -779,5 +833,35 @@
     "is_builtin": false,
     "endorsed": true,
     "environmentVariables": []
-  }
+  },
+  {
+    "id": "cash-app",
+    "name": "Cash App",
+    "description": "Cash App brings local food ordering into the AI era. Discover nearby sellers, browse menus with calories and allergen info, customize orders, and complete checkout\u2014all conversationally.",
+    "type": "streamable-http",
+    "url": "https://connect.squareup.com/v2/mcp/cash-app",
+    "link": "",
+    "installation_notes": "No local setup required. This extension connects to a remote service. Use the install button or run the command below.",
+    "is_builtin": false,
+    "endorsed": true,
+    "environmentVariables": []
+  },
+  {
+  "id": "scholar-sidekick",
+  "name": "Scholar Sidekick",
+  "description": "Resolve, format, export, and verify academic citations (DOI, PMID, ISBN, arXiv) plus retraction and open-access checks",
+  "command": "npx -y scholar-sidekick-mcp@latest",
+  "link": "https://github.com/mlava/scholar-sidekick-mcp",
+  "installation_notes": "Requires a free RapidAPI key. Get one at https://rapidapi.com/scholar-sidekick-scholar-sidekick-api/api/scholar-sidekick and set RAPIDAPI_KEY.",
+  "is_builtin": false,
+  "endorsed": false,
+  "environmentVariables": [
+    {
+      "name": "RAPIDAPI_KEY",
+      "description": "RapidAPI key for the Scholar Sidekick API (free tier available)",
+      "required": true
+    }
+  ]
+}
+
 ]

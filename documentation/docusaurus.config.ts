@@ -11,25 +11,31 @@ const inkeepApiKey = process.env.INKEEP_API_KEY;
 const inkeepIntegrationId = process.env.INKEEP_INTEGRATION_ID;
 const inkeepOrgId = process.env.INKEEP_ORG_ID;
 
+type SidebarItem = {
+  type?: string;
+  label?: string;
+  items?: SidebarItem[];
+  [key: string]: unknown;
+};
+
 const config: Config = {
-  title: "goose",
-  tagline:
-    "your local AI agent, automating engineering tasks seamlessly",
+  title: "goose | Your open source AI agent",
+  tagline: "your local AI agent, automating engineering tasks seamlessly",
   favicon: "img/favicon.ico",
 
   // Set the production url of your site here
-  url: "https://block.github.io/",
+  url: "https://goose-docs.ai/",
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
-  baseUrl: process.env.TARGET_PATH || "/goose/",
+  baseUrl: process.env.TARGET_PATH || "/",
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: "block", // Usually your GitHub org/user name.
+  organizationName: "aaif-goose", // Usually your GitHub org/user name.
   projectName: "goose", // Usually your repo name.
 
   onBrokenLinks: "throw",
-  
+
   markdown: {
     hooks: {
       onBrokenMarkdownLinks: "warn",
@@ -44,7 +50,6 @@ const config: Config = {
     locales: ["en"],
   },
 
-
   headTags: [
     {
       tagName: "link",
@@ -52,7 +57,7 @@ const config: Config = {
         rel: "alternate",
         type: "text/plain",
         title: "LLM context",
-        href: "/goose/llms.txt",
+        href: "/llms.txt",
       },
     },
   ],
@@ -63,6 +68,48 @@ const config: Config = {
       {
         docs: {
           sidebarPath: "./sidebars.ts",
+          async sidebarItemsGenerator(args) {
+            const items = await args.defaultSidebarItemsGenerator(args);
+
+            const contextEngineeringItems = [
+              {
+                type: "doc" as const,
+                id: "mcp/memory-mcp",
+                label: "Memory Extension",
+              },
+              {
+                type: "doc" as const,
+                id: "tutorials/rpi",
+                label: "Research → Plan → Implement",
+              },
+            ];
+
+            const addItemsToCategory = (
+              sidebarItems: SidebarItem[],
+              categoryLabel: string,
+              extraItems: SidebarItem[],
+            ) => {
+              for (const item of sidebarItems) {
+                if (item.type === "category" && item.label === categoryLabel) {
+                  item.items.push(...extraItems);
+                  return true;
+                }
+
+                if (
+                  item.type === "category" &&
+                  addItemsToCategory(item.items, categoryLabel, extraItems)
+                ) {
+                  return true;
+                }
+              }
+
+              return false;
+            };
+
+            addItemsToCategory(items, "Context Engineering", contextEngineeringItems);
+
+            return items;
+          },
         },
         blog: {
           showReadingTime: true,
@@ -76,7 +123,8 @@ const config: Config = {
           onInlineTags: "warn",
           onInlineAuthors: "warn",
           onUntruncatedBlogPosts: "warn",
-          blogSidebarCount: 'ALL'
+          blogSidebarCount: "ALL",
+          postsPerPage: 22,
         },
         theme: {
           customCss: [
@@ -85,10 +133,13 @@ const config: Config = {
             "./src/css/tailwind.css",
           ],
         },
-        gtag: process.env.NODE_ENV === 'production' ? {
-          trackingID: 'G-ZS5D6SB4ZJ',
-          anonymizeIP: true,
-        } : false,
+        gtag:
+          process.env.NODE_ENV === "production"
+            ? {
+                trackingID: "G-ZS5D6SB4ZJ",
+                anonymizeIP: true,
+              }
+            : false,
       } satisfies Preset.Options,
     ],
   ],
@@ -99,242 +150,274 @@ const config: Config = {
       {
         redirects: [
           {
-            from: '/docs/getting-started/using-goose-free',
-            to: '/docs/getting-started/providers#using-goose-for-free'
+            from: "/docs/getting-started/using-goose-free",
+            to: "/docs/getting-started/providers#using-goose-for-free",
           },
           {
-            from: '/v1/docs/getting-started/providers',
-            to: '/docs/getting-started/providers'
+            from: "/v1/docs/getting-started/providers",
+            to: "/docs/getting-started/providers",
           },
           {
-            from: '/v1/docs/getting-started/installation',
-            to: '/docs/getting-started/installation'
+            from: "/v1/docs/getting-started/installation",
+            to: "/docs/getting-started/installation",
           },
           {
-            from: '/v1/docs/quickstart',
-            to: '/docs/quickstart'
+            from: "/v1/docs/quickstart",
+            to: "/docs/quickstart",
           },
           {
-            from: '/v1/',
-            to: '/'
+            from: "/v1/",
+            to: "/",
           },
           {
-            from: '/docs/guides/custom-extensions',
-            to: '/docs/tutorials/custom-extensions'
+            from: "/docs/guides/custom-extensions",
+            to: "/docs/tutorials/custom-extensions",
           },
           {
-            from: '/docs',
-            to: '/docs/category/getting-started'
+            from: "/docs",
+            to: "/docs/category/getting-started",
           },
           {
-            from: '/v1/extensions',
-            to: '/extensions'
+            from: "/v1/extensions",
+            to: "/extensions",
           },
           {
-            from: '/v1/extensions/detail/nondeveloper',
-            to: '/docs/mcp/computer-controller-mcp'
+            from: "/v1/extensions/detail/nondeveloper",
+            to: "/docs/mcp/computer-controller-mcp",
           },
           {
-            from: '/docs/guides/managing-goose-sessions',
-            to: '/docs/guides/sessions/session-management'
+            from: "/docs/guides/managing-goose-sessions",
+            to: "/docs/guides/sessions/session-management",
           },
           {
-            from: '/docs/guides/smart-context-management',
-            to: '/docs/guides/sessions/smart-context-management'
+            from: "/docs/guides/smart-context-management",
+            to: "/docs/guides/sessions/smart-context-management",
           },
           {
-            from: '/docs/guides/share-goose-sessions',
-            to: '/docs/guides/recipes/session-recipes'
+            from: "/docs/guides/share-goose-sessions",
+            to: "/docs/guides/recipes/session-recipes",
           },
           {
-            from: '/docs/guides/session-recipes',
-            to: '/docs/guides/recipes/session-recipes'
+            from: "/docs/guides/session-recipes",
+            to: "/docs/guides/recipes/session-recipes",
           },
           {
-            from: '/docs/guides/recipe-reference',
-            to: '/docs/guides/recipes/recipe-reference'
+            from: "/docs/guides/recipe-reference",
+            to: "/docs/guides/recipes/recipe-reference",
           },
           {
-            from: '/docs/guides/recipes/sub-recipes',
-            to: '/docs/guides/recipes/subrecipes'
+            from: "/docs/guides/recipes/sub-recipes",
+            to: "/docs/guides/recipes/subrecipes",
           },
           {
-            from: '/docs/tutorials/sub-recipes-in-parallel',
-            to: '/docs/tutorials/subrecipes-in-parallel'
+            from: "/docs/tutorials/sub-recipes-in-parallel",
+            to: "/docs/tutorials/subrecipes-in-parallel",
           },
           {
-            from: '/docs/guides/tool-permissions',
-            to: '/docs/guides/managing-tools/tool-permissions'
+            from: "/docs/guides/tool-permissions",
+            to: "/docs/guides/managing-tools/tool-permissions",
           },
           {
-            from: '/docs/guides/adjust-tool-output',
-            to: '/docs/guides/managing-tools/adjust-tool-output'
+            from: "/docs/guides/adjust-tool-output",
+            to: "/docs/guides/managing-tools/adjust-tool-output",
           },
           {
-            from: '/docs/guides/benchmarking',
-            to: '/docs/tutorials/benchmarking'
+            from: "/docs/guides/goose-in-docker",
+            to: "/docs/tutorials/goose-in-docker",
           },
           {
-            from: '/docs/guides/goose-in-docker',
-            to: '/docs/tutorials/goose-in-docker'
+            from: "/docs/guides/multi-model/creating-plans",
+            to: "/docs/guides/context-engineering/creating-plans",
           },
           {
-            from: '/docs/guides/multi-model/creating-plans',
-            to: '/docs/guides/creating-plans'
+            from: "/docs/guides/creating-plans",
+            to: "/docs/guides/context-engineering/creating-plans",
           },
           {
-            from: '/docs/guides/config-file',
-            to: '/docs/guides/config-files',
+            from: "/docs/guides/using-gooseignore",
+            to: "/docs/guides/context-engineering/using-gooseignore",
           },
           {
-            from: '/docs/guides/using-goosehints',
-            to: '/docs/guides/context-engineering/using-goosehints',
+            from: "/docs/guides/config-file",
+            to: "/docs/guides/config-files",
+          },
+          {
+            from: "/docs/guides/using-persistent-instructions",
+            to: "/docs/guides/context-engineering/using-persistent-instructions",
+          },
+          {
+            from: "/docs/guides/subagents",
+            to: "/docs/guides/context-engineering/subagents",
+          },
+          {
+            from: "/docs/guides/prompt-templates",
+            to: "/docs/guides/context-engineering/prompt-templates",
+          },
+          {
+            from: "/docs/guides/goose-permissions",
+            to: "/docs/guides/managing-tools/goose-permissions",
+          },
+          {
+            from: "/docs/guides/using-goosehints",
+            to: "/docs/guides/context-engineering/using-goosehints",
+          },
+          {
+            from: "/docs/guides/managing-tools/hooks",
+            to: "/docs/guides/context-engineering/hooks",
+          },
+          {
+            from: "/docs/guides/managing-tools/plugins",
+            to: "/docs/guides/context-engineering/plugins",
           },
           // MCP tutorial redirects - moved from /docs/tutorials/ to /docs/mcp/
           {
-            from: '/docs/tutorials/agentql-mcp',
-            to: '/docs/mcp/agentql-mcp'
+            from: "/docs/tutorials/agentql-mcp",
+            to: "/docs/mcp/agentql-mcp",
           },
           {
-            from: '/docs/tutorials/asana-mcp',
-            to: '/docs/mcp/asana-mcp'
+            from: "/docs/tutorials/asana-mcp",
+            to: "/docs/mcp/asana-mcp",
           },
           {
-            from: '/docs/tutorials/blender-mcp',
-            to: '/docs/mcp/blender-mcp'
+            from: "/docs/tutorials/blender-mcp",
+            to: "/docs/mcp/blender-mcp",
           },
           {
-            from: '/docs/tutorials/brave-mcp',
-            to: '/docs/mcp/brave-mcp'
+            from: "/docs/tutorials/brave-mcp",
+            to: "/docs/mcp/brave-mcp",
           },
           {
-            from: '/docs/tutorials/browserbase-mcp',
-            to: '/docs/mcp/browserbase-mcp'
+            from: "/docs/tutorials/browserbase-mcp",
+            to: "/docs/mcp/browserbase-mcp",
           },
           {
-            from: '/docs/tutorials/computer-controller-mcp',
-            to: '/docs/mcp/computer-controller-mcp'
+            from: "/docs/tutorials/computer-controller-mcp",
+            to: "/docs/mcp/computer-controller-mcp",
           },
           {
-            from: '/docs/tutorials/context7-mcp',
-            to: '/docs/mcp/context7-mcp'
+            from: "/docs/tutorials/context7-mcp",
+            to: "/docs/mcp/context7-mcp",
           },
           {
-            from: '/docs/tutorials/developer-mcp',
-            to: '/docs/mcp/developer-mcp'
+            from: "/docs/tutorials/developer-mcp",
+            to: "/docs/mcp/developer-mcp",
           },
           {
-            from: '/docs/tutorials/elevenlabs-mcp',
-            to: '/docs/mcp/elevenlabs-mcp'
+            from: "/docs/tutorials/elevenlabs-mcp",
+            to: "/docs/mcp/elevenlabs-mcp",
           },
           {
-            from: '/docs/tutorials/fetch-mcp',
-            to: '/docs/mcp/fetch-mcp'
+            from: "/docs/tutorials/fetch-mcp",
+            to: "/docs/mcp/fetch-mcp",
           },
           {
-            from: '/docs/tutorials/figma-mcp',
-            to: '/docs/mcp/figma-mcp'
+            from: "/docs/tutorials/figma-mcp",
+            to: "/docs/mcp/figma-mcp",
           },
           {
-            from: '/docs/tutorials/filesystem-mcp',
-            to: '/docs/mcp/filesystem-mcp'
+            from: ["/docs/tutorials/filesystem-mcp", "/docs/mcp/filesystem-mcp"],
+            to: "/docs/getting-started/using-extensions",
           },
           {
-            from: '/docs/tutorials/github-mcp',
-            to: '/docs/mcp/github-mcp'
+            from: "/docs/tutorials/github-mcp",
+            to: "/docs/mcp/github-mcp",
           },
           {
-            from: '/docs/tutorials/google-drive-mcp',
-            to: '/docs/mcp/google-drive-mcp'
+            from: "/docs/tutorials/google-drive-mcp",
+            to: "/docs/mcp/google-drive-mcp",
           },
           {
-            from: '/docs/tutorials/google-maps-mcp',
-            to: '/docs/mcp/google-maps-mcp'
+            from: "/docs/tutorials/google-maps-mcp",
+            to: "/docs/mcp/google-maps-mcp",
           },
           {
-            from: '/docs/tutorials/jetbrains-mcp',
-            to: '/docs/mcp/jetbrains-mcp'
+            from: "/docs/tutorials/jetbrains-mcp",
+            to: "/docs/mcp/jetbrains-mcp",
           },
           {
-            from: '/docs/tutorials/knowledge-graph-mcp',
-            to: '/docs/mcp/knowledge-graph-mcp'
+            from: "/docs/tutorials/knowledge-graph-mcp",
+            to: "/docs/mcp/knowledge-graph-mcp",
           },
           {
-            from: '/docs/tutorials/mbot-mcp',
-            to: '/docs/mcp/mbot-mcp'
+            from: "/docs/tutorials/mbot-mcp",
+            to: "/docs/mcp/mbot-mcp",
           },
           {
-            from: '/docs/tutorials/memory-mcp',
-            to: '/docs/mcp/memory-mcp'
+            from: "/docs/tutorials/memory-mcp",
+            to: "/docs/mcp/memory-mcp",
           },
           {
-            from: '/docs/tutorials/nostrbook-mcp',
-            to: '/docs/mcp/nostrbook-mcp'
+            from: "/docs/tutorials/nostrbook-mcp",
+            to: "/docs/mcp/nostrbook-mcp",
           },
           {
-            from: '/docs/tutorials/pdf-mcp',
-            to: '/docs/mcp/pdf-mcp'
+            from: "/docs/tutorials/pdf-mcp",
+            to: "/docs/mcp/pdf-mcp",
           },
           {
-            from: '/docs/tutorials/pieces-mcp',
-            to: '/docs/mcp/pieces-mcp'
+            from: "/docs/tutorials/pieces-mcp",
+            to: "/docs/mcp/pieces-mcp",
           },
           {
-            from: '/docs/tutorials/playwright-mcp',
-            to: '/docs/mcp/playwright-mcp'
+            from: "/docs/tutorials/playwright-mcp",
+            to: "/docs/mcp/playwright-mcp",
           },
           {
-            from: '/docs/tutorials/postgres-mcp',
-            to: '/docs/mcp/postgres-mcp'
+            from: "/docs/tutorials/postgres-mcp",
+            to: "/docs/mcp/postgres-mcp",
           },
           {
-            from: '/docs/tutorials/puppeteer-mcp',
-            to: '/docs/mcp/puppeteer-mcp'
+            from: "/docs/tutorials/puppeteer-mcp",
+            to: "/docs/mcp/puppeteer-mcp",
           },
           {
-            from: '/docs/tutorials/reddit-mcp',
-            to: '/docs/mcp/reddit-mcp'
+            from: "/docs/tutorials/reddit-mcp",
+            to: "/docs/mcp/reddit-mcp",
           },
           {
-            from: '/docs/tutorials/repomix-mcp',
-            to: '/docs/mcp/repomix-mcp'
+            from: "/docs/tutorials/repomix-mcp",
+            to: "/docs/mcp/repomix-mcp",
           },
           {
-            from: '/docs/tutorials/selenium-mcp',
-            to: '/docs/mcp/selenium-mcp'
+            from: "/docs/tutorials/selenium-mcp",
+            to: "/docs/mcp/selenium-mcp",
           },
           {
-            from: '/docs/tutorials/speech-mcp',
-            to: '/docs/mcp/speech-mcp'
+            from: "/docs/tutorials/speech-mcp",
+            to: "/docs/mcp/speech-mcp",
           },
           {
-            from: '/docs/tutorials/square-mcp',
-            to: '/docs/mcp/square-mcp'
+            from: "/docs/tutorials/square-mcp",
+            to: "/docs/mcp/square-mcp",
           },
           {
-            from: '/docs/tutorials/tavily-mcp',
-            to: '/docs/mcp/tavily-mcp'
+            from: "/docs/tutorials/tavily-mcp",
+            to: "/docs/mcp/tavily-mcp",
           },
           {
-            from: '/docs/tutorials/tutorial-extension',
-            to: '/docs/mcp/tutorial-mcp'
+            from: "/docs/tutorials/tutorial-extension",
+            to: "/docs/mcp/tutorial-mcp",
           },
           {
-            from: '/docs/tutorials/vscode-mcp',
-            to: '/docs/mcp/vs-code-mcp'
+            from: "/docs/tutorials/vscode-mcp",
+            to: "/docs/mcp/vs-code-mcp",
           },
           {
-            from: '/docs/tutorials/youtube-transcript',
-            to: '/docs/mcp/youtube-transcript-mcp'
+            from: "/docs/tutorials/youtube-transcript",
+            to: "/docs/mcp/youtube-transcript-mcp",
           },
           {
-            from: '/docs/guides/isolated-development-environments',
-            to: '/docs/tutorials/isolated-development-environments'
+            from: "/docs/guides/isolated-development-environments",
+            to: "/docs/tutorials/isolated-development-environments",
           },
           {
-            from: '/docs/experimental/subagents',
-            to: '/docs/guides/subagents'
-          }         
+            from: "/docs/experimental/subagents",
+            to: "/docs/guides/context-engineering/subagents",
+          },
+          {
+            from: "/docs/tutorials/lead-worker",
+            to: "/docs/guides/context-engineering/creating-plans",
+          },
         ],
       },
     ],
@@ -351,12 +434,12 @@ const config: Config = {
     // Replace with your project's social card
     image: "img/home-banner.png",
     colorMode: {
-      respectPrefersColorScheme: true
+      respectPrefersColorScheme: true,
     },
     navbar: {
       title: "",
       logo: {
-        alt: "Block Logo",
+        alt: "goose Logo", // TODO: replace logo assets with AAIF branding
         src: "img/logo_light.png",
         srcDark: "img/logo_dark.png",
       },
@@ -383,33 +466,33 @@ const config: Config = {
         },
         { to: "/blog", label: "Blog", position: "left" },
         {
-          type: 'dropdown',
-          label: 'Resources',
-          position: 'left',
+          type: "dropdown",
+          label: "Resources",
+          position: "left",
           items: [
             {
-              to: '/extensions',
-              label: 'Extensions',
+              to: "/extensions",
+              label: "Extensions",
             },
             {
-              to: '/skills',
-              label: 'Skills Marketplace',
+              to: "/skills",
+              label: "Skills Marketplace",
             },
             {
-              to: '/recipe-generator',
-              label: 'Recipe Generator',
+              to: "/recipe-generator",
+              label: "Recipe Generator",
             },
             {
-              to: '/prompt-library',
-              label: 'Prompt Library',
+              to: "/prompt-library",
+              label: "Prompt Library",
             },
             {
-              to: '/recipes',
-              label: 'Recipe Cookbook',
+              to: "/recipes",
+              label: "Recipe Cookbook",
             },
             {
-              to: 'deeplink-generator',
-              label: 'Deeplink Generator',
+              to: "deeplink-generator",
+              label: "Deeplink Generator",
             },
           ],
         },
@@ -420,7 +503,7 @@ const config: Config = {
           position: "right",
         },
         {
-          href: "https://github.com/block/goose",
+          href: "https://github.com/aaif-goose/goose",
           label: "GitHub",
           position: "right",
         },
@@ -483,12 +566,12 @@ const config: Config = {
             },
             {
               label: "GitHub",
-              href: "https://github.com/block/goose",
+              href: "https://github.com/aaif-goose/goose",
             },
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Block, Inc.`,
+      copyright: `Copyright © ${new Date().getFullYear()} AAIF (Agentic AI Foundation)`,
     },
     prism: {
       theme: prismThemes.github,
@@ -503,12 +586,11 @@ const config: Config = {
       },
       aiChatSettings: {
         chatSubjectName: "goose",
-        botAvatarSrcUrl:
-          "",
+        botAvatarSrcUrl: "",
         getHelpCallToActions: [
           {
             name: "GitHub",
-            url: "https://github.com/block/goose",
+            url: "https://github.com/aaif-goose/goose",
             icon: {
               builtIn: "FaGithub",
             },
@@ -517,16 +599,15 @@ const config: Config = {
         quickQuestions: ["What is goose?"],
       },
     },
-    // announcementBar: {
-    //   id: 'goose-grants',
-    //   content:
-    //     '✨ goose grant program now open: <a href="/goose/grants">apply now</a>! ✨',
-    //   backgroundColor: '#20232a',
-    //   textColor: '#fff',
-    //   isCloseable: false,
-    // },
+    announcementBar: {
+      id: 'goose-aaif-announcement', // Increment on new announcements to reuse the bar
+      content:
+        '✨ goose has moved to the Agentic AI Foundation (AAIF): <a href="/blog/2026/04/07/goose-moves-to-aaif">Learn more</a>! ✨',
+      backgroundColor: '#20232a',
+      textColor: '#fff',
+      isCloseable: true,
+    },
   } satisfies Preset.ThemeConfig,
 };
-
 
 export default config;

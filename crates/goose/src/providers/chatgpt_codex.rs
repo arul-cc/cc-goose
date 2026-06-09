@@ -3,9 +3,8 @@ use crate::conversation::message::{Message, MessageContent};
 use crate::model::ModelConfig;
 use crate::providers::api_client::AuthProvider;
 use crate::providers::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
-use crate::providers::errors::ProviderError;
 use crate::providers::formats::openai_responses::responses_api_to_streaming_message;
-use crate::providers::openai_compatible::handle_status_openai_compat;
+use crate::providers::openai_compatible::handle_status;
 use crate::providers::retry::ProviderRetry;
 use crate::session_context::SESSION_ID_HEADER;
 use anyhow::{anyhow, Result};
@@ -16,6 +15,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
+use goose_providers::errors::ProviderError;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use reqwest::header::{HeaderName, HeaderValue};
@@ -45,15 +45,52 @@ const OAUTH_TIMEOUT_SECS: u64 = 300;
 const HTML_AUTO_CLOSE_TIMEOUT_MS: u64 = 2000;
 
 const CHATGPT_CODEX_PROVIDER_NAME: &str = "chatgpt_codex";
-pub const CHATGPT_CODEX_DEFAULT_MODEL: &str = "gpt-5.1-codex";
-pub const CHATGPT_CODEX_KNOWN_MODELS: &[&str] = &[
-    "gpt-5.2-codex",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
+pub const CHATGPT_CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
+
+#[derive(Debug)]
+pub struct ChatGptCodexModelAttrs {
+    pub name: &'static str,
+    pub reasoning_levels: &'static [&'static str],
+}
+
+pub const CHATGPT_CODEX_KNOWN_MODELS: &[ChatGptCodexModelAttrs] = &[
+    ChatGptCodexModelAttrs {
+        name: "gpt-5.5",
+        reasoning_levels: &["low", "medium", "high", "xhigh"],
+    },
+    ChatGptCodexModelAttrs {
+        name: "gpt-5.4",
+        reasoning_levels: &["low", "medium", "high", "xhigh"],
+    },
+    ChatGptCodexModelAttrs {
+        name: "gpt-5.3-codex",
+        reasoning_levels: &["low", "medium", "high", "xhigh"],
+    },
 ];
 
 const CHATGPT_CODEX_DOC_URL: &str = "https://openai.com/chatgpt";
+
+const DEFAULT_REASONING_LEVELS: &[&str] = &["medium", "high"];
+
+pub fn reasoning_levels_for_model(model_name: &str) -> &'static [&'static str] {
+    CHATGPT_CODEX_KNOWN_MODELS
+        .iter()
+        .find(|m| m.name == model_name)
+        .map(|m| m.reasoning_levels)
+        .unwrap_or(DEFAULT_REASONING_LEVELS)
+}
+
+fn known_model_names() -> Vec<&'static str> {
+    CHATGPT_CODEX_KNOWN_MODELS.iter().map(|m| m.name).collect()
+}
+
+const GPT_53_CODEX_TOOL_PREAMBLE: &str = "\
+You are a coding agent. You have access to tools to accomplish tasks. \
+Always use your tools to fulfill requests - do not just describe what you would do. \
+Keep going until the query is completely resolved before yielding back to the user. \
+Autonomously resolve the query using the tools available to you. \
+Do NOT guess or make up an answer. \
+Before making tool calls, send a brief message explaining what you're about to do.";
 
 #[derive(Debug)]
 struct ChatGptCodexAuthState {
@@ -172,6 +209,49 @@ fn build_input_items(messages: &[Message]) -> Result<Vec<Value>> {
     Ok(items)
 }
 
+fn get_reasoning_effort(model_name: &str) -> String {
+    let config = crate::config::Config::global();
+    let effort = config
+        .get_chatgpt_codex_reasoning_effort()
+        .map(String::from)
+        .unwrap_or_else(|_| "medium".to_string());
+
+    let valid_levels = reasoning_levels_for_model(model_name);
+    if valid_levels.contains(&effort.as_str()) {
+        effort
+    } else {
+        tracing::warn!(
+            "Invalid CHATGPT_CODEX_REASONING_EFFORT '{}' for model '{}', using 'medium'",
+            effort,
+            model_name
+        );
+        "medium".to_string()
+    }
+}
+
+fn reasoning_effort_for_config(model_config: &ModelConfig) -> Option<String> {
+    use goose_providers::thinking::ThinkingEffort;
+
+    model_config
+        .thinking_effort()
+        .map(|effort| {
+            let valid_levels = reasoning_levels_for_model(&model_config.model_name);
+            let preferred_levels: &[&str] = match effort {
+                ThinkingEffort::Off => return None,
+                ThinkingEffort::Low => &["low", "medium", "high", "xhigh"],
+                ThinkingEffort::Medium => &["medium", "high", "low", "xhigh"],
+                ThinkingEffort::High => &["high", "medium", "xhigh", "low"],
+                ThinkingEffort::Max => &["xhigh", "high", "medium", "low"],
+            };
+
+            preferred_levels
+                .iter()
+                .find(|level| valid_levels.contains(level))
+                .map(|level| (*level).to_string())
+        })
+        .unwrap_or_else(|| Some(get_reasoning_effort(&model_config.model_name)))
+}
+
 fn create_codex_request(
     model_config: &ModelConfig,
     system: &str,
@@ -179,12 +259,18 @@ fn create_codex_request(
     tools: &[Tool],
 ) -> Result<Value> {
     let input_items = build_input_items(messages)?;
+    let reasoning_effort = reasoning_effort_for_config(model_config);
+
+    let instructions = match model_config.model_name.as_str() {
+        "gpt-5.3-codex" => format!("{GPT_53_CODEX_TOOL_PREAMBLE}\n\n{system}"),
+        _ => system.to_string(),
+    };
 
     let mut payload = json!({
         "model": model_config.model_name,
         "input": input_items,
         "store": false,
-        "instructions": system,
+        "instructions": instructions,
     });
 
     let payload_obj = payload
@@ -205,10 +291,19 @@ fn create_codex_request(
             .collect();
 
         payload_obj.insert("tools".to_string(), json!(tools_spec));
+        payload_obj.insert("tool_choice".to_string(), json!("auto"));
+        payload_obj.insert("parallel_tool_calls".to_string(), json!(true));
     }
 
     if let Some(temp) = model_config.temperature {
         payload_obj.insert("temperature".to_string(), json!(temp));
+    }
+
+    if let Some(reasoning_effort) = reasoning_effort {
+        payload_obj.insert(
+            "reasoning".to_string(),
+            json!({ "effort": reasoning_effort }),
+        );
     }
 
     Ok(payload)
@@ -529,7 +624,7 @@ fn html_success() -> String {
 }
 
 fn html_error(error: &str) -> String {
-    let safe_error = v_htmlescape::escape(error).to_string();
+    let safe_error = v_htmlescape::escape_fmt(error);
     format!(
         r#"<!doctype html>
 <html>
@@ -728,6 +823,10 @@ impl ChatGptCodexAuthProvider {
         }
     }
 
+    fn clear_cached_tokens(&self) {
+        self.cache.clear();
+    }
+
     async fn get_valid_token(&self) -> Result<TokenData> {
         if let Some(mut token_data) = self.cache.load() {
             if token_data.expires_at > Utc::now() + chrono::Duration::seconds(60) {
@@ -787,6 +886,11 @@ pub struct ChatGptCodexProvider {
 }
 
 impl ChatGptCodexProvider {
+    pub async fn cleanup() -> Result<()> {
+        TokenCache::new().clear();
+        Ok(())
+    }
+
     pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let auth_provider = Arc::new(ChatGptCodexAuthProvider::new(
             ChatGptCodexAuthState::instance(),
@@ -841,7 +945,7 @@ impl ChatGptCodexProvider {
             .await
             .map_err(|e| ProviderError::RequestFailed(e.to_string()))?;
 
-        handle_status_openai_compat(response).await
+        handle_status(response).await
     }
 }
 
@@ -854,7 +958,7 @@ impl ProviderDef for ChatGptCodexProvider {
             "ChatGPT Codex",
             "Use your ChatGPT Plus/Pro subscription for GPT-5 Codex models via OAuth",
             CHATGPT_CODEX_DEFAULT_MODEL,
-            CHATGPT_CODEX_KNOWN_MODELS.to_vec(),
+            known_model_names(),
             CHATGPT_CODEX_DOC_URL,
             vec![ConfigKey::new_oauth(
                 "CHATGPT_CODEX_TOKEN",
@@ -871,6 +975,10 @@ impl ProviderDef for ChatGptCodexProvider {
         _extensions: Vec<crate::config::ExtensionConfig>,
     ) -> BoxFuture<'static, Result<Self::Provider>> {
         Box::pin(Self::from_env(model))
+    }
+
+    fn inventory_configured() -> bool {
+        TokenCache::new().load().is_some()
     }
 }
 
@@ -919,18 +1027,30 @@ impl Provider for ChatGptCodexProvider {
     }
 
     async fn configure_oauth(&self) -> Result<(), ProviderError> {
-        self.auth_provider
-            .get_valid_token()
+        let previous_token = self.auth_provider.cache.load();
+        self.auth_provider.clear_cached_tokens();
+
+        let result = perform_oauth_flow(self.auth_provider.state.as_ref())
             .await
-            .map_err(|e| ProviderError::Authentication(format!("OAuth flow failed: {}", e)))?;
+            .and_then(|token_data| self.auth_provider.cache.save(&token_data));
+
+        if let Err(e) = result {
+            if let Some(previous_token) = previous_token.as_ref() {
+                if self.auth_provider.cache.load().is_none() {
+                    let _ = self.auth_provider.cache.save(previous_token);
+                }
+            }
+            return Err(ProviderError::Authentication(format!(
+                "OAuth flow failed: {}",
+                e
+            )));
+        }
+
         Ok(())
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
-        Ok(CHATGPT_CODEX_KNOWN_MODELS
-            .iter()
-            .map(|s| s.to_string())
-            .collect())
+        Ok(known_model_names().into_iter().map(String::from).collect())
     }
 }
 
@@ -967,16 +1087,35 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn inventory_configured_uses_oauth_token_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_string_lossy().to_string();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(root_path.as_str()))]);
+
+        TokenCache::new().clear();
+        assert!(!ChatGptCodexProvider::inventory_configured());
+
+        TokenCache::new()
+            .save(&TokenData {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                id_token: None,
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+                account_id: Some("account".to_string()),
+            })
+            .unwrap();
+
+        assert!(ChatGptCodexProvider::inventory_configured());
+    }
+
     #[test_case(
         vec![
             Message::user().with_text("user text"),
             Message::assistant().with_text("assistant prelude").with_tool_request(
                 "call-1",
-                Ok(CallToolRequestParams {
-                    meta: None, task: None,
-                    name: "tool_name".into(),
-                    arguments: Some(object!({"param": "value"})),
-                }),
+                Ok(CallToolRequestParams::new("tool_name").with_arguments(object!({"param": "value"}))),
             ),
             Message::user().with_tool_response(
                 "call-1",
@@ -998,11 +1137,7 @@ mod tests {
             Message::user().with_text("user text"),
             Message::assistant().with_tool_request(
                 "call-1",
-                Ok(CallToolRequestParams {
-                    meta: None, task: None,
-                    name: "tool_name".into(),
-                    arguments: Some(object!({"param": "value"})),
-                }),
+                Ok(CallToolRequestParams::new("tool_name").with_arguments(object!({"param": "value"}))),
             ),
             Message::user().with_tool_response(
                 "call-1",
@@ -1023,11 +1158,7 @@ mod tests {
             Message::user().with_text("user text"),
             Message::assistant().with_tool_request(
                 "call-1",
-                Ok(CallToolRequestParams {
-                    meta: None, task: None,
-                    name: "tool_name".into(),
-                    arguments: Some(object!({"param": "value"})),
-                }),
+                Ok(CallToolRequestParams::new("tool_name").with_arguments(object!({"param": "value"}))),
             ),
             Message::user().with_tool_response(
                 "call-1",
@@ -1073,6 +1204,42 @@ mod tests {
             "image_url should start with data:image/png;base64, but was: {}",
             url
         );
+    }
+
+    #[test]
+    fn test_create_codex_request_reasoning_effort_from_unified_thinking() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("max"));
+        let mut config = ModelConfig::new("gpt-5.3-codex").unwrap();
+        config.request_params = Some(params);
+
+        let payload = create_codex_request(&config, "sys", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "xhigh");
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_create_codex_request_caps_unified_thinking_to_supported_level() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("max"));
+        let mut config = ModelConfig::new("unknown-model").unwrap();
+        config.request_params = Some(params);
+
+        let payload = create_codex_request(&config, "sys", &[], &[]).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_create_codex_request_off_omits_reasoning_for_codex_models() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("thinking_effort".to_string(), json!("off"));
+        let mut config = ModelConfig::new("gpt-5.2-codex").unwrap();
+        config.request_params = Some(params);
+
+        let payload = create_codex_request(&config, "sys", &[], &[]).unwrap();
+        assert!(payload.get("reasoning").is_none());
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test_case(
@@ -1226,5 +1393,27 @@ mod tests {
         let claims = parse_jwt_claims_with_jwks(&token, &jwks).unwrap();
 
         assert_eq!(claims.chatgpt_account_id.as_deref(), Some("account-1"));
+    }
+
+    #[test_case("unknown-model", &["medium", "high"]; "unknown model gets default reasoning levels")]
+    fn test_reasoning_levels_for_model(model: &str, expected: &[&str]) {
+        assert_eq!(reasoning_levels_for_model(model), expected);
+    }
+
+    #[test]
+    fn test_gpt53_preamble_injected() {
+        let model = ModelConfig::new("gpt-5.3-codex").unwrap();
+        let payload = create_codex_request(&model, "system prompt", &[], &[]).unwrap();
+        let instructions = payload["instructions"].as_str().unwrap();
+        assert!(instructions.contains(GPT_53_CODEX_TOOL_PREAMBLE));
+        assert!(instructions.contains("system prompt"));
+    }
+
+    #[test]
+    fn test_other_models_no_preamble() {
+        let model = ModelConfig::new("gpt-5.4").unwrap();
+        let payload = create_codex_request(&model, "system prompt", &[], &[]).unwrap();
+        let instructions = payload["instructions"].as_str().unwrap();
+        assert_eq!(instructions, "system prompt");
     }
 }

@@ -27,9 +27,11 @@ on:
         required: false
         type: string
         default: ''
-    secrets:
-      OSX_CODESIGN_ROLE:
+      environment:
+        description: 'GitHub Environment containing signing secrets (e.g. "signing"). Leave empty to skip.'
         required: false
+        type: string
+        default: ''
 
 name: Reusable workflow to bundle desktop app
 
@@ -37,6 +39,9 @@ jobs:
   bundle-desktop:
     runs-on: macos-latest
     name: Bundle Desktop App on macOS
+    environment: ${{ inputs.environment || '' }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
     permissions:
       id-token: write
       contents: read
@@ -72,7 +77,7 @@ jobs:
         run: df -h
 
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           # Only pass ref if it's explicitly set, otherwise let checkout action use its default behavior
           ref: ${{ inputs.ref != '' && inputs.ref || '' }}
@@ -101,14 +106,16 @@ jobs:
           # Update version in Cargo.toml
           sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           rm -f Cargo.toml.bak
-          
+
           source ./bin/activate-hermit
-          # Update version in package.json 
+          # Update version in package.json
           cd ui/desktop
-          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+          npm pkg set "version=${VERSION}"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          key: macos-deployment-target-12
 
       # Build the project
       - name: Build goosed
@@ -131,31 +138,42 @@ jobs:
         run: |
           cp target/release/goosed ui/desktop/src/bin/goosed
 
-      - name: Cache npm dependencies
+      - name: Cache pnpm dependencies
         uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7  # v5.0.2
         with:
           path: |
             ui/desktop/node_modules
             .hermit/node/cache
-          key: macos-npm-cache-v1-${{ runner.os }}-${{ hashFiles('ui/desktop/package-lock.json') }}
+          key: macos-pnpm-cache-v1-${{ runner.os }}-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: |
-            macos-npm-cache-v1-${{ runner.os }}-
+            macos-pnpm-cache-v1-${{ runner.os }}-
 
       - name: Install dependencies
-        run: source ../../bin/activate-hermit && npm ci
+        run: source ../../bin/activate-hermit && pnpm install --frozen-lockfile
         working-directory: ui/desktop
+
+      - name: Import Apple signing certificate
+        if: ${{ inputs.signing }}
+        uses: ./.github/actions/apple-codesign
+        with:
+          certificate-base64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
       # Check disk space before bundling
       - name: Check disk space before bundling
         run: df -h
 
       - name: Build App
+        env:
+          APPLE_ID: ${{ inputs.signing && secrets.APPLE_ID || '' }}
+          APPLE_ID_PASSWORD: ${{ inputs.signing && secrets.APPLE_ID_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.signing && secrets.APPLE_TEAM_ID || '' }}
         run: |
           source ../../bin/activate-hermit
           attempt=0
           max_attempts=2
           until [ $attempt -ge $max_attempts ]; do
-            npm run bundle:default && break
+            pnpm run bundle:default && break
             attempt=$((attempt + 1))
             echo "Attempt $attempt failed. Retrying..."
             sleep 5
@@ -166,79 +184,12 @@ jobs:
           fi
         working-directory: ui/desktop
 
-      - name: Configure AWS credentials
-        if: ${{ inputs.signing }}
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708  # v5.1.1
-        with:
-          role-to-assume: "${{ secrets.OSX_CODESIGN_ROLE }}"
-          aws-region: us-west-2
-
-      - name: Codesigning and Notarization
-        if: ${{ inputs.signing }}
+      - name: Clean up signing keychain
+        if: always()
         run: |
-          set -e
-
-          echo "⬆️ uploading unsigned app"
-          source_job_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          unsigned_url="s3://block-goose-artifacts-bucket-production/unsigned/goose-${GITHUB_SHA}-${{ github.run_id }}-arm64.zip"
-          
-          zip -q -u -r out/Goose-darwin-arm64/Goose.zip entitlements.plist
-
-          # upload unsigned goose to transfer bucket so it can be passed to lambda
-          aws s3 cp --quiet out/Goose-darwin-arm64/Goose.zip "${unsigned_url}"
-
-          # begin signing
-          echo "🚀 launching signing process"
-          aws lambda invoke \
-            --function-name codesign_helper \
-            --cli-binary-format raw-in-base64-out \
-            --payload "{\"source_s3_url\": \"${unsigned_url}\", \"source_job_url\": \"${source_job_url}\"}" \
-            response.json > /dev/null
-
-          if [ "$(jq -r .statusCode response.json)" != "200" ]; then
-            echo "⚠️ lambda function did not return expected status code"
-            exit 1
+          if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
           fi
-
-          build_number="$(jq -r .body.build_number response.json)"
-
-          start_time=$(date +%s)
-
-          while sleep 30; do
-            aws lambda invoke \
-              --function-name codesign_helper \
-              --cli-binary-format raw-in-base64-out \
-              --payload "{\"source_s3_url\": \"${unsigned_url}\", \"build_number\": \"${build_number}\"}" \
-              response.json > /dev/null
-
-            if [ "$(jq -r .statusCode response.json)" != "200" ]; then
-              echo "⚠️ signing request returned unexpected response code $(jq -r .statusCode response.json):"
-              jq . response.json
-              exit 1
-            fi
-
-            state="$(jq -r .body.state response.json)"
-
-            if [ "${state}" == "completed" ]; then
-              echo "✅ signing complete ($(($(date +%s) - start_time))s)"
-              break
-            fi
-
-            if [ $(($(date +%s) - start_time)) -ge 3600 ]; then
-              echo "⚠️ timed out ($(($(date +%s) - start_time))s)"
-              exit 1
-            fi
-
-            echo "⏲️ waiting for signing to complete (${state}: $(($(date +%s) - start_time))s)"
-          done
-
-          # parse lambda response
-          signed_url=$(jq -r .body.destination_url response.json)
-
-          # download the signed app from S3
-          echo "⬇️ downloading signed app"
-          aws s3 cp --quiet "${signed_url}" out/Goose-darwin-arm64/Goose.zip
-        working-directory: ui/desktop
 
       - name: Final cleanup before artifact upload
         run: |

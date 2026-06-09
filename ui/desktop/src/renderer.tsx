@@ -1,5 +1,6 @@
 import React, { Suspense, lazy } from 'react';
 import ReactDOM from 'react-dom/client';
+import { IntlProvider } from 'react-intl';
 import { ConfigProvider } from './components/ConfigContext';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import SuspenseLoader from './suspense-loader';
@@ -7,6 +8,7 @@ import { client } from './api/client.gen';
 import { setTelemetryEnabled } from './utils/analytics';
 import { readConfig } from './api';
 import { applyThemeTokens } from './theme/theme-tokens';
+import { currentLocale, currentMessageLocale, loadMessages } from './i18n';
 
 // Apply theme tokens to :root before first paint.
 applyThemeTokens();
@@ -15,18 +17,30 @@ const App = lazy(() => import('./App'));
 
 const TELEMETRY_CONFIG_KEY = 'GOOSE_TELEMETRY_ENABLED';
 
+let warnedFallbackLocale = false;
+function handleIntlError(err: { code: string; message?: string }) {
+  if (err.code === 'MISSING_TRANSLATION' && currentLocale !== currentMessageLocale) {
+    if (!warnedFallbackLocale) {
+      warnedFallbackLocale = true;
+      console.warn(
+        `[i18n] Locale "${currentLocale}" has no translations; falling back to "${currentMessageLocale}".`
+      );
+    }
+    return;
+  }
+  console.error(err);
+}
+
 (async () => {
   // Check if we're in the launcher view (doesn't need goosed connection)
   const isLauncher = window.location.hash === '#/launcher';
 
   if (!isLauncher) {
-    console.log('window created, getting goosed connection info');
     const gooseApiHost = await window.electron.getGoosedHostPort();
     if (gooseApiHost === null) {
       window.alert('failed to start goose backend process');
       return;
     }
-    console.log('connecting at', gooseApiHost);
     client.setConfig({
       baseUrl: gooseApiHost,
       headers: {
@@ -46,15 +60,24 @@ const TELEMETRY_CONFIG_KEY = 'GOOSE_TELEMETRY_ENABLED';
     }
   }
 
+  const messages = await loadMessages(currentMessageLocale);
+
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
-      <Suspense fallback={SuspenseLoader()}>
-        <ConfigProvider>
-          <ErrorBoundary>
-            <App />
-          </ErrorBoundary>
-        </ConfigProvider>
-      </Suspense>
+      <IntlProvider
+        locale={currentLocale}
+        defaultLocale="en"
+        messages={messages}
+        onError={handleIntlError}
+      >
+        <Suspense fallback={SuspenseLoader()}>
+          <ConfigProvider>
+            <ErrorBoundary>
+              <App />
+            </ErrorBoundary>
+          </ConfigProvider>
+        </Suspense>
+      </IntlProvider>
     </React.StrictMode>
   );
 })();

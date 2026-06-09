@@ -8,19 +8,19 @@ use aws_sdk_bedrockruntime::config::ProvideCredentials;
 use aws_sdk_sagemakerruntime::Client as SageMakerClient;
 use rmcp::model::Tool;
 use serde_json::{json, Value};
+use smithy_transport_reqwest::ReqwestHttpClient;
 
-use super::base::{
-    ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata, ProviderUsage, Usage,
-};
-use super::errors::ProviderError;
+use super::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
 use super::retry::ProviderRetry;
 use super::utils::RequestLog;
 use crate::conversation::message::{Message, MessageContent};
 use crate::session_context::SESSION_ID_HEADER;
+use goose_providers::errors::ProviderError;
 
 use crate::model::ModelConfig;
 use chrono::Utc;
 use futures::future::BoxFuture;
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use rmcp::model::Role;
 
 const SAGEMAKER_TGI_PROVIDER_NAME: &str = "sagemaker_tgi";
@@ -61,7 +61,10 @@ impl SageMakerTgiProvider {
         set_aws_env_vars(config.all_values());
         set_aws_env_vars(config.all_secrets());
 
-        let aws_config = aws_config::load_from_env().await;
+        let aws_config = aws_config::from_env()
+            .http_client(ReqwestHttpClient::new())
+            .load()
+            .await;
 
         // Validate credentials
         aws_config
@@ -285,8 +288,8 @@ impl ProviderDef for SageMakerTgiProvider {
             SAGEMAKER_TGI_DOC_LINK,
             vec![
                 ConfigKey::new("SAGEMAKER_ENDPOINT_NAME", true, false, None, true),
-                ConfigKey::new("AWS_REGION", true, false, Some("us-east-1"), true),
-                ConfigKey::new("AWS_PROFILE", true, false, Some("default"), true),
+                ConfigKey::new("AWS_REGION", false, false, Some("us-east-1"), true),
+                ConfigKey::new("AWS_PROFILE", false, false, Some("default"), true),
             ],
         )
     }
@@ -309,10 +312,6 @@ impl Provider for SageMakerTgiProvider {
         self.model.clone()
     }
 
-    #[tracing::instrument(
-        skip(self, model_config, system, messages, tools),
-        fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
-    )]
     async fn stream(
         &self,
         model_config: &ModelConfig,

@@ -28,7 +28,7 @@ goose includes several built-in extensions you can start using out of the box:
 - [Auto Visualiser](/docs/mcp/autovisualiser-mcp): Automatically generates graphical data visualizations in conversations.
 
 :::warning Access Control
-goose operates autonomously by default. Combined with the Developer extension's tools, this means goose can execute commands and modify files without your approval. If you want more control over this behavior, you can configure the [goose permission mode](/docs/guides/goose-permissions), [tool permissions](/docs/guides/managing-tools/tool-permissions), and [.gooseignore files](/docs/guides/using-gooseignore). See [Configuring Access Controls](/docs/mcp/developer-mcp#configuring-access-controls) for a brief overview.
+goose operates autonomously by default. Combined with the Developer extension's tools, this means goose can execute commands and modify files without your approval. If you want more control over this behavior, you can configure the [goose permission mode](/docs/guides/managing-tools/goose-permissions), [tool permissions](/docs/guides/managing-tools/tool-permissions), and [.gooseignore files](/docs/guides/context-engineering/using-gooseignore). See [Configuring Access Controls](/docs/mcp/developer-mcp#configuring-access-controls) for a brief overview.
 :::
 
 ### Built-in Platform Extensions
@@ -118,6 +118,8 @@ If you're in a corporate or airgapped environment and extensions fail to activat
 ### MCP Servers
 
 You can install any MCP server as a goose extension. 
+
+Many MCP servers work better when they understand your active workspace. goose supports [MCP Roots](/docs/guides/mcp-roots), which lets roots-aware extensions see your current session working directory automatically.
 
 :::tip MCP Server Directory
 See available servers in the **[MCP Server Directory](https://www.pulsemcp.com/servers)**.

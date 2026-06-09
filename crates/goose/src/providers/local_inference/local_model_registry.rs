@@ -36,6 +36,29 @@ impl Default for SamplingConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallingMode {
+    #[default]
+    Auto,
+    ForceNative,
+    ForceEmulated,
+}
+
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatTemplate {
+    #[serde(alias = "auto")]
+    #[default]
+    Embedded,
+    Builtin {
+        name: String,
+    },
+    CustomInline {
+        template: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelSettings {
     pub context_size: Option<u32>,
@@ -57,9 +80,30 @@ pub struct ModelSettings {
     pub flash_attention: Option<bool>,
     pub n_threads: Option<i32>,
     #[serde(default)]
-    pub native_tool_calling: bool,
+    pub tool_calling: ToolCallingMode,
     #[serde(default)]
-    pub use_jinja: bool,
+    pub chat_template: ChatTemplate,
+    #[serde(default = "default_true")]
+    pub enable_thinking: bool,
+    /// Whether this model architecture supports vision input.
+    /// Derived from associated mmproj metadata, not user-configurable.
+    #[serde(default)]
+    pub vision_capable: bool,
+    /// Estimated tokens per image for budget planning before mtmd tokenization.
+    /// The actual count is determined after tokenization via `chunks.total_tokens()`.
+    #[serde(default = "default_image_token_estimate")]
+    pub image_token_estimate: usize,
+    /// Size of the mmproj file in bytes, used for memory accounting.
+    #[serde(default)]
+    pub mmproj_size_bytes: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_image_token_estimate() -> usize {
+    256
 }
 
 fn default_repeat_penalty() -> f32 {
@@ -85,25 +129,60 @@ impl Default for ModelSettings {
             use_mlock: false,
             flash_attention: None,
             n_threads: None,
-            native_tool_calling: false,
-            use_jinja: false,
+            tool_calling: ToolCallingMode::Auto,
+            chat_template: ChatTemplate::Embedded,
+            enable_thinking: true,
+            vision_capable: false,
+            image_token_estimate: default_image_token_estimate(),
+            mmproj_size_bytes: 0,
         }
     }
 }
 
-/// Featured models — HuggingFace specs in "author/repo-GGUF:quantization" format.
-pub const FEATURED_MODELS: &[&str] = &[
-    "bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M",
-    "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",
-    "bartowski/Hermes-2-Pro-Mistral-7B-GGUF:Q4_K_M",
-    "bartowski/Mistral-Small-24B-Instruct-2501-GGUF:Q4_K_M",
+pub struct FeaturedModel {
+    /// HuggingFace spec in "author/repo-GGUF:quantization" format.
+    pub spec: &'static str,
+}
+
+pub const FEATURED_MODELS: &[FeaturedModel] = &[
+    FeaturedModel {
+        spec: "bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M",
+    },
+    FeaturedModel {
+        spec: "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",
+    },
+    FeaturedModel {
+        spec: "bartowski/Hermes-2-Pro-Mistral-7B-GGUF:Q4_K_M",
+    },
+    FeaturedModel {
+        spec: "bartowski/Mistral-Small-24B-Instruct-2501-GGUF:Q4_K_M",
+    },
+    FeaturedModel {
+        spec: "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M",
+    },
+    FeaturedModel {
+        spec: "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+    },
 ];
+
+pub fn default_settings_for_model(_model_id: &str) -> ModelSettings {
+    ModelSettings {
+        ..ModelSettings::default()
+    }
+}
+
+/// Local path for an mmproj file, namespaced by repo to avoid collisions
+/// between different models that use the same filename.
+pub fn mmproj_local_path(repo_id: &str, filename: &str) -> PathBuf {
+    let repo_name = repo_id.split('/').next_back().unwrap_or(repo_id);
+    Paths::in_data_dir("models").join(repo_name).join(filename)
+}
 
 /// Check if a model ID corresponds to a featured model.
 pub fn is_featured_model(model_id: &str) -> bool {
     use super::hf_models::parse_model_spec;
-    FEATURED_MODELS.iter().any(|spec| {
-        if let Ok((repo_id, quant)) = parse_model_spec(spec) {
+    FEATURED_MODELS.iter().any(|m| {
+        if let Ok((repo_id, quant)) = parse_model_spec(m.spec) {
             model_id_from_repo(&repo_id, &quant) == model_id
         } else {
             false
@@ -121,6 +200,14 @@ pub fn get_registry() -> &'static Mutex<LocalModelRegistry> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardFile {
+    pub filename: String,
+    pub local_path: PathBuf,
+    pub source_url: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalModelEntry {
     pub id: String,
     pub repo_id: String,
@@ -132,11 +219,48 @@ pub struct LocalModelEntry {
     pub settings: ModelSettings,
     #[serde(default)]
     pub size_bytes: u64,
+    /// Local path to the multimodal projection GGUF (vision encoder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj_path: Option<PathBuf>,
+    /// Download URL for the mmproj file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj_source_url: Option<String>,
+    /// Size of the mmproj file in bytes.
+    #[serde(default)]
+    pub mmproj_size_bytes: u64,
+    #[serde(default)]
+    pub mmproj_checked: bool,
+    #[serde(default)]
+    pub shard_files: Vec<ShardFile>,
 }
 
 impl LocalModelEntry {
+    pub fn refresh_mmproj_metadata(&mut self) {
+        self.settings.vision_capable = self.mmproj_path.is_some();
+        if let Some(path) = &self.mmproj_path {
+            self.mmproj_checked = true;
+            self.settings.vision_capable = true;
+            if self.mmproj_size_bytes == 0 || self.settings.mmproj_size_bytes == 0 {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    self.mmproj_size_bytes = meta.len();
+                    self.settings.mmproj_size_bytes = meta.len();
+                }
+            }
+        } else {
+            self.mmproj_size_bytes = 0;
+            self.settings.mmproj_size_bytes = 0;
+        }
+    }
+
     pub fn is_downloaded(&self) -> bool {
-        self.local_path.exists()
+        self.local_path.exists() && self.shard_files.iter().all(|s| s.local_path.exists())
+    }
+
+    /// Returns all GGUF model file paths (primary + shards).
+    /// Does NOT include mmproj — that has separate shared-ownership deletion logic.
+    pub fn all_local_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        std::iter::once(self.local_path.as_path())
+            .chain(self.shard_files.iter().map(|s| s.local_path.as_path()))
     }
 
     pub fn is_downloading(&self) -> bool {
@@ -146,7 +270,7 @@ impl LocalModelEntry {
     }
 
     pub fn download_status(&self) -> ModelDownloadStatus {
-        if self.local_path.exists() {
+        if self.is_downloaded() {
             return ModelDownloadStatus::Downloaded;
         }
 
@@ -164,6 +288,36 @@ impl LocalModelEntry {
                 DownloadStatus::Failed | DownloadStatus::Cancelled => {
                     ModelDownloadStatus::NotDownloaded
                 }
+            };
+        }
+
+        ModelDownloadStatus::NotDownloaded
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.mmproj_path.as_ref().is_some_and(|p| p.exists())
+    }
+
+    pub fn mmproj_download_status(&self) -> ModelDownloadStatus {
+        if let Some(path) = &self.mmproj_path {
+            if path.exists() {
+                return ModelDownloadStatus::Downloaded;
+            }
+        } else {
+            return ModelDownloadStatus::NotDownloaded;
+        }
+
+        let download_id = format!("{}-mmproj", self.id);
+        let manager = get_download_manager();
+        if let Some(progress) = manager.get_progress(&download_id) {
+            return match progress.status {
+                DownloadStatus::Downloading => ModelDownloadStatus::Downloading {
+                    progress_percent: progress.progress_percent,
+                    bytes_downloaded: progress.bytes_downloaded,
+                    total_bytes: progress.total_bytes,
+                    speed_bps: progress.speed_bps.unwrap_or(0),
+                },
+                _ => ModelDownloadStatus::NotDownloaded,
             };
         }
 
@@ -241,8 +395,9 @@ impl LocalModelRegistry {
     pub fn sync_with_featured(&mut self, featured_entries: Vec<LocalModelEntry>) {
         let mut changed = false;
 
-        for entry in featured_entries {
+        for mut entry in featured_entries {
             if !self.models.iter().any(|m| m.id == entry.id) {
+                entry.refresh_mmproj_metadata();
                 self.models.push(entry);
                 changed = true;
             }
@@ -260,7 +415,8 @@ impl LocalModelRegistry {
         }
     }
 
-    pub fn add_model(&mut self, entry: LocalModelEntry) -> Result<()> {
+    pub fn add_model(&mut self, mut entry: LocalModelEntry) -> Result<()> {
+        entry.refresh_mmproj_metadata();
         if let Some(existing) = self.models.iter_mut().find(|m| m.id == entry.id) {
             *existing = entry;
         } else {
@@ -298,6 +454,10 @@ impl LocalModelRegistry {
 
     pub fn list_models(&self) -> &[LocalModelEntry] {
         &self.models
+    }
+
+    pub fn list_models_mut(&mut self) -> &mut [LocalModelEntry] {
+        &mut self.models
     }
 }
 

@@ -1,5 +1,5 @@
 ---
-sidebar_position: 35
+sidebar_position: 7
 title: CLI Commands
 sidebar_label: CLI Commands
 toc_max_heading_level: 4
@@ -104,7 +104,7 @@ Once installed, you can:
 - Discover options without checking `--help`
 
 **Arguments:**
-- **`<SHELL>`**: The shell to generate completions for. Supported shells: `bash`, `elvish`, `fish`, `powershell`, `zsh`
+- **`<SHELL>`**: The shell to generate completions for. Supported shells: `bash`, `elvish`, `fish`, `nu`, `powershell`, `zsh`
 
 **Usage:**
 ```bash
@@ -112,6 +112,7 @@ Once installed, you can:
 goose completion bash
 goose completion zsh
 goose completion fish
+goose completion nu
 ```
 
 **Installation by Shell:**
@@ -152,6 +153,20 @@ goose completion fish > ~/.config/fish/completions/goose.fish
 ```
 
 Then restart your terminal or run `exec fish`.
+
+</TabItem>
+<TabItem value="nu" label="Nushell">
+
+```nu
+let autoload_dir = ($nu.user-autoload-dirs | first)
+mkdir $autoload_dir
+goose completion nu | save --force ($autoload_dir | path join "goose.nu")
+```
+
+Then restart Nushell or run:
+```nu
+source (($nu.user-autoload-dirs | first) | path join "goose.nu")
+```
 
 </TabItem>
 <TabItem value="powershell" label="PowerShell">
@@ -444,16 +459,6 @@ goose run --recipe recipe.yaml --max-turns 10
 
 ---
 
-#### bench
-Used to evaluate system-configuration across a range of practical tasks. See the [detailed guide](/docs/tutorials/benchmarking) for more information.
-
-**Usage:**
-```bash
-goose bench ...etc.
-```
-
----
-
 #### recipe
 Used to validate recipe files, manage recipe sharing, list available recipes, and open recipes in goose desktop.
 
@@ -499,6 +504,30 @@ goose recipe validate my-recipe.yaml
 # Get help about recipe commands
 goose recipe help
 ```
+
+---
+
+#### plugin
+Install and update git-backed plugins that provide skills or other Open Plugins components.
+
+**Commands:**
+- **`install [OPTIONS] <URL>`**: Install a plugin from a git repository URL
+  - **`--auto-update`**: Automatically check for updates before plugin skills are loaded
+- **`update <NAME>`**: Update an installed git-backed plugin by name
+
+**Usage:**
+```bash
+# Install a plugin from a git repository
+goose plugin install https://github.com/example/my-goose-plugin.git
+
+# Install a plugin and enable automatic update checks
+goose plugin install --auto-update https://github.com/example/my-goose-plugin.git
+
+# Update an installed plugin manually
+goose plugin update my-plugin
+```
+
+Installed plugins are stored under `~/.agents/plugins/<plugin-name>/`. For more about plugin-provided skills, hooks, and update behavior, see the [Plugins guide](/docs/guides/context-engineering/plugins).
 
 ---
 
@@ -593,57 +622,6 @@ goose projects
 
 ---
 
-### Interface
-
-#### web
-Start a new session in goose Web, a lightweight web-based interface launched via the CLI that mirrors the desktop app's chat experience.
-
-goose Web is particularly useful when:
-- You want to access goose with a graphical interface without installing the desktop app
-- You need to use goose from different devices, including mobile
-- You're working in an environment where installing desktop apps isn't practical
-
-:::warning
-Don't expose the web interface to the internet without proper security measures.
-:::
-
-**Options:**
-- **`-p, --port <PORT>`**: Port number to run the web server on. Default is `3000`
-- **`--host <HOST>`**: Host to bind the web server to. Default is `127.0.0.1`
-- **`--open`**: Automatically open the browser when the server starts
-- **`--auth-token <TOKEN>`**: Require a password to access the web interface
-
-**Usage:**
-```bash
-# Start web interface at `http://127.0.0.1:3000` and open the browser
-goose web --open
-
-# Start web interface at `http://127.0.0.1:8080` 
-goose web --port 8080
-
-# Start web interface accessible from local network at `http://192.168.1.7:8080`
-goose web --host 192.168.1.7 --port 8080
-
-# Start web interface with authentication required
-goose web --auth-token <TOKEN>
-```
-
-:::info
-Use `Ctrl+C` to stop the server.
-:::
-
-**Limitations:**
-
-While the web interface provides most core features, be aware of these limitations:
-- Some file system operations may require additional confirmation
-- Extension management must be done through the CLI
-- Certain tool interactions might need extra setup
-- Configuration changes require a server restart
-
-
-
----
-
 ### Terminal Integration
 
 #### @goose / @g
@@ -679,6 +657,7 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/recipe [filepath]`** - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml). If no filepath is provided, it will be saved to ./recipe.yaml
 - **`/compact`** - Compact and summarize the current conversation to reduce context length while preserving key information
 - **`/r`** - Toggle full tool output display (show complete tool parameters without truncation)
+- **`/skills`** - List available skills
 - **`/t`** - Toggle between `light`, `dark`, and `ansi` themes. [More info](#themes).
 - **`/t <name>`** - Set theme directly (light, dark, ansi)
 

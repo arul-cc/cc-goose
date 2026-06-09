@@ -1,21 +1,27 @@
 import React from 'react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/Tooltip';
+import { defineMessages, useIntl } from '../../i18n';
+
+const i18n = defineMessages({
+  dev: {
+    id: 'environmentBadge.dev',
+    defaultMessage: 'Dev',
+  },
+});
 
 interface EnvironmentBadgeProps {
   className?: string;
 }
 
 const EnvironmentBadge: React.FC<EnvironmentBadgeProps> = ({ className = '' }) => {
-  const isAlpha = process.env.ALPHA;
+  const intl = useIntl();
   const isDevelopment = import.meta.env.DEV;
 
-  // Don't show badge in production
-  if (!isDevelopment && !isAlpha) {
+  if (!isDevelopment) {
     return null;
   }
 
-  const tooltipText = isAlpha ? 'Alpha' : 'Dev';
-  const bgColor = isAlpha ? 'bg-purple-600' : 'bg-orange-400';
+  const tooltipText = intl.formatMessage(i18n.dev);
 
   return (
     <Tooltip>
@@ -26,13 +32,13 @@ const EnvironmentBadge: React.FC<EnvironmentBadgeProps> = ({ className = '' }) =
           aria-label={tooltipText}
         >
           <div className="absolute -inset-1" />
-          <div className={`${bgColor} w-2 h-2 rounded-full`} />
+          <div className="bg-orange-400 w-2 h-2 rounded-full" />
         </div>
       </TooltipTrigger>
       <TooltipContent
         side="bottom"
-        className={bgColor}
-        arrowClassName={isAlpha ? 'fill-purple-600 bg-purple-600' : 'fill-orange-400 bg-orange-400'}
+        className="bg-orange-400"
+        arrowClassName="fill-orange-400 bg-orange-400"
       >
         {tooltipText}
       </TooltipContent>

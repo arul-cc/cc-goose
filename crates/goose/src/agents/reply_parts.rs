@@ -1,4 +1,5 @@
 use anyhow::Result;
+use goose_providers::errors::ProviderError;
 use regex::Regex;
 use std::sync::Arc;
 
@@ -14,13 +15,14 @@ use crate::conversation::message::{Message, MessageContent, ToolRequest};
 use crate::conversation::Conversation;
 #[cfg(test)]
 use crate::providers::base::stream_from_single_message;
-use crate::providers::base::{MessageStream, Provider, ProviderUsage};
-use crate::providers::errors::ProviderError;
+use crate::providers::base::{MessageStream, Provider};
 use crate::providers::toolshim::{
-    augment_message_with_tool_calls, convert_tool_messages_to_text,
-    modify_system_prompt_for_tool_json, OllamaInterpreter,
+    augment_message_with_selected_tool_interpreter, convert_tool_messages_to_text,
+    modify_system_prompt_for_tool_json, sanitize_residual_markers,
 };
+use goose_providers::conversation::token_usage::ProviderUsage;
 use rmcp::model::Tool;
+use tracing::warn;
 
 async fn enhance_model_error(error: ProviderError, provider: &Arc<dyn Provider>) -> ProviderError {
     let ProviderError::RequestFailed(ref msg) = error else {
@@ -96,7 +98,7 @@ fn try_coerce_boolean(s: &str) -> Value {
     }
 }
 
-fn coerce_tool_arguments(
+pub(crate) fn coerce_tool_arguments(
     arguments: Option<serde_json::Map<String, Value>>,
     tool_schema: &Value,
 ) -> Option<serde_json::Map<String, Value>> {
@@ -123,13 +125,16 @@ async fn toolshim_postprocess(
     response: Message,
     toolshim_tools: &[Tool],
 ) -> Result<Message, ProviderError> {
-    let interpreter = OllamaInterpreter::new().map_err(|e| {
-        ProviderError::ExecutionError(format!("Failed to create OllamaInterpreter: {}", e))
-    })?;
-
-    augment_message_with_tool_calls(&interpreter, response, toolshim_tools)
-        .await
-        .map_err(|e| ProviderError::ExecutionError(format!("Failed to augment message: {}", e)))
+    match augment_message_with_selected_tool_interpreter(response.clone(), toolshim_tools).await {
+        Ok(message) => Ok(message),
+        Err(e) => {
+            warn!(
+                "Toolshim augmentation failed, skipping tool augmentation: {}",
+                e
+            );
+            Ok(sanitize_residual_markers(response))
+        }
+    }
 }
 
 impl Agent {
@@ -138,14 +143,7 @@ impl Agent {
         session_id: &str,
         working_dir: &std::path::Path,
     ) -> Result<(Vec<Tool>, Vec<Tool>, String)> {
-        // Get tools from extension manager
         let mut tools = self.list_tools(session_id, None).await;
-
-        // Add frontend tools
-        let frontend_tools = self.frontend_tools.lock().await;
-        for frontend_tool in frontend_tools.values() {
-            tools.push(frontend_tool.tool.clone());
-        }
 
         #[cfg(feature = "code-mode")]
         let code_execution_active = self
@@ -154,15 +152,57 @@ impl Agent {
             .await;
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
+        #[cfg(feature = "code-mode")]
         if code_execution_active {
-            tools.retain(|tool| {
-                if let Some(owner) = crate::agents::extension_manager::get_tool_owner(tool) {
-                    crate::agents::extension_manager::is_first_class_extension(&owner)
-                } else {
-                    false
-                }
-            });
+            let disclosure_style =
+                crate::agents::platform_extensions::code_execution::get_tool_disclosure();
+
+            tools = tools
+                .into_iter()
+                .filter_map(|mut t| match disclosure_style {
+                    pctx_code_mode::config::ToolDisclosure::Catalog
+                    | pctx_code_mode::config::ToolDisclosure::Filesystem => {
+                        // in catalog & filesystem styles, progressive search is handled
+                        // by pctx, so we want to omit all non-first-class extensions
+                        // from the standard tool list
+                        if crate::agents::extension_manager::get_tool_owner(&t).is_some_and(|o| {
+                            crate::agents::extension_manager::is_first_class_extension(&o)
+                        }) {
+                            Some(t)
+                        } else {
+                            None
+                        }
+                    }
+                    pctx_code_mode::config::ToolDisclosure::Sidecar => {
+                        // in sidecar style there is no progressive search, just a way to chain tools
+                        // together with typescript
+                        // add output schema to description since many model providers drop the
+                        // output schema when presenting tools to the model
+                        let output_schema = t
+                            .output_schema
+                            .as_ref()
+                            .map(|s| serde_json::json!(s).to_string())
+                            .unwrap_or("unknown".to_string());
+                        let description_extension = format!(
+                            "The successful return schema of this tool is:\n{output_schema}"
+                        );
+
+                        t.description = Some(
+                            t.description
+                                .map(|t| format!("{t}\n{description_extension}"))
+                                .unwrap_or(description_extension)
+                                .into(),
+                        );
+
+                        Some(t)
+                    }
+                })
+                .collect();
         }
+
+        // Filter out tools not visible to the model per MCP Apps visibility spec.
+        // Tools with `_meta.ui.visibility` that doesn't include "model" are app-only.
+        tools.retain(is_tool_visible_to_model);
 
         // Stable tool ordering is important for multi session prompt caching.
         tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -172,14 +212,13 @@ impl Agent {
             .extension_manager
             .get_extensions_info(working_dir)
             .await;
-        let (extension_count, tool_count) = self
-            .extension_manager
-            .get_extension_and_tool_counts(session_id)
-            .await;
+        let (extension_count, tool_count) = self.total_extension_and_tool_counts(session_id).await;
 
         // Get model name from provider
         let provider = self.provider().await?;
         let model_config = provider.get_model_config();
+
+        let goose_mode = *self.current_goose_mode.lock().await;
 
         let prompt_manager = self.prompt_manager.lock().await;
         let mut system_prompt = prompt_manager
@@ -189,6 +228,7 @@ impl Agent {
             .with_extension_and_tool_counts(extension_count, tool_count)
             .with_code_execution_mode(code_execution_active)
             .with_hints(working_dir)
+            .with_goose_mode(goose_mode)
             .build();
 
         // Handle toolshim if enabled
@@ -205,8 +245,10 @@ impl Agent {
         Ok((tools, toolshim_tools, system_prompt))
     }
 
-    /// Stream a response from the LLM provider.
-    /// Handles toolshim transformations if needed
+    #[tracing::instrument(
+        skip(provider, session_id, system_prompt, messages, tools, toolshim_tools),
+        fields(session.id = %session_id)
+    )]
     pub(crate) async fn stream_response_from_provider(
         provider: Arc<dyn Provider>,
         session_id: &str,
@@ -265,20 +307,59 @@ impl Agent {
         };
 
         Ok(Box::pin(try_stream! {
-            while let Some(result) = stream.next().await {
-                let (mut message, usage) = result?;
+            if config.toolshim {
+                // Toolshim mode: accumulate the full response before processing
+                // so that tool-use markers spanning multiple chunks are detected
+                // and stripped before any output reaches the UI.
+                let mut accumulated_message: Option<Message> = None;
+                let mut final_usage: Option<ProviderUsage> = None;
 
-                // Store the model information in the global store
-                if let Some(usage) = usage.as_ref() {
-                    crate::providers::base::set_current_model(&usage.model);
+                while let Some(result) = stream.next().await {
+                    let (msg_opt, usage_opt) = result?;
+
+                    if let Some(msg) = msg_opt {
+                        accumulated_message = Some(match accumulated_message {
+                            Some(mut prev) => {
+                                for new_content in msg.content {
+                                    match (&mut prev.content.last_mut(), &new_content) {
+                                        (
+                                            Some(MessageContent::Text(last_text)),
+                                            MessageContent::Text(new_text),
+                                        ) => {
+                                            last_text.text.push_str(&new_text.text);
+                                        }
+                                        _ => {
+                                            prev.content.push(new_content);
+                                        }
+                                    }
+                                }
+                                prev
+                            }
+                            None => msg,
+                        });
+                    }
+
+                    if let Some(usage) = usage_opt {
+                        final_usage = Some(usage);
+                    }
+
+                    // Yield empty item so the agent loop can check cancellation
+                    yield (None, None);
                 }
 
-                // Post-process / structure the response only if tool interpretation is enabled
-                if message.is_some() && config.toolshim {
-                    message = Some(toolshim_postprocess(message.unwrap(), &toolshim_tools).await?);
+                if let Some(msg) = accumulated_message {
+                    let processed = toolshim_postprocess(msg, &toolshim_tools).await?;
+                    yield (Some(processed), final_usage);
+                } else if final_usage.is_some() {
+                    // Preserve usage-only responses (no message content)
+                    yield (None, final_usage);
                 }
+            } else {
+                while let Some(result) = stream.next().await {
+                    let (message, usage) = result?;
 
-                yield (message, usage);
+                    yield (message, usage);
+                }
             }
         }))
     }
@@ -292,6 +373,7 @@ impl Agent {
         &self,
         response: &Message,
         tools: &[Tool],
+        suppress_replayed_thinking: bool,
     ) -> (Vec<ToolRequest>, Vec<ToolRequest>, Message) {
         // First collect all tool requests with coercion applied
         let tool_requests: Vec<ToolRequest> = response
@@ -308,7 +390,24 @@ impl Agent {
                                 coerce_tool_arguments(tool_call.arguments.clone(), &schema_value);
 
                             if let Some(ref meta) = tool.meta {
-                                coerced_req.tool_meta = serde_json::to_value(meta).ok();
+                                // Merge registry meta into existing tool_meta;
+                                // existing keys win so provider markers (e.g.
+                                // goose.external_dispatch) survive coercion.
+                                let new_meta = serde_json::to_value(meta).ok();
+                                coerced_req.tool_meta =
+                                    match (coerced_req.tool_meta.take(), new_meta) {
+                                        (
+                                            Some(Value::Object(mut existing)),
+                                            Some(Value::Object(new)),
+                                        ) => {
+                                            for (k, v) in new {
+                                                existing.entry(k).or_insert(v);
+                                            }
+                                            Some(Value::Object(existing))
+                                        }
+                                        (None, new) => new,
+                                        (existing, _) => existing,
+                                    };
                             }
                         }
                     }
@@ -320,7 +419,16 @@ impl Agent {
             })
             .collect();
 
-        // Create a filtered message with frontend tool requests removed
+        let has_tool_requests = !tool_requests.is_empty();
+        let should_suppress_replayed_thinking = suppress_replayed_thinking && has_tool_requests;
+
+        // Create a filtered message with frontend tool requests removed.
+        // When a response contains tool calls, keep reasoning in the original
+        // message for provider/state purposes but only suppress it from the
+        // user-visible filtered message if the caller already surfaced
+        // thinking earlier in this provider turn. That avoids replaying full
+        // accumulated reasoning after streamed thought chunks while still
+        // preserving final-only non-streaming thoughts.
         let mut filtered_content = Vec::new();
         let mut tool_request_index = 0;
 
@@ -331,7 +439,12 @@ impl Agent {
                         let coerced_req = &tool_requests[tool_request_index];
                         tool_request_index += 1;
 
-                        let should_include = if let Ok(tool_call) = &coerced_req.tool_call {
+                        // Always keep externally-dispatched requests visible, even if
+                        // their name happens to overlap a registered frontend tool —
+                        // they're observation-only and must not be removed from history.
+                        let should_include = if coerced_req.is_externally_dispatched() {
+                            true
+                        } else if let Ok(tool_call) = &coerced_req.tool_call {
                             !self.is_frontend_tool(&tool_call.name).await
                         } else {
                             true
@@ -342,6 +455,8 @@ impl Agent {
                         }
                     }
                 }
+                MessageContent::Thinking(_) | MessageContent::RedactedThinking(_)
+                    if should_suppress_replayed_thinking => {}
                 _ => {
                     filtered_content.push(content.clone());
                 }
@@ -361,6 +476,11 @@ impl Agent {
         let mut other_requests = Vec::new();
 
         for request in tool_requests {
+            // Skip externally-dispatched requests (e.g. claude-acp); the
+            // provider already executed the tool. Stays in filtered_message.
+            if request.is_externally_dispatched() {
+                continue;
+            }
             if let Ok(tool_call) = &request.tool_call {
                 if self.is_frontend_tool(&tool_call.name).await {
                     frontend_requests.push(request);
@@ -400,6 +520,12 @@ impl Agent {
         let accumulated_output =
             accumulate(session.accumulated_output_tokens, usage.usage.output_tokens);
 
+        let accumulated_cost = session
+            .provider_name
+            .as_deref()
+            .and_then(|pn| self.accumulate_cost(session.accumulated_cost, usage, pn))
+            .or(session.accumulated_cost);
+
         let (current_total, current_input, current_output) = if is_compaction_usage {
             // After compaction: summary output becomes new input context
             let new_input = usage.usage.output_tokens;
@@ -421,22 +547,86 @@ impl Agent {
             .accumulated_total_tokens(accumulated_total)
             .accumulated_input_tokens(accumulated_input)
             .accumulated_output_tokens(accumulated_output)
+            .accumulated_cost(accumulated_cost)
             .apply()
             .await?;
 
         Ok(())
     }
+
+    fn accumulate_cost(
+        &self,
+        existing: Option<f64>,
+        usage: &ProviderUsage,
+        provider_name: &str,
+    ) -> Option<f64> {
+        let canonical =
+            crate::providers::canonical::maybe_get_canonical_model(provider_name, &usage.model)?;
+
+        let input_price = canonical.cost.input?;
+        let output_price = canonical.cost.output?;
+
+        let input_tokens = usage.usage.input_tokens.unwrap_or(0) as f64;
+        let output_tokens = usage.usage.output_tokens.unwrap_or(0) as f64;
+
+        let chunk_cost = (input_tokens * input_price + output_tokens * output_price) / 1_000_000.0;
+
+        Some(existing.unwrap_or(0.0) + chunk_cost)
+    }
+}
+
+/// Check whether a tool should be callable by an app based on MCP Apps visibility metadata.
+///
+/// Per the MCP Apps spec (2026-01-26), if `_meta.ui.visibility` is present and does not
+/// include `"app"`, the tool is model-only and must not be callable by app UIs.
+/// If the field is absent, the tool defaults to visible to both model and app.
+pub fn is_tool_visible_to_app(tool: &Tool) -> bool {
+    let Some(meta) = &tool.meta else {
+        return true;
+    };
+    let Some(ui) = meta.0.get("ui") else {
+        return true;
+    };
+    let Some(visibility) = ui.get("visibility") else {
+        return true;
+    };
+    let Some(arr) = visibility.as_array() else {
+        return true;
+    };
+    arr.iter().any(|v| v.as_str() == Some("app"))
+}
+
+/// Check whether a tool should be visible to the model based on MCP Apps visibility metadata.
+///
+/// Per the MCP Apps spec (2026-01-26), tools may declare `_meta.ui.visibility` as an array
+/// of `"model"` and/or `"app"`. If the field is absent, the tool defaults to visible to both.
+/// If present and does not include `"model"`, the tool is app-only and must not be sent to the LLM.
+pub fn is_tool_visible_to_model(tool: &Tool) -> bool {
+    let Some(meta) = &tool.meta else {
+        return true;
+    };
+    let Some(ui) = meta.0.get("ui") else {
+        return true;
+    };
+    let Some(visibility) = ui.get("visibility") else {
+        return true;
+    };
+    let Some(arr) = visibility.as_array() else {
+        return true;
+    };
+    arr.iter().any(|v| v.as_str() == Some("model"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GooseMode;
     use crate::conversation::message::Message;
     use crate::model::ModelConfig;
-    use crate::providers::base::{Provider, ProviderUsage, Usage};
-    use crate::providers::errors::ProviderError;
+    use crate::providers::base::Provider;
     use crate::session::session_manager::SessionType;
     use async_trait::async_trait;
+    use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
     use rmcp::object;
 
     #[derive(Clone)]
@@ -479,6 +669,7 @@ mod tests {
                 std::env::current_dir().unwrap(),
                 "test-prepare-tools".to_string(),
                 SessionType::Hidden,
+                GooseMode::default(),
             )
             .await?;
 
@@ -569,5 +760,201 @@ mod tests {
             error_seen,
             "Error should have been propagated, not silently ignored"
         );
+    }
+
+    #[tokio::test]
+    async fn categorize_tool_requests_keeps_thinking_when_not_previously_streamed() {
+        let agent = crate::agents::Agent::new();
+        let response = Message::assistant()
+            .with_thinking("final-only reasoning", "")
+            .with_tool_request(
+                "tool-1",
+                Ok(rmcp::model::CallToolRequestParams::new("test_tool")),
+            );
+
+        let (_frontend_requests, other_requests, filtered_message) =
+            agent.categorize_tool_requests(&response, &[], false).await;
+
+        assert_eq!(other_requests.len(), 1);
+        assert_eq!(filtered_message.content.len(), 2);
+        assert!(matches!(
+            filtered_message.content[0],
+            MessageContent::Thinking(_)
+        ));
+        assert!(matches!(
+            filtered_message.content[1],
+            MessageContent::ToolRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn categorize_tool_requests_drops_replayed_thinking_after_streaming() {
+        let agent = crate::agents::Agent::new();
+        let response = Message::assistant()
+            .with_thinking("replayed reasoning", "")
+            .with_tool_request(
+                "tool-1",
+                Ok(rmcp::model::CallToolRequestParams::new("test_tool")),
+            );
+
+        let (_frontend_requests, other_requests, filtered_message) =
+            agent.categorize_tool_requests(&response, &[], true).await;
+
+        assert_eq!(other_requests.len(), 1);
+        assert_eq!(filtered_message.content.len(), 1);
+        assert!(matches!(
+            filtered_message.content[0],
+            MessageContent::ToolRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn categorize_tool_requests_skips_externally_dispatched_and_preserves_marker() {
+        // External requests must (1) survive coercion with goose.external_dispatch
+        // intact, (2) be excluded from both dispatch buckets, (3) stay in
+        // filtered_message.
+        use crate::conversation::message::TOOL_META_EXTERNAL_DISPATCH_KEY;
+
+        let agent = crate::agents::Agent::new();
+
+        let registry_tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }))
+            .with_meta(rmcp::model::Meta(
+                serde_json::json!({ "ui": { "visibility": ["model"] } })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ));
+
+        let response = Message::assistant().with_tool_request_with_metadata(
+            "tool-1",
+            Ok(rmcp::model::CallToolRequestParams::new("test_tool")),
+            None,
+            Some(serde_json::json!({ TOOL_META_EXTERNAL_DISPATCH_KEY: true })),
+        );
+
+        let (frontend_requests, other_requests, filtered_message) = agent
+            .categorize_tool_requests(&response, &[registry_tool], false)
+            .await;
+
+        assert!(
+            frontend_requests.is_empty(),
+            "external request leaked into frontend_requests: {frontend_requests:?}"
+        );
+        assert!(
+            other_requests.is_empty(),
+            "external request leaked into other_requests: {other_requests:?}"
+        );
+        assert_eq!(filtered_message.content.len(), 1);
+        let tool_req = match &filtered_message.content[0] {
+            MessageContent::ToolRequest(req) => req,
+            other => panic!("expected ToolRequest, got {other:?}"),
+        };
+        assert!(
+            tool_req.is_externally_dispatched(),
+            "goose.external_dispatch marker was clobbered by coercion; merged tool_meta = {:?}",
+            tool_req.tool_meta
+        );
+        let merged = tool_req
+            .tool_meta
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .expect("tool_meta should be an object after merge");
+        assert!(
+            merged.contains_key("ui"),
+            "registry tool meta keys were dropped; merged tool_meta = {merged:?}"
+        );
+    }
+
+    fn make_tool_with_meta(meta_json: Option<serde_json::Value>) -> Tool {
+        let mut tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }));
+        if let Some(v) = meta_json {
+            let obj = v.as_object().unwrap().clone();
+            tool = tool.with_meta(rmcp::model::Meta(obj));
+        }
+        tool
+    }
+
+    #[test]
+    fn test_tool_visible_when_no_meta() {
+        let tool = make_tool_with_meta(None);
+        assert!(is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_visible_when_meta_has_no_ui() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"other": "stuff"})));
+        assert!(is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_visible_when_ui_has_no_visibility() {
+        let tool = make_tool_with_meta(Some(
+            serde_json::json!({"ui": {"resourceUri": "ui://foo/bar"}}),
+        ));
+        assert!(is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_visible_when_visibility_includes_model() {
+        let tool = make_tool_with_meta(Some(
+            serde_json::json!({"ui": {"visibility": ["model", "app"]}}),
+        ));
+        assert!(is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_visible_when_visibility_is_model_only() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": ["model"]}})));
+        assert!(is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_hidden_when_visibility_is_app_only() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": ["app"]}})));
+        assert!(!is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_hidden_when_visibility_is_empty() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": []}})));
+        assert!(!is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_tool_visible_when_visibility_is_not_array() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": "model"}})));
+        assert!(is_tool_visible_to_model(&tool));
+    }
+
+    #[test]
+    fn test_app_visible_when_no_meta() {
+        let tool = make_tool_with_meta(None);
+        assert!(is_tool_visible_to_app(&tool));
+    }
+
+    #[test]
+    fn test_app_visible_when_visibility_includes_app() {
+        let tool = make_tool_with_meta(Some(
+            serde_json::json!({"ui": {"visibility": ["model", "app"]}}),
+        ));
+        assert!(is_tool_visible_to_app(&tool));
+    }
+
+    #[test]
+    fn test_app_visible_when_visibility_is_app_only() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": ["app"]}})));
+        assert!(is_tool_visible_to_app(&tool));
+    }
+
+    #[test]
+    fn test_app_hidden_when_visibility_is_model_only() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": ["model"]}})));
+        assert!(!is_tool_visible_to_app(&tool));
+    }
+
+    #[test]
+    fn test_app_hidden_when_visibility_is_empty() {
+        let tool = make_tool_with_meta(Some(serde_json::json!({"ui": {"visibility": []}})));
+        assert!(!is_tool_visible_to_app(&tool));
     }
 }

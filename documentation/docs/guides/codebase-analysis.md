@@ -5,7 +5,7 @@ description: Understand codebases with semantic analysis and call graphs
 sidebar_position: 111
 ---
 
-The [Developer extension](/docs/mcp/developer-mcp) includes an `analyze` tool that helps you understand code structure, track symbol usage, and explore call graphs across your codebase. It's automatically available when the Developer extension is enabled and supports file types for [multiple programming languages](https://github.com/block/goose/blob/main/crates/goose-mcp/src/developer/analyze/languages/mod.rs).
+The [Developer extension](/docs/mcp/developer-mcp) includes an `analyze` tool that helps you understand code structure, track symbol usage, and explore call graphs across your codebase. It's automatically available when the Developer extension is enabled and supports file types for [multiple programming languages](https://github.com/aaif-goose/goose/blob/main/crates/goose-mcp/src/developer/analyze/languages/mod.rs).
 
 <details>
 <summary>Example analysis: Tracking a function across files</summary>
@@ -114,10 +114,10 @@ If the analysis results exceed 1000 lines, the tool returns a warning message in
 - **Use `force=true`** to bypass the warning and see the full output (may consume significant conversation context)
 - **Narrow your scope** by analyzing a specific subdirectory or file
 - **Reduce depth** with `max_depth=1` or `max_depth=2` for directories
-- **Delegate to a [subagent](/docs/guides/subagents)** to analyze and summarize without filling your conversation history, for example: "Use a subagent to analyze the entire src/ directory and summarize the main components"
+- **Delegate to a [subagent](/docs/guides/context-engineering/subagents)** to analyze and summarize without filling your conversation history, for example: "Use a subagent to analyze the entire src/ directory and summarize the main components"
 
 ### Performance Tips
 
 - Start with smaller scopes (specific files or subdirectories) before analyzing entire projects
 - Use `max_depth=1` or `max_depth=2` to limit directory traversal depth
-- Use [`.gooseignore`](/docs/guides/using-gooseignore) and `.gitignore` files to exclude unnecessary files from analysis (like `node_modules/`, build artifacts, or sensitive files)
+- Use [`.gooseignore`](/docs/guides/context-engineering/using-gooseignore) and `.gitignore` files to exclude unnecessary files from analysis (like `node_modules/`, build artifacts, or sensitive files)

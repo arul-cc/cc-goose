@@ -6,7 +6,7 @@ unlisted: true
 ---
 
 :::info Archived
-goose Mobile has been archived. Mobile access to goose is now supported for [iOS devices via tunneling](/docs/experimental/mobile-access).
+goose Mobile has been archived. Mobile access to goose is now supported for [iOS devices via tunneling](/docs/experimental/remote-access/mobile-access).
 :::
 
 goose Mobile is an experimental Android project inspired by the goose application. It acts as an open agent on your phone, automating multistep tasks, responding to notifications, and even replacing your home screen for maximum efficiency.
@@ -27,17 +27,17 @@ goose Mobile requires deep access to your device. Use at your own risk — best 
 
 ## Installation
 - **Pre-built APK:** Install quickly via [Firebase distribution link](https://appdistribution.firebase.google.com/pub/i/3f111ea732d5f7f6).
-- **Build from Source:** Developer instructions are in the [goose Mobile repository](https://github.com/block/goose-mobile).
+- **Build from Source:** Developer instructions are in the [goose Mobile repository](https://github.com/aaif-goose/goose-mobile).
 
 
 ## Extending goose Mobile
 goose Mobile supports the **mobile MCP** system, which lets it use tools from other apps without leaving context — e.g., fetching weather data via a weather extension.  
 
-Sample code and setup instructions are in the repository [README](https://github.com/block/goose-mobile).
+Sample code and setup instructions are in the repository [README](https://github.com/aaif-goose/goose-mobile).
 
 ## Contribute
-We welcome contributions! See the [Contributing Guide](https://github.com/block/goose-mobile/blob/main/CONTRIBUTING.md) for details.
+We welcome contributions! See the [Contributing Guide](https://github.com/aaif-goose/goose-mobile/blob/main/CONTRIBUTING.md) for details.
 
 ---
 
-For more scenarios, instructions, and development setup, visit the [goose Mobile repository](https://github.com/block/goose-mobile).
+For more scenarios, instructions, and development setup, visit the [goose Mobile repository](https://github.com/aaif-goose/goose-mobile).

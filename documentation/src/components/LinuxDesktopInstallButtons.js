@@ -2,7 +2,9 @@ import Link from "@docusaurus/Link";
 import { IconDownload } from "@site/src/components/icons/download";
 import { useState, useEffect } from "react";
 
-const FALLBACK_URL = "https://github.com/block/goose/releases/latest";
+const FALLBACK_URL = "https://github.com/aaif-goose/goose/releases/latest";
+
+const isStandardLinuxAsset = (asset) => !asset.name.includes('-vulkan');
 
 const LinuxDesktopInstallButtons = () => {
   const [downloadUrls, setDownloadUrls] = useState({
@@ -26,16 +28,22 @@ const LinuxDesktopInstallButtons = () => {
         }
 
         // Fetch latest release from GitHub API
-        const response = await fetch('https://api.github.com/repos/block/goose/releases/latest');
+        const response = await fetch('https://api.github.com/repos/aaif-goose/goose/releases/latest');
         if (!response.ok) throw new Error('API request failed');
 
         const release = await response.json();
         const assets = release.assets || [];
 
         // Find DEB, RPM, and Flatpak files
-        const debAsset = assets.find(asset => asset.name.includes('.deb') && asset.name.includes('amd64'));
-        const rpmAsset = assets.find(asset => asset.name.includes('.rpm') && asset.name.includes('x86_64'));
-        const flatpakAsset = assets.find(asset => asset.name.endsWith('.flatpak'));
+        const debAsset = assets.find(asset =>
+          isStandardLinuxAsset(asset) && asset.name.includes('.deb') && asset.name.includes('amd64')
+        );
+        const rpmAsset = assets.find(asset =>
+          isStandardLinuxAsset(asset) && asset.name.includes('.rpm') && asset.name.includes('x86_64')
+        );
+        const flatpakAsset = assets.find(asset =>
+          isStandardLinuxAsset(asset) && asset.name.endsWith('.flatpak')
+        );
 
         const newUrls = {
           deb: debAsset?.browser_download_url || FALLBACK_URL,

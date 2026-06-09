@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Bot, ExternalLink } from 'lucide-react';
+import { defineMessages, useIntl } from '../../../../i18n';
 
 import {
   Dialog,
@@ -16,31 +17,183 @@ import { Select } from '../../../ui/Select';
 import { useConfig } from '../../../ConfigContext';
 import { useModelAndProvider } from '../../../ModelAndProviderContext';
 import type { View } from '../../../../utils/navigationUtils';
-import Model, { getProviderMetadata, fetchModelsForProviders } from '../modelInterface';
+import Model, {
+  fetchModelReasoning,
+  fetchModelsForProviders,
+  getProviderMetadata,
+} from '../modelInterface';
 import { getPredefinedModelsFromEnv, shouldShowPredefinedModels } from '../predefinedModelsUtils';
-import { ProviderType } from '../../../../api';
+import type { ProviderType, ThinkingEffort } from '../../../../api';
 import { trackModelChanged } from '../../../../utils/analytics';
 
-const THINKING_LEVEL_OPTIONS = [
-  { value: 'low', label: 'Low - Better latency, lighter reasoning' },
-  { value: 'high', label: 'High - Deeper reasoning, higher latency' },
-];
+const i18n = defineMessages({
+  thinkingEffortOff: {
+    id: 'switchModelModal.thinkingEffortOff',
+    defaultMessage: 'Off - No extended thinking',
+  },
+  thinkingLevelLow: {
+    id: 'switchModelModal.thinkingLevelLow',
+    defaultMessage: 'Low - Better latency, lighter reasoning',
+  },
+  thinkingLevelHigh: {
+    id: 'switchModelModal.thinkingLevelHigh',
+    defaultMessage: 'High - Deeper reasoning, higher latency',
+  },
+  claudeEffortLow: {
+    id: 'switchModelModal.claudeEffortLow',
+    defaultMessage: 'Low - Minimal thinking, fastest responses',
+  },
+  claudeEffortMedium: {
+    id: 'switchModelModal.claudeEffortMedium',
+    defaultMessage: 'Medium - Moderate thinking',
+  },
+  claudeEffortHigh: {
+    id: 'switchModelModal.claudeEffortHigh',
+    defaultMessage: 'High - Deep reasoning (default)',
+  },
+  claudeEffortMax: {
+    id: 'switchModelModal.claudeEffortMax',
+    defaultMessage: 'Max - No constraints on thinking depth',
+  },
+  selectModel: {
+    id: 'switchModelModal.selectModel',
+    defaultMessage: 'Please select a model',
+  },
+  selectProvider: {
+    id: 'switchModelModal.selectProvider',
+    defaultMessage: 'Please select a provider',
+  },
+  selectOrEnterModel: {
+    id: 'switchModelModal.selectOrEnterModel',
+    defaultMessage: 'Please select or enter a model',
+  },
+  title: {
+    id: 'switchModelModal.title',
+    defaultMessage: 'Switch models',
+  },
+  description: {
+    id: 'switchModelModal.description',
+    defaultMessage: 'Select a provider and model to use for your conversations.',
+  },
+  chooseModel: {
+    id: 'switchModelModal.chooseModel',
+    defaultMessage: 'Choose a model:',
+  },
+  recommended: {
+    id: 'switchModelModal.recommended',
+    defaultMessage: 'Recommended',
+  },
+  thinkingLevel: {
+    id: 'switchModelModal.thinkingLevel',
+    defaultMessage: 'Thinking Level',
+  },
+  geminiOnly: {
+    id: 'switchModelModal.geminiOnly',
+    defaultMessage: '(Gemini 3 models only)',
+  },
+  selectThinkingLevel: {
+    id: 'switchModelModal.selectThinkingLevel',
+    defaultMessage: 'Select thinking level',
+  },
+  useOtherProvider: {
+    id: 'switchModelModal.useOtherProvider',
+    defaultMessage: 'Use other provider',
+  },
+  providerPlaceholder: {
+    id: 'switchModelModal.providerPlaceholder',
+    defaultMessage: 'Provider, type to search',
+  },
+  localModelsTitle: {
+    id: 'switchModelModal.localModelsTitle',
+    defaultMessage: 'Local models need to be downloaded first',
+  },
+  localModelsDescription: {
+    id: 'switchModelModal.localModelsDescription',
+    defaultMessage: 'To use local inference, you need to download a model to your computer first. Go to Settings → Models to manage local models.',
+  },
+  goToSettings: {
+    id: 'switchModelModal.goToSettings',
+    defaultMessage: 'Go to Settings',
+  },
+  couldNotContactProvider: {
+    id: 'switchModelModal.couldNotContactProvider',
+    defaultMessage: 'Could not contact provider',
+  },
+  checkProviderConfig: {
+    id: 'switchModelModal.checkProviderConfig',
+    defaultMessage: 'Check your provider configuration in Settings → Providers',
+  },
+  loadingModels: {
+    id: 'switchModelModal.loadingModels',
+    defaultMessage: 'Loading models…',
+  },
+  selectModelPlaceholder: {
+    id: 'switchModelModal.selectModelPlaceholder',
+    defaultMessage: 'Select a model, type to search',
+  },
+  customModelName: {
+    id: 'switchModelModal.customModelName',
+    defaultMessage: 'Custom model name',
+  },
+  backToModelList: {
+    id: 'switchModelModal.backToModelList',
+    defaultMessage: 'Back to model list',
+  },
+  typeModelName: {
+    id: 'switchModelModal.typeModelName',
+    defaultMessage: 'Type model name here',
+  },
+  extendedThinking: {
+    id: 'switchModelModal.extendedThinking',
+    defaultMessage: 'Extended Thinking',
+  },
+  selectThinkingMode: {
+    id: 'switchModelModal.selectThinkingMode',
+    defaultMessage: 'Select thinking mode',
+  },
+  thinkingEffort: {
+    id: 'switchModelModal.thinkingEffort',
+    defaultMessage: 'Thinking Effort',
+  },
+  selectEffortLevel: {
+    id: 'switchModelModal.selectEffortLevel',
+    defaultMessage: 'Select effort level',
+  },
+  thinkingBudget: {
+    id: 'switchModelModal.thinkingBudget',
+    defaultMessage: 'Thinking Budget (tokens)',
+  },
+  quickStartGuide: {
+    id: 'switchModelModal.quickStartGuide',
+    defaultMessage: 'Quick start guide',
+  },
+  cancel: {
+    id: 'switchModelModal.cancel',
+    defaultMessage: 'Cancel',
+  },
+  selectModelButton: {
+    id: 'switchModelModal.selectModelButton',
+    defaultMessage: 'Select model',
+  },
+  enterModelNotListed: {
+    id: 'switchModelModal.enterModelNotListed',
+    defaultMessage: 'Enter a model not listed...',
+  },
+  claudeAdaptive: {
+    id: 'switchModelModal.claudeAdaptive',
+    defaultMessage: 'Adaptive - Claude decides when and how much to think',
+  },
+  claudeEnabled: {
+    id: 'switchModelModal.claudeEnabled',
+    defaultMessage: 'Enabled - Fixed token budget for thinking',
+  },
+  claudeDisabled: {
+    id: 'switchModelModal.claudeDisabled',
+    defaultMessage: 'Disabled - No extended thinking',
+  },
+});
 
-const CLAUDE_THINKING_EFFORT_OPTIONS = [
-  { value: 'low', label: 'Low - Minimal thinking, fastest responses' },
-  { value: 'medium', label: 'Medium - Moderate thinking' },
-  { value: 'high', label: 'High - Deep reasoning (default)' },
-  { value: 'max', label: 'Max - No constraints on thinking depth' },
-];
-
-function isClaudeModel(name: string | null | undefined): boolean {
-  return !!name && name.toLowerCase().startsWith('claude-');
-}
-
-function supportsAdaptiveThinking(name: string): boolean {
-  const lower = name.toLowerCase();
-  return lower.includes('claude-opus-4-6') || lower.includes('claude-sonnet-4-6');
-}
+// Thinking effort options are created inside the component to support i18n.
 
 const PREFERRED_MODEL_PATTERNS = [
   /claude-sonnet-4/i,
@@ -84,9 +237,11 @@ type SwitchModelModalProps = {
   sessionId: string | null;
   onClose: () => void;
   setView: (view: View) => void;
-  onModelSelected?: (model: string) => void;
+  onModelSelected?: (model: string, provider: string) => void;
   initialProvider?: string | null;
   titleOverride?: string;
+  sessionModel?: string | null;
+  sessionProvider?: string | null;
 };
 export const SwitchModelModal = ({
   sessionId,
@@ -95,11 +250,36 @@ export const SwitchModelModal = ({
   onModelSelected,
   initialProvider,
   titleOverride,
+  sessionModel,
+  sessionProvider,
 }: SwitchModelModalProps) => {
+  const intl = useIntl();
+
+  const THINKING_EFFORT_OPTIONS: { value: ThinkingEffort; label: string }[] = [
+    { value: 'off', label: intl.formatMessage(i18n.thinkingEffortOff) },
+    { value: 'low', label: intl.formatMessage(i18n.claudeEffortLow) },
+    { value: 'medium', label: intl.formatMessage(i18n.claudeEffortMedium) },
+    { value: 'high', label: intl.formatMessage(i18n.claudeEffortHigh) },
+    { value: 'max', label: intl.formatMessage(i18n.claudeEffortMax) },
+  ];
+
   const { getProviders, read, upsert } = useConfig();
-  const { changeModel, currentModel, currentProvider } = useModelAndProvider();
+  const {
+    changeModel,
+    currentModel: configModel,
+    currentProvider: configProvider,
+  } = useModelAndProvider();
+  // Use session-specific model/provider if available, otherwise fall back to config defaults
+  const currentModel = sessionModel ?? configModel;
+  const currentProvider = sessionProvider ?? configProvider;
   const [providerOptions, setProviderOptions] = useState<{ value: string; label: string }[]>([]);
-  type ModelOption = { value: string; label: string; provider: string; isDisabled?: boolean };
+  type ModelOption = {
+    value: string;
+    label: string;
+    provider: string;
+    isDisabled?: boolean;
+    reasoning?: boolean;
+  };
   const [modelOptions, setModelOptions] = useState<{ options: ModelOption[] }[]>([]);
   const [provider, setProvider] = useState<string | null>(
     initialProvider || currentProvider || null
@@ -121,42 +301,59 @@ export const SwitchModelModal = ({
   const [userClearedModel, setUserClearedModel] = useState(false);
   const [providerErrors, setProviderErrors] = useState<Record<string, string>>({});
   const [providerWarnings, setProviderWarnings] = useState<Record<string, string>>({});
-  const [thinkingLevel, setThinkingLevel] = useState<string>('low');
-  const [claudeThinkingType, setClaudeThinkingType] = useState<string>('disabled');
-  const [claudeThinkingEffort, setClaudeThinkingEffort] = useState<string>('high');
-  const [claudeThinkingBudget, setClaudeThinkingBudget] = useState<string>('16000');
+  const [activeProvidersList, setActiveProvidersList] = useState<
+    import('../../../../api').ProviderDetails[]
+  >([]);
+  const fetchedProviders = useRef<Set<string>>(new Set());
+  const reasoningRequestId = useRef(0);
+  const [thinkingEffort, setThinkingEffort] = useState<ThinkingEffort | null>(null);
+  const [selectedModelReasoning, setSelectedModelReasoning] = useState<boolean | null>(null);
 
-  const modelName = usePredefinedModels ? selectedPredefinedModel?.name : model;
-  const isGemini3Model = modelName?.toLowerCase().startsWith('gemini-3') ?? false;
-  const showClaudeThinking = isClaudeModel(modelName);
-  const modelSupportsAdaptive = modelName ? supportsAdaptiveThinking(modelName) : false;
+  const modelReasoning = selectedModelReasoning ?? selectedPredefinedModel?.reasoning;
+  const showThinkingControl = modelReasoning === true;
+  const resolveSelectedModelReasoning = useCallback(
+    (providerName: string, modelName: string, fallback?: boolean) => {
+      const requestId = ++reasoningRequestId.current;
+      setSelectedModelReasoning(fallback ?? null);
+      fetchModelReasoning(providerName, modelName, fallback).then((reasoning) => {
+        if (requestId === reasoningRequestId.current) {
+          setSelectedModelReasoning(reasoning);
+        }
+      });
+    },
+    []
+  );
 
   useEffect(() => {
-    if (!showClaudeThinking) return;
-    if (claudeThinkingType === 'adaptive' && !modelSupportsAdaptive) {
-      setClaudeThinkingType('disabled');
-    }
-  }, [modelName, showClaudeThinking, modelSupportsAdaptive, claudeThinkingType]);
-
-  useEffect(() => {
-    const readConfig = async (key: string): Promise<string | null> => {
-      try {
-        const val = (await read(key, false)) as string;
-        return val || null;
-      } catch (e) {
-        console.warn(`Could not read ${key}, using default:`, e);
-        return null;
-      }
-    };
     (async () => {
-      const tt = await readConfig('CLAUDE_THINKING_TYPE');
-      if (tt) setClaudeThinkingType(tt);
-      const effort = await readConfig('CLAUDE_THINKING_EFFORT');
-      if (effort) setClaudeThinkingEffort(effort);
-      const budget = await readConfig('CLAUDE_THINKING_BUDGET');
-      if (budget) setClaudeThinkingBudget(budget);
+      try {
+        const effort = (await read('GOOSE_THINKING_EFFORT', false)) as ThinkingEffort;
+        if (effort) setThinkingEffort(effort);
+      } catch (e) {
+        console.warn('Could not read GOOSE_THINKING_EFFORT, using default:', e);
+      }
     })();
   }, [read]);
+
+  useEffect(() => {
+    if (!provider || !model) return;
+
+    const selectedOption = modelOptions
+      .flatMap((group) => group.options)
+      .find((option) => option.provider === provider && option.value === model);
+
+    if (selectedOption) {
+      resolveSelectedModelReasoning(provider, model, selectedOption.reasoning);
+      return;
+    }
+
+    setSelectedModelReasoning(null);
+    const timeout = setTimeout(() => {
+      resolveSelectedModelReasoning(provider, model);
+    }, 400);
+
+    return () => clearTimeout(timeout);
+  }, [model, provider, modelOptions, resolveSelectedModelReasoning]);
 
   // Validate form data
   const validateForm = useCallback(() => {
@@ -168,17 +365,17 @@ export const SwitchModelModal = ({
 
     if (usePredefinedModels) {
       if (!selectedPredefinedModel) {
-        errors.model = 'Please select a model';
+        errors.model = intl.formatMessage(i18n.selectModel);
         formIsValid = false;
       }
     } else {
       if (!provider) {
-        errors.provider = 'Please select a provider';
+        errors.provider = intl.formatMessage(i18n.selectProvider);
         formIsValid = false;
       }
 
       if (!model) {
-        errors.model = 'Please select or enter a model';
+        errors.model = intl.formatMessage(i18n.selectOrEnterModel);
         formIsValid = false;
       }
     }
@@ -186,7 +383,7 @@ export const SwitchModelModal = ({
     setValidationErrors(errors);
     setIsValid(formIsValid);
     return formIsValid;
-  }, [model, provider, usePredefinedModels, selectedPredefinedModel]);
+  }, [model, provider, usePredefinedModels, selectedPredefinedModel, intl]);
 
   const handleClose = () => {
     onClose();
@@ -210,42 +407,25 @@ export const SwitchModelModal = ({
           subtext: providerDisplayName,
         } as Model;
       }
+      modelObj = {
+        ...modelObj,
+        reasoning: selectedModelReasoning ?? modelObj.reasoning,
+      };
 
-      if (isGemini3Model) {
+      if (showThinkingControl) {
+        const effort = thinkingEffort ?? modelObj.request_params?.thinking_effort ?? 'off';
         modelObj = {
           ...modelObj,
-          request_params: { ...modelObj.request_params, thinking_level: thinkingLevel },
+          request_params: { ...modelObj.request_params, thinking_effort: effort },
         };
+        upsert('GOOSE_THINKING_EFFORT', effort, false).catch(console.warn);
       }
 
-      if (showClaudeThinking) {
-        const params: Record<string, unknown> = {
-          ...modelObj.request_params,
-          thinking_type: claudeThinkingType,
-        };
-        if (claudeThinkingType === 'adaptive') {
-          params.effort = claudeThinkingEffort;
-        } else if (claudeThinkingType === 'enabled') {
-          params.budget_tokens = parseInt(claudeThinkingBudget, 10) || 16000;
-        }
-        modelObj = { ...modelObj, request_params: params };
-
-        upsert('CLAUDE_THINKING_TYPE', claudeThinkingType, false).catch(console.warn);
-        if (claudeThinkingType === 'adaptive') {
-          upsert('CLAUDE_THINKING_EFFORT', claudeThinkingEffort, false).catch(console.warn);
-        } else if (claudeThinkingType === 'enabled') {
-          upsert(
-            'CLAUDE_THINKING_BUDGET',
-            parseInt(claudeThinkingBudget, 10) || 16000,
-            false
-          ).catch(console.warn);
-        }
+      const success = await changeModel(sessionId, modelObj);
+      if (success) {
+        onModelSelected?.(modelObj.name, modelObj.provider || '');
+        trackModelChanged(modelObj.provider || '', modelObj.name);
       }
-
-      await changeModel(sessionId, modelObj);
-      onModelSelected?.(modelObj.name);
-
-      trackModelChanged(modelObj.provider || '', modelObj.name);
 
       onClose();
     }
@@ -258,32 +438,51 @@ export const SwitchModelModal = ({
     }
   }, [attemptedSubmit, validateForm]);
 
+  // Initialize predefined model selection from session/config model.
+  // Separate effect so it re-runs when currentModel loads asynchronously.
   useEffect(() => {
-    // Load predefined models if enabled
+    if (!usePredefinedModels || !currentModel) return;
+    const models = getPredefinedModelsFromEnv();
+    const matchingModel = models.find((m) => m.name === currentModel);
+    if (matchingModel) {
+      setSelectedPredefinedModel(matchingModel);
+      resolveSelectedModelReasoning(
+        matchingModel.provider,
+        matchingModel.name,
+        matchingModel.reasoning
+      );
+    }
+  }, [usePredefinedModels, currentModel, resolveSelectedModelReasoning]);
+
+  // For manual mode: one-time sync of provider/model when session data
+  // arrives after the modal has already mounted. Uses a ref so it only
+  // fires once and doesn't interfere with user-driven changes (e.g.
+  // switching provider clears model intentionally).
+  const manualSyncDone = useRef(false);
+  useEffect(() => {
+    if (usePredefinedModels || manualSyncDone.current) return;
+    if (initialProvider && initialProvider !== currentProvider) return;
+    if (currentModel && currentProvider) {
+      if (!provider) setProvider(currentProvider);
+      if (!model) setModel(currentModel);
+      manualSyncDone.current = true;
+    }
+  }, [currentModel, currentProvider, usePredefinedModels, provider, model, initialProvider]);
+
+  useEffect(() => {
     if (usePredefinedModels) {
       const models = getPredefinedModelsFromEnv();
       setPredefinedModels(models);
-
-      // Initialize selected predefined model with current model
-      (async () => {
-        try {
-          const currentModelName = (await read('GOOSE_MODEL', false)) as string;
-          const matchingModel = models.find((model) => model.name === currentModelName);
-          if (matchingModel) {
-            setSelectedPredefinedModel(matchingModel);
-          }
-        } catch (error) {
-          console.error('Failed to get current model for selection:', error);
-        }
-      })();
     }
 
-    // Load providers for manual model selection
     (async () => {
       try {
-        const providersResponse = await getProviders(false);
+        // Force a refresh so the list reflects providers (un)configured since the
+        // cache was populated; otherwise a provider deleted in Settings still
+        // shows up here (#9364).
+        const providersResponse = await getProviders(true);
         const activeProviders = providersResponse.filter((provider) => provider.is_configured);
-        // Create provider options and add "Use other provider" option
+        setActiveProvidersList(activeProviders);
         setProviderOptions([
           ...activeProviders.map(({ metadata, name }) => ({
             value: name,
@@ -291,27 +490,46 @@ export const SwitchModelModal = ({
           })),
           {
             value: 'configure_providers',
-            label: 'Use other provider',
+            label: intl.formatMessage(i18n.useOtherProvider),
           },
         ]);
+      } catch (error: unknown) {
+        console.error('Failed to query providers:', error);
+      }
+    })();
+  }, [getProviders, usePredefinedModels, read, intl]);
 
-        setLoadingModels(true);
+  useEffect(() => {
+    if (!provider || usePredefinedModels) return;
+    if (fetchedProviders.current.has(provider)) {
+      setLoadingModels(false);
+      return;
+    }
 
-        const results = await fetchModelsForProviders(activeProviders);
+    const activeProvider = activeProvidersList.find((p) => p.name === provider);
+    if (!activeProvider) return;
 
-        // Process results and build grouped options
-        const groupedOptions: {
-          options: { value: string; label: string; provider: string; providerType: ProviderType }[];
+    let cancelled = false;
+
+    (async () => {
+      setLoadingModels(true);
+      try {
+        const results = await fetchModelsForProviders([activeProvider]);
+
+        if (cancelled) return;
+
+        const newGroupedOptions: {
+          options: (ModelOption & { providerType: ProviderType })[];
         }[] = [];
-        const errorMap: Record<string, string> = {};
-        const warningMap: Record<string, string> = {};
+        const newErrors: Record<string, string> = {};
+        const newWarnings: Record<string, string> = {};
 
         results.forEach(({ provider: p, models, error, warning }) => {
           if (warning) {
-            warningMap[p.name] = warning;
+            newWarnings[p.name] = warning;
           }
           if (error) {
-            errorMap[p.name] = error;
+            newErrors[p.name] = error;
             return;
           }
 
@@ -322,40 +540,57 @@ export const SwitchModelModal = ({
             label: string;
             provider: string;
             providerType: ProviderType;
+            reasoning?: boolean;
           }[] = modelList.map((m) => ({
-            value: m,
-            label: m,
+            value: m.name,
+            label: m.name,
             provider: p.name,
             providerType: p.provider_type,
+            reasoning: m.reasoning,
           }));
 
           if (p.provider_type !== 'Custom') {
             options.push({
               value: 'custom',
-              label: 'Enter a model not listed...',
+              label: intl.formatMessage(i18n.enterModelNotListed),
               provider: p.name,
               providerType: p.provider_type,
             });
           }
 
           if (options.length > 0) {
-            groupedOptions.push({ options });
+            newGroupedOptions.push({ options });
           }
         });
 
-        // Save provider errors and warnings to state
-        setProviderErrors(errorMap);
-        setProviderWarnings(warningMap);
+        setProviderErrors((prev) => {
+          const next = { ...prev, ...newErrors };
+          if (!newErrors[activeProvider.name]) delete next[activeProvider.name];
+          return next;
+        });
+        setProviderWarnings((prev) => {
+          const next = { ...prev, ...newWarnings };
+          if (!newWarnings[activeProvider.name]) delete next[activeProvider.name];
+          return next;
+        });
 
-        setModelOptions(groupedOptions);
-        setOriginalModelOptions(groupedOptions);
+        setModelOptions((prev) => [...prev, ...newGroupedOptions]);
+        setOriginalModelOptions((prev) => [...prev, ...newGroupedOptions]);
+        fetchedProviders.current.add(provider);
       } catch (error: unknown) {
-        console.error('Failed to query providers:', error);
+        console.error(`Failed to fetch models for ${provider}:`, error);
       } finally {
-        setLoadingModels(false);
+        if (!cancelled) {
+          setLoadingModels(false);
+        }
       }
     })();
-  }, [getProviders, usePredefinedModels, read]);
+
+    return () => {
+      cancelled = true;
+      setLoadingModels(false);
+    };
+  }, [provider, activeProvidersList, usePredefinedModels, intl]);
 
   const filteredModelOptions = provider
     ? modelOptions.filter((group) => group.options[0]?.provider === provider)
@@ -364,6 +599,13 @@ export const SwitchModelModal = ({
   useEffect(() => {
     // Don't auto-select if user explicitly cleared the model
     if (!provider || loadingModels || model || isCustomModel || userClearedModel) return;
+
+    // Use saved model from provider config if available
+    const providerInfo = activeProvidersList.find((p) => p.name === provider);
+    if (providerInfo?.saved_model) {
+      setModel(providerInfo.saved_model);
+      return;
+    }
 
     const providerModels = modelOptions
       .filter((group) => group.options[0]?.provider === provider)
@@ -375,32 +617,53 @@ export const SwitchModelModal = ({
         setModel(preferredModel);
       }
     }
-  }, [provider, modelOptions, loadingModels, model, isCustomModel, userClearedModel]);
+  }, [provider, modelOptions, loadingModels, model, isCustomModel, userClearedModel, activeProvidersList]);
+
+  const handlePredefinedModelChange = (model: Model) => {
+    setSelectedPredefinedModel(model);
+    resolveSelectedModelReasoning(model.provider, model.name, model.reasoning);
+  };
 
   // Handle model selection change
   const handleModelChange = (newValue: unknown) => {
-    const selectedOption = newValue as { value: string; label: string; provider: string } | null;
+    const selectedOption = newValue as {
+      value: string;
+      label: string;
+      provider: string;
+      reasoning?: boolean;
+    } | null;
     if (selectedOption?.value === 'custom') {
       setIsCustomModel(true);
       setModel('');
       setProvider(selectedOption.provider);
+      setSelectedModelReasoning(null);
       setUserClearedModel(false);
     } else if (selectedOption === null) {
       // User cleared the selection
       setIsCustomModel(false);
       setModel('');
+      setSelectedModelReasoning(null);
       setUserClearedModel(true);
     } else {
       setIsCustomModel(false);
       setModel(selectedOption?.value || '');
       setProvider(selectedOption?.provider || '');
+      if (selectedOption?.provider && selectedOption.value) {
+        resolveSelectedModelReasoning(
+          selectedOption.provider,
+          selectedOption.value,
+          selectedOption.reasoning
+        );
+      } else {
+        setSelectedModelReasoning(selectedOption?.reasoning ?? null);
+      }
       setUserClearedModel(false);
     }
   };
 
   // Store the original model options in state, initialized from modelOptions
   const [originalModelOptions, setOriginalModelOptions] =
-    useState<{ options: { value: string; label: string; provider: string }[] }[]>(modelOptions);
+    useState<{ options: ModelOption[] }[]>(modelOptions);
 
   const handleInputChange = (inputValue: string) => {
     if (!provider) return;
@@ -444,54 +707,20 @@ export const SwitchModelModal = ({
     }
   };
 
-  const claudeThinkingTypeOptions = [
-    ...(modelSupportsAdaptive
-      ? [{ value: 'adaptive', label: 'Adaptive - Claude decides when and how much to think' }]
-      : []),
-    { value: 'enabled', label: 'Enabled - Fixed token budget for thinking' },
-    { value: 'disabled', label: 'Disabled - No extended thinking' },
-  ];
-
-  const claudeThinkingControls = showClaudeThinking && (
-    <div className="mt-2 flex flex-col gap-3">
-      <div>
-        <label className="text-sm text-textSubtle mb-1 block">Extended Thinking</label>
-        <Select
-          options={claudeThinkingTypeOptions}
-          value={claudeThinkingTypeOptions.find((o) => o.value === claudeThinkingType)}
-          onChange={(newValue: unknown) => {
-            const option = newValue as { value: string; label: string } | null;
-            setClaudeThinkingType(option?.value || 'disabled');
-          }}
-          placeholder="Select thinking mode"
-        />
-      </div>
-      {claudeThinkingType === 'adaptive' && (
-        <div>
-          <label className="text-sm text-textSubtle mb-1 block">Thinking Effort</label>
-          <Select
-            options={CLAUDE_THINKING_EFFORT_OPTIONS}
-            value={CLAUDE_THINKING_EFFORT_OPTIONS.find((o) => o.value === claudeThinkingEffort)}
-            onChange={(newValue: unknown) => {
-              const option = newValue as { value: string; label: string } | null;
-              setClaudeThinkingEffort(option?.value || 'high');
-            }}
-            placeholder="Select effort level"
-          />
-        </div>
-      )}
-      {claudeThinkingType === 'enabled' && (
-        <div>
-          <label className="text-sm text-textSubtle mb-1 block">Thinking Budget (tokens)</label>
-          <Input
-            className="border-2 px-4 py-2"
-            type="number"
-            min="1024"
-            value={claudeThinkingBudget}
-            onChange={(e) => setClaudeThinkingBudget(e.target.value)}
-          />
-        </div>
-      )}
+  const thinkingEffortControl = showThinkingControl && (
+    <div className="mt-2">
+      <label className="text-sm text-textSubtle mb-1 block">
+        {intl.formatMessage(i18n.thinkingEffort)}
+      </label>
+      <Select
+        options={THINKING_EFFORT_OPTIONS}
+        value={THINKING_EFFORT_OPTIONS.find((o) => o.value === (thinkingEffort ?? 'off'))}
+        onChange={(newValue: unknown) => {
+          const option = newValue as { value: ThinkingEffort; label: string } | null;
+          setThinkingEffort(option?.value || 'off');
+        }}
+        placeholder={intl.formatMessage(i18n.selectEffortLevel)}
+      />
     </div>
   );
 
@@ -501,10 +730,10 @@ export const SwitchModelModal = ({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Bot size={24} className="text-text-primary" />
-            {titleOverride || 'Switch models'}
+            {titleOverride || intl.formatMessage(i18n.title)}
           </DialogTitle>
           <DialogDescription>
-            Select a provider and model to use for your conversations.
+            {intl.formatMessage(i18n.description)}
           </DialogDescription>
         </DialogHeader>
 
@@ -512,7 +741,7 @@ export const SwitchModelModal = ({
           {usePredefinedModels ? (
             <div className="w-full flex flex-col gap-4">
               <div className="flex justify-between items-center">
-                <label className="text-sm font-medium text-text-primary">Choose a model:</label>
+                <label className="text-sm font-medium text-text-primary">{intl.formatMessage(i18n.chooseModel)}</label>
               </div>
 
               <div className="space-y-2 max-h-64 overflow-y-auto">
@@ -524,7 +753,7 @@ export const SwitchModelModal = ({
                           ? 'bg-background-secondary'
                           : 'bg-background-primary hover:bg-background-secondary'
                       } rounded-lg transition-all`}
-                      onClick={() => setSelectedPredefinedModel(model)}
+                      onClick={() => handlePredefinedModelChange(model)}
                     >
                       <div className="flex-1">
                         <div className="flex items-center justify-between">
@@ -533,7 +762,7 @@ export const SwitchModelModal = ({
                           </span>
                           {model.alias?.includes('recommended') && (
                             <span className="text-xs bg-background-secondary text-text-primary px-2 py-1 rounded-full border border-border-primary ml-2">
-                              Recommended
+                              {intl.formatMessage(i18n.recommended)}
                             </span>
                           )}
                         </div>
@@ -550,7 +779,7 @@ export const SwitchModelModal = ({
                           name="predefined-model"
                           value={model.name}
                           checked={selectedPredefinedModel?.name === model.name}
-                          onChange={() => setSelectedPredefinedModel(model)}
+                          onChange={() => handlePredefinedModelChange(model)}
                           className="peer sr-only"
                         />
                         <div
@@ -569,25 +798,7 @@ export const SwitchModelModal = ({
                 <div className="text-red-500 text-sm mt-1">{validationErrors.model}</div>
               )}
 
-              {isGemini3Model && (
-                <div className="mt-2">
-                  <label className="text-sm text-textSubtle mb-1 block">
-                    Thinking Level
-                    <span className="text-xs text-textMuted ml-2">(Gemini 3 models only)</span>
-                  </label>
-                  <Select
-                    options={THINKING_LEVEL_OPTIONS}
-                    value={THINKING_LEVEL_OPTIONS.find((o) => o.value === thinkingLevel)}
-                    onChange={(newValue: unknown) => {
-                      const option = newValue as { value: string; label: string } | null;
-                      setThinkingLevel(option?.value || 'low');
-                    }}
-                    placeholder="Select thinking level"
-                  />
-                </div>
-              )}
-
-              {claudeThinkingControls}
+              {thinkingEffortControl}
             </div>
           ) : (
             /* Manual Provider/Model Selection */
@@ -609,7 +820,7 @@ export const SwitchModelModal = ({
                       setUserClearedModel(false);
                     }
                   }}
-                  placeholder="Provider, type to search"
+                  placeholder={intl.formatMessage(i18n.providerPlaceholder)}
                   isClearable
                 />
                 {attemptedSubmit && validationErrors.provider && (
@@ -628,11 +839,10 @@ export const SwitchModelModal = ({
                       <div className="flex flex-col gap-3">
                         <div>
                           <h3 className="text-sm font-medium text-blue-800 dark:text-blue-200">
-                            Local models need to be downloaded first
+                            {intl.formatMessage(i18n.localModelsTitle)}
                           </h3>
                           <div className="mt-1 text-sm text-blue-700 dark:text-blue-300">
-                            To use local inference, you need to download a model to your computer
-                            first. Go to Settings → Models to manage local models.
+                            {intl.formatMessage(i18n.localModelsDescription)}
                           </div>
                         </div>
                         <Button
@@ -644,26 +854,38 @@ export const SwitchModelModal = ({
                           }}
                           className="self-start border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/40"
                         >
-                          Go to Settings
+                          {intl.formatMessage(i18n.goToSettings)}
                         </Button>
                       </div>
                     </div>
                   ) : providerErrors[provider] ? (
-                    /* Show error message when provider failed to connect */
-                    <div className="rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3">
-                      <div className="flex items-start">
-                        <div className="flex-1">
-                          <h3 className="text-sm font-medium text-red-800 dark:text-red-200">
-                            Could not contact provider
-                          </h3>
-                          <div className="mt-1 text-sm text-red-700 dark:text-red-300">
-                            {providerErrors[provider]}
-                          </div>
-                          <div className="mt-2 text-xs text-red-600 dark:text-red-400">
-                            Check your provider configuration in Settings → Providers
+                    /* Show error with custom model input so users aren't stuck */
+                    <div className="flex flex-col gap-2">
+                      <div className="rounded-md bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 p-3">
+                        <div className="flex items-start">
+                          <div className="flex-1">
+                            <h3 className="text-sm font-medium text-yellow-800 dark:text-yellow-200">
+                              {intl.formatMessage(i18n.couldNotContactProvider)}
+                            </h3>
+                            <div className="mt-1 text-sm text-yellow-700 dark:text-yellow-300">
+                              {providerErrors[provider]}
+                            </div>
+                            <div className="mt-2 text-xs text-yellow-600 dark:text-yellow-400">
+                              {intl.formatMessage(i18n.checkProviderConfig)}
+                            </div>
                           </div>
                         </div>
                       </div>
+                      <label className="text-sm text-text-secondary">{intl.formatMessage(i18n.customModelName)}</label>
+                      <Input
+                        className="border-2 px-4 py-5"
+                        placeholder={intl.formatMessage(i18n.typeModelName)}
+                        onChange={(event) => setModel(event.target.value)}
+                        value={model}
+                      />
+                      {attemptedSubmit && validationErrors.model && (
+                        <div className="text-red-500 text-sm mt-1">{validationErrors.model}</div>
+                      )}
                     </div>
                   ) : !isCustomModel ? (
                     <div>
@@ -679,12 +901,12 @@ export const SwitchModelModal = ({
                         onInputChange={handleInputChange}
                         value={
                           loadingModels
-                            ? { value: '', label: 'Loading models…', isDisabled: true }
+                            ? { value: '', label: intl.formatMessage(i18n.loadingModels), isDisabled: true }
                             : model
                               ? { value: model, label: model }
                               : null
                         }
-                        placeholder="Select a model, type to search"
+                        placeholder={intl.formatMessage(i18n.selectModelPlaceholder)}
                         isClearable
                         isDisabled={loadingModels}
                       />
@@ -703,17 +925,17 @@ export const SwitchModelModal = ({
                   ) : (
                     <div className="flex flex-col gap-2">
                       <div className="flex justify-between">
-                        <label className="text-sm text-text-secondary">Custom model name</label>
+                        <label className="text-sm text-text-secondary">{intl.formatMessage(i18n.customModelName)}</label>
                         <button
                           onClick={() => setIsCustomModel(false)}
                           className="text-sm text-text-secondary"
                         >
-                          Back to model list
+                          {intl.formatMessage(i18n.backToModelList)}
                         </button>
                       </div>
                       <Input
                         className="border-2 px-4 py-5"
-                        placeholder="Type model name here"
+                        placeholder={intl.formatMessage(i18n.typeModelName)}
                         onChange={(event) => setModel(event.target.value)}
                         value={model}
                       />
@@ -723,25 +945,7 @@ export const SwitchModelModal = ({
                     </div>
                   )}
 
-                  {isGemini3Model && (
-                    <div className="mt-2">
-                      <label className="text-sm text-textSubtle mb-1 block">
-                        Thinking Level
-                        <span className="text-xs text-textMuted ml-2">(Gemini 3 models only)</span>
-                      </label>
-                      <Select
-                        options={THINKING_LEVEL_OPTIONS}
-                        value={THINKING_LEVEL_OPTIONS.find((o) => o.value === thinkingLevel)}
-                        onChange={(newValue: unknown) => {
-                          const option = newValue as { value: string; label: string } | null;
-                          setThinkingLevel(option?.value || 'low');
-                        }}
-                        placeholder="Select thinking level"
-                      />
-                    </div>
-                  )}
-
-                  {claudeThinkingControls}
+                  {thinkingEffortControl}
                 </>
               )}
             </div>
@@ -756,14 +960,14 @@ export const SwitchModelModal = ({
             className="inline-flex items-center text-text-secondary hover:text-text-primary text-sm mr-auto"
           >
             <ExternalLink size={14} className="mr-1" />
-            Quick start guide
+            {intl.formatMessage(i18n.quickStartGuide)}
           </a>
           <div className="flex gap-2">
             <Button variant="outline" onClick={handleClose} type="button">
-              Cancel
+              {intl.formatMessage(i18n.cancel)}
             </Button>
             <Button onClick={handleSubmit} disabled={!isValid}>
-              Select model
+              {intl.formatMessage(i18n.selectModelButton)}
             </Button>
           </div>
         </DialogFooter>

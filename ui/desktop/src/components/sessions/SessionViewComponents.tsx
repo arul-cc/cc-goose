@@ -1,5 +1,6 @@
 import React from 'react';
 import { MessageSquare, AlertCircle } from 'lucide-react';
+import { defineMessages, useIntl } from '../../i18n';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { ScrollArea } from '../ui/scroll-area';
@@ -8,12 +9,39 @@ import ToolCallWithResponse from '../ToolCallWithResponse';
 import ImagePreview from '../ImagePreview';
 import {
   getTextAndImageContent,
-  getReasoningContent,
+  getThinkingContent,
   ToolRequestMessageContent,
   ToolResponseMessageContent,
 } from '../../types/message';
 import { formatMessageTimestamp } from '../../utils/timeUtils';
 import { Message } from '../../api';
+
+const i18n = defineMessages({
+  errorLoadingDetails: {
+    id: 'sessionViewComponents.error.loading',
+    defaultMessage: 'Error Loading Session Details',
+  },
+  tryAgain: {
+    id: 'sessionViewComponents.error.tryAgain',
+    defaultMessage: 'Try Again',
+  },
+  noMessages: {
+    id: 'sessionViewComponents.empty.title',
+    defaultMessage: 'No messages found',
+  },
+  noMessagesDesc: {
+    id: 'sessionViewComponents.empty.description',
+    defaultMessage: "This session doesn't contain any messages",
+  },
+  you: {
+    id: 'sessionViewComponents.role.user',
+    defaultMessage: 'You',
+  },
+  goose: {
+    id: 'sessionViewComponents.role.assistant',
+    defaultMessage: 'Goose',
+  },
+});
 
 /**
  * Get tool responses map from messages
@@ -59,6 +87,7 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
   error,
   onRetry,
 }) => {
+  const intl = useIntl();
   return (
     <ScrollArea className="h-full w-full">
       <div className="p-4">
@@ -73,17 +102,17 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
                 <div className="text-red-500 mb-4">
                   <AlertCircle size={32} />
                 </div>
-                <p className="text-md mb-2">Error Loading Session Details</p>
+                <p className="text-md mb-2">{intl.formatMessage(i18n.errorLoadingDetails)}</p>
                 <p className="text-sm text-center mb-4">{error}</p>
                 <Button onClick={onRetry} variant="default">
-                  Try Again
+                  {intl.formatMessage(i18n.tryAgain)}
                 </Button>
               </div>
             ) : messages?.length > 0 ? (
               messages
                 .map((message, index) => {
                   const { textContent, imagePaths } = getTextAndImageContent(message);
-                  const reasoningContent = getReasoningContent(message);
+                  const thinkingContent = getThinkingContent(message);
 
                   // Get tool requests from the message
                   const toolRequests = message.content
@@ -113,7 +142,7 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
                     >
                       <div className="flex justify-between items-center mb-2">
                         <span className="font-medium text-text-primary">
-                          {message.role === 'user' ? 'You' : 'Goose'}
+                          {message.role === 'user' ? intl.formatMessage(i18n.you) : intl.formatMessage(i18n.goose)}
                         </span>
                         <span className="text-xs text-text-secondary">
                           {formatMessageTimestamp(message.created)}
@@ -121,16 +150,11 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
                       </div>
 
                       <div className="flex flex-col w-full">
-                        {/* Reasoning content */}
-                        {reasoningContent && (
-                          <details className="mb-2">
-                            <summary className="cursor-pointer text-xs text-textSubtle select-none">
-                              Show reasoning
-                            </summary>
-                            <div className="mt-2 text-sm">
-                              <MarkdownContent content={reasoningContent} />
-                            </div>
-                          </details>
+                        {/* Thinking content */}
+                        {thinkingContent && (
+                          <div className="mb-2 text-sm text-gray-400 italic">
+                            <MarkdownContent content={thinkingContent} />
+                          </div>
                         )}
 
                         {/* Text content */}
@@ -176,8 +200,8 @@ export const SessionMessages: React.FC<SessionMessagesProps> = ({
             ) : (
               <div className="flex flex-col items-center justify-center py-8 text-text-secondary">
                 <MessageSquare className="w-12 h-12 mb-4" />
-                <p className="text-lg mb-2">No messages found</p>
-                <p className="text-sm">This session doesn't contain any messages</p>
+                <p className="text-lg mb-2">{intl.formatMessage(i18n.noMessages)}</p>
+                <p className="text-sm">{intl.formatMessage(i18n.noMessagesDesc)}</p>
               </div>
             )}
           </div>

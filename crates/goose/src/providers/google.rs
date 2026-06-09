@@ -1,14 +1,15 @@
 use super::api_client::{ApiClient, AuthMethod};
 use super::base::MessageStream;
-use super::errors::ProviderError;
-use super::openai_compatible::handle_status_openai_compat;
+use super::openai_compatible::{handle_status, map_http_error_to_provider_error, sanitize_url};
 use super::retry::ProviderRetry;
 use super::utils::RequestLog;
 use crate::conversation::message::Message;
+use goose_providers::errors::ProviderError;
 
 use crate::model::ModelConfig;
 use crate::providers::base::{ConfigKey, Provider, ProviderDef, ProviderMetadata};
 use crate::providers::formats::google::{create_request, response_to_streaming_message};
+use crate::providers::inventory::{config_secret_value, InventoryIdentityInput};
 use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -101,7 +102,7 @@ impl GoogleProvider {
             .api_client
             .response_post(session_id, &path, payload)
             .await?;
-        handle_status_openai_compat(response).await
+        handle_status(response).await
     }
 }
 
@@ -111,7 +112,7 @@ impl ProviderDef for GoogleProvider {
     fn metadata() -> ProviderMetadata {
         ProviderMetadata::new(
             GOOGLE_PROVIDER_NAME,
-            "Google Gemini",
+            "Google Gemini (API Key)",
             "Gemini models from Google AI",
             GOOGLE_DEFAULT_MODEL,
             GOOGLE_KNOWN_MODELS.to_vec(),
@@ -121,6 +122,12 @@ impl ProviderDef for GoogleProvider {
                 ConfigKey::new("GOOGLE_HOST", false, false, Some(GOOGLE_API_HOST), false),
             ],
         )
+        .with_setup_steps(vec![
+            "Go to https://aistudio.google.com and sign in with your Google account",
+            "Click 'Get API key' on the left sidebar",
+            "Create a new API key or select an existing one",
+            "Copy the key and paste it above",
+        ])
     }
 
     fn from_env(
@@ -128,6 +135,27 @@ impl ProviderDef for GoogleProvider {
         _extensions: Vec<crate::config::ExtensionConfig>,
     ) -> BoxFuture<'static, Result<Self::Provider>> {
         Box::pin(Self::from_env(model))
+    }
+
+    fn supports_inventory_refresh() -> bool {
+        true
+    }
+
+    fn inventory_identity() -> Result<InventoryIdentityInput> {
+        let config = crate::config::Config::global();
+        let mut identity = InventoryIdentityInput::new(GOOGLE_PROVIDER_NAME, GOOGLE_PROVIDER_NAME)
+            .with_public(
+                "host",
+                config
+                    .get_param::<String>("GOOGLE_HOST")
+                    .unwrap_or_else(|_| GOOGLE_API_HOST.to_string()),
+            );
+
+        if let Some(api_key) = config_secret_value(config, "GOOGLE_API_KEY") {
+            identity = identity.with_secret("api_key", api_key);
+        }
+
+        Ok(identity)
     }
 }
 
@@ -147,6 +175,14 @@ impl Provider for GoogleProvider {
             .request(None, "v1beta/models")
             .response_get()
             .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let url = sanitize_url(response.url().as_str());
+            let body = response.text().await.unwrap_or_default();
+            let payload = serde_json::from_str::<serde_json::Value>(&body).ok();
+            return Err(map_http_error_to_provider_error(status, payload, &url));
+        }
+
         let json: serde_json::Value = response.json().await?;
         let arr = json
             .get("models")

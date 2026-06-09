@@ -1,6 +1,7 @@
 import type { ExtensionConfig } from '../../../api/types.gen';
 import { FixedExtensionEntry } from '../../ConfigContext';
 import bundledExtensionsData from './bundled-extensions.json';
+import deprecatedBundledExtensionsData from './deprecated-bundled-extensions.json';
 import { nameToKey } from './utils';
 
 // Type definition for built-in extensions from JSON
@@ -20,7 +21,41 @@ type BundledExtension = {
   allow_configure?: boolean;
 };
 
-const DEPRECATED_BUILTINS = ['googledrive', 'google_drive'];
+type DeprecatedBundledExtension = {
+  id: string;
+};
+
+export function getDeprecatedBundledExtensions(): DeprecatedBundledExtension[] {
+  return deprecatedBundledExtensionsData as DeprecatedBundledExtension[];
+}
+
+function isBundledExtension(extension: FixedExtensionEntry): boolean {
+  return 'bundled' in extension && extension.bundled === true;
+}
+
+export async function pruneDeprecatedBundledExtensions(
+  existingExtensions: FixedExtensionEntry[],
+  removeExtensionFn: (id: string) => Promise<void>
+): Promise<FixedExtensionEntry[]> {
+  const deprecatedExtensionIds = new Set(getDeprecatedBundledExtensions().map((ext) => ext.id));
+  const remainingExtensions: FixedExtensionEntry[] = [];
+
+  for (const existingExt of existingExtensions) {
+    if (!isBundledExtension(existingExt)) {
+      remainingExtensions.push(existingExt);
+      continue;
+    }
+
+    if (!deprecatedExtensionIds.has(nameToKey(existingExt.name))) {
+      remainingExtensions.push(existingExt);
+      continue;
+    }
+
+    await removeExtensionFn(nameToKey(existingExt.name));
+  }
+
+  return remainingExtensions;
+}
 
 /**
  * Synchronizes built-in extensions with the config system.
@@ -39,20 +74,14 @@ export async function syncBundledExtensions(
     // Cast the imported JSON data to the expected type
     const bundledExtensions = bundledExtensionsData as BundledExtension[];
 
-    for (let i = existingExtensions.length - 1; i >= 0; i--) {
-      const ext = existingExtensions[i];
-      if (ext.type == 'builtin' && DEPRECATED_BUILTINS.includes(ext.name)) {
-        existingExtensions.splice(i, 1);
-      }
-    }
-
     // Process each bundled extension
     for (const bundledExt of bundledExtensions) {
       // Find if this extension already exists
       const existingExt = existingExtensions.find((ext) => nameToKey(ext.name) === bundledExt.id);
 
-      // Skip if extension exists and is already marked as bundled
-      if (existingExt && 'bundled' in existingExt && existingExt.bundled) continue;
+      if (existingExt && isBundledExtension(existingExt)) {
+        continue;
+      }
 
       // Create the config for this extension
       let extConfig: ExtensionConfig;
@@ -99,15 +128,4 @@ export async function syncBundledExtensions(
     console.error('Failed to sync built-in extensions:', error);
     throw error;
   }
-}
-
-/**
- * Function to initialize all built-in extensions for a first-time user.
- * This can be called when the application is first installed.
- */
-export async function initializeBundledExtensions(
-  addExtensionFn: (name: string, config: ExtensionConfig, enabled: boolean) => Promise<void>
-): Promise<void> {
-  // Call with an empty list to ensure all built-ins are added
-  await syncBundledExtensions([], addExtensionFn);
 }

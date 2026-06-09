@@ -2,7 +2,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::future::BoxFuture;
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::thinking::ThinkingEffort;
 use serde_json::json;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,18 +13,16 @@ use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use super::base::{
-    ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata, ProviderUsage, Usage,
-};
-use super::errors::ProviderError;
+use super::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
 use super::utils::{filter_extensions_from_system_prompt, RequestLog};
-use crate::config::base::{CodexCommand, CodexReasoningEffort, CodexSkipGitCheck};
+use crate::config::base::{CodexCommand, CodexSkipGitCheck};
 use crate::config::paths::Paths;
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent};
 use crate::model::ModelConfig;
 use crate::subprocess::configure_subprocess;
+use goose_providers::errors::ProviderError;
 use rmcp::model::Role;
 use rmcp::model::Tool;
 
@@ -49,31 +50,58 @@ pub struct CodexProvider {
     #[serde(skip)]
     name: String,
     /// Reasoning effort level (none, low, medium, high, xhigh)
-    reasoning_effort: String,
+    reasoning_effort: Option<String>,
     /// Whether to skip git repo check
     skip_git_check: bool,
     /// CLI config overrides for MCP servers
     mcp_config_overrides: Vec<String>,
+    #[serde(skip)]
+    mode_by_session: tokio::sync::RwLock<HashMap<String, GooseMode>>,
 }
 
 impl CodexProvider {
-    fn supports_reasoning_effort(model_name: &str, reasoning_effort: &str) -> bool {
-        if !CODEX_REASONING_LEVELS.contains(&reasoning_effort) {
-            return false;
-        }
+    fn legacy_reasoning_effort() -> Option<ThinkingEffort> {
+        Config::global()
+            .get_param::<String>("CODEX_REASONING_EFFORT")
+            .ok()
+            .and_then(|effort| match effort.to_lowercase().as_str() {
+                "none" => Some(ThinkingEffort::Off),
+                "low" => Some(ThinkingEffort::Low),
+                "medium" => Some(ThinkingEffort::Medium),
+                "high" => Some(ThinkingEffort::High),
+                "xhigh" => Some(ThinkingEffort::Max),
+                _ => None,
+            })
+    }
 
-        if reasoning_effort == "none" && model_name.contains("codex") {
+    fn map_thinking_effort(_model_name: &str, effort: Option<ThinkingEffort>) -> Option<String> {
+        use ThinkingEffort;
+        match effort
+            .or_else(Self::legacy_reasoning_effort)
+            .unwrap_or(ThinkingEffort::High)
+        {
+            ThinkingEffort::Off => Some("none".to_string()),
+            ThinkingEffort::Low => Some("low".to_string()),
+            ThinkingEffort::Medium => Some("medium".to_string()),
+            ThinkingEffort::High => Some("high".to_string()),
+            ThinkingEffort::Max => Some("xhigh".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    fn supports_reasoning_effort(_model_name: &str, reasoning_effort: &str) -> bool {
+        if !CODEX_REASONING_LEVELS.contains(&reasoning_effort) {
             return false;
         }
 
         true
     }
 
-    /// Apply permission flags based on GOOSE_MODE setting
-    fn apply_permission_flags(cmd: &mut Command) -> Result<(), ProviderError> {
-        let config = Config::global();
-        let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
-
+    /// Apply permission flags based on GooseMode
+    fn apply_permission_flags(
+        cmd: &mut Command,
+        goose_mode: GooseMode,
+    ) -> Result<(), ProviderError> {
         match goose_mode {
             GooseMode::Auto => {
                 // --yolo is shorthand for --dangerously-bypass-approvals-and-sandbox
@@ -101,6 +129,7 @@ impl CodexProvider {
         system: &str,
         messages: &[Message],
         _tools: &[Tool],
+        goose_mode: GooseMode,
     ) -> Result<Vec<String>, ProviderError> {
         // Single pass: text → prompt (stdin), images → temp files (-i flags)
         let image_dir = Paths::state_dir().join("codex/images");
@@ -111,7 +140,7 @@ impl CodexProvider {
             println!("=== CODEX PROVIDER DEBUG ===");
             println!("Command: {:?}", self.command);
             println!("Model: {}", self.model.model_name);
-            println!("Reasoning effort: {}", self.reasoning_effort);
+            println!("Reasoning effort: {:?}", self.reasoning_effort);
             println!("Skip git check: {}", self.skip_git_check);
             println!("Prompt length: {} chars", prompt.len());
             println!("Prompt: {}", prompt);
@@ -138,11 +167,10 @@ impl CodexProvider {
             cmd.arg("-m").arg(&self.model.model_name);
         }
 
-        // Reasoning effort configuration
-        cmd.arg("-c").arg(format!(
-            "model_reasoning_effort=\"{}\"",
-            self.reasoning_effort
-        ));
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            cmd.arg("-c")
+                .arg(format!("model_reasoning_effort=\"{}\"", reasoning_effort));
+        }
 
         for override_config in &self.mcp_config_overrides {
             cmd.arg("-c").arg(override_config);
@@ -151,8 +179,7 @@ impl CodexProvider {
         // JSON output format for structured parsing
         cmd.arg("--json");
 
-        // Apply permission mode based on GOOSE_MODE
-        Self::apply_permission_flags(&mut cmd)?;
+        Self::apply_permission_flags(&mut cmd, goose_mode)?;
 
         // Skip git repo check if configured
         if self.skip_git_check {
@@ -595,13 +622,12 @@ impl ProviderDef for CodexProvider {
         ProviderMetadata::new(
             CODEX_PROVIDER_NAME,
             "OpenAI Codex CLI",
-            "Execute OpenAI models via Codex CLI tool. Requires codex CLI installed.",
+            "[Deprecated: use chatgpt_codex or codex-acp instead] Execute OpenAI models via Codex CLI tool. Requires codex CLI installed.",
             CODEX_DEFAULT_MODEL,
             CODEX_KNOWN_MODELS.to_vec(),
             CODEX_DOC_URL,
             vec![
                 ConfigKey::from_value_type::<CodexCommand>(true, false, true),
-                ConfigKey::from_value_type::<CodexReasoningEffort>(false, false, true),
                 ConfigKey::from_value_type::<CodexSkipGitCheck>(false, false, true),
             ],
         )
@@ -616,24 +642,8 @@ impl ProviderDef for CodexProvider {
             let command: String = config.get_codex_command().unwrap_or_default().into();
             let resolved_command = SearchPaths::builder().with_npm().resolve(command)?;
 
-            // Get reasoning effort from config, default to "high"
-            let reasoning_effort = config
-                .get_codex_reasoning_effort()
-                .map(String::from)
-                .unwrap_or_else(|_| "high".to_string());
-
-            // Validate reasoning effort
             let reasoning_effort =
-                if Self::supports_reasoning_effort(&model.model_name, &reasoning_effort) {
-                    reasoning_effort
-                } else {
-                    tracing::warn!(
-                        "Invalid CODEX_REASONING_EFFORT '{}' for model '{}', using 'high'",
-                        reasoning_effort,
-                        model.model_name
-                    );
-                    "high".to_string()
-                };
+                Self::map_thinking_effort(&model.model_name, model.thinking_effort());
 
             // Get skip_git_check from config, default to false
             let skip_git_check = config
@@ -653,6 +663,7 @@ impl ProviderDef for CodexProvider {
                 reasoning_effort,
                 skip_git_check,
                 mcp_config_overrides: codex_mcp_config_overrides(&resolved),
+                mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
             })
         })
     }
@@ -668,14 +679,10 @@ impl Provider for CodexProvider {
         self.model.clone()
     }
 
-    #[tracing::instrument(
-        skip(self, model_config, system, messages, tools),
-        fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
-    )]
     async fn stream(
         &self,
         model_config: &ModelConfig,
-        _session_id: &str, // CLI has no external session-id flag to propagate.
+        session_id: &str,
         system: &str,
         messages: &[Message],
         tools: &[Tool],
@@ -691,7 +698,13 @@ impl Provider for CodexProvider {
             ));
         }
 
-        let lines = self.execute_command(system, messages, tools).await?;
+        let goose_mode = {
+            let map = self.mode_by_session.read().await;
+            map.get(session_id).copied().unwrap_or_default()
+        };
+        let lines = self
+            .execute_command(system, messages, tools, goose_mode)
+            .await?;
 
         let (message, usage) = self.parse_response(&lines)?;
 
@@ -722,6 +735,14 @@ impl Provider for CodexProvider {
             message,
             provider_usage,
         ))
+    }
+
+    async fn update_mode(&self, session_id: &str, mode: GooseMode) -> Result<(), ProviderError> {
+        self.mode_by_session
+            .write()
+            .await
+            .insert(session_id.to_string(), mode);
+        Ok(())
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
@@ -778,8 +799,10 @@ mod tests {
             env_keys: vec![],
             headers: HashMap::from([("Authorization".into(), "Bearer token".into())]),
             timeout: None,
+            socket: None,
             bundled: Some(false),
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         &[
             r#"mcp_servers.lookup.url="http://localhost/mcp""#,
@@ -796,8 +819,10 @@ mod tests {
             env_keys: vec![],
             headers: HashMap::new(),
             timeout: None,
+            socket: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         &[
             r#"mcp_servers.mcp_kiwi_com.url="https://mcp.kiwi.com""#,
@@ -876,12 +901,8 @@ mod tests {
     fn test_prepare_input_tool_request() {
         use rmcp::model::CallToolRequestParams;
         let dir = tempfile::tempdir().unwrap();
-        let tool_call = Ok(CallToolRequestParams {
-            name: "developer__shell".into(),
-            arguments: Some(serde_json::from_value(json!({"cmd": "ls"})).unwrap()),
-            meta: None,
-            task: None,
-        });
+        let tool_call = Ok(CallToolRequestParams::new("developer__shell")
+            .with_arguments(serde_json::from_value(json!({"cmd": "ls"})).unwrap()));
         let messages = vec![Message::new(
             Role::Assistant,
             0,
@@ -896,12 +917,7 @@ mod tests {
     fn test_prepare_input_tool_response() {
         use rmcp::model::{CallToolResult, Content};
         let dir = tempfile::tempdir().unwrap();
-        let result = CallToolResult {
-            content: vec![Content::text("file1.txt\nfile2.txt")],
-            is_error: None,
-            structured_content: None,
-            meta: None,
-        };
+        let result = CallToolResult::success(vec![Content::text("file1.txt\nfile2.txt")]);
         let messages = vec![Message::new(
             Role::User,
             0,
@@ -918,9 +934,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines = vec!["Hello, world!".to_string()];
@@ -938,9 +955,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         // Test with actual Codex CLI output format
@@ -971,9 +989,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines: Vec<String> = vec![];
@@ -995,7 +1014,7 @@ mod tests {
     #[test]
     fn test_reasoning_effort_support_by_model() {
         assert!(CodexProvider::supports_reasoning_effort("gpt-5.2", "none"));
-        assert!(!CodexProvider::supports_reasoning_effort(
+        assert!(CodexProvider::supports_reasoning_effort(
             "gpt-5.2-codex",
             "none"
         ));
@@ -1019,9 +1038,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines = vec![
@@ -1044,9 +1064,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines = vec![
@@ -1116,9 +1137,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
@@ -1132,9 +1154,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines = vec![
@@ -1200,20 +1223,56 @@ mod tests {
     #[test]
     fn test_config_keys() {
         let metadata = CodexProvider::metadata();
-        assert_eq!(metadata.config_keys.len(), 3);
+        assert_eq!(metadata.config_keys.len(), 2);
 
         // First key should be CODEX_COMMAND (required)
         assert_eq!(metadata.config_keys[0].name, "CODEX_COMMAND");
         assert!(metadata.config_keys[0].required);
         assert!(!metadata.config_keys[0].secret);
 
-        // Second key should be CODEX_REASONING_EFFORT (optional)
-        assert_eq!(metadata.config_keys[1].name, "CODEX_REASONING_EFFORT");
+        // Second key should be CODEX_SKIP_GIT_CHECK (optional)
+        assert_eq!(metadata.config_keys[1].name, "CODEX_SKIP_GIT_CHECK");
         assert!(!metadata.config_keys[1].required);
+    }
 
-        // Third key should be CODEX_SKIP_GIT_CHECK (optional)
-        assert_eq!(metadata.config_keys[2].name, "CODEX_SKIP_GIT_CHECK");
-        assert!(!metadata.config_keys[2].required);
+    #[test]
+    fn test_map_thinking_effort() {
+        use ThinkingEffort;
+
+        let _guard = env_lock::lock_env([
+            ("CODEX_REASONING_EFFORT", None::<&str>),
+            ("GOOSE_THINKING_EFFORT", None::<&str>),
+        ]);
+
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.2-codex", Some(ThinkingEffort::Off)),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.2", Some(ThinkingEffort::Off)),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.2-codex", Some(ThinkingEffort::Max)),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.2-codex", None),
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_thinking_effort_uses_legacy_codex_env() {
+        let _guard = env_lock::lock_env([
+            ("CODEX_REASONING_EFFORT", Some("low")),
+            ("GOOSE_THINKING_EFFORT", None::<&str>),
+        ]);
+
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.2-codex", None),
+            Some("low".to_string())
+        );
     }
 
     #[test]
@@ -1222,9 +1281,10 @@ mod tests {
             command: PathBuf::from("codex"),
             model: ModelConfig::new("gpt-5.2-codex").unwrap(),
             name: "codex".to_string(),
-            reasoning_effort: "high".to_string(),
+            reasoning_effort: Some("high".to_string()),
             skip_git_check: false,
             mcp_config_overrides: Vec::new(),
+            mode_by_session: tokio::sync::RwLock::new(HashMap::new()),
         };
 
         let lines = vec![
@@ -1251,5 +1311,20 @@ mod tests {
     #[test]
     fn test_default_model() {
         assert_eq!(CODEX_DEFAULT_MODEL, "gpt-5.2-codex");
+    }
+
+    #[test_case(GooseMode::Auto, &["--yolo"] ; "auto_yolo")]
+    #[test_case(GooseMode::SmartApprove, &["--full-auto"] ; "smart_approve_full_auto")]
+    #[test_case(GooseMode::Approve, &[] as &[&str] ; "approve_no_flags")]
+    #[test_case(GooseMode::Chat, &["--sandbox", "read-only"] ; "chat_read_only")]
+    fn test_apply_permission_flags(mode: GooseMode, expected: &[&str]) {
+        let mut cmd = tokio::process::Command::new("codex");
+        CodexProvider::apply_permission_flags(&mut cmd, mode).unwrap();
+        let args: Vec<&str> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        assert_eq!(args, expected);
     }
 }

@@ -1,5 +1,6 @@
 import { AppEvents } from '../../constants/events';
 import React, { useEffect, useState, useRef, useCallback, useMemo, startTransition } from 'react';
+import { defineMessages, useIntl } from '../../i18n';
 import {
   MessageSquareText,
   Target,
@@ -10,6 +11,8 @@ import {
   Trash2,
   Download,
   Upload,
+  Share2,
+  LoaderCircle,
   ExternalLink,
   Copy,
   Puzzle,
@@ -28,21 +31,80 @@ import { toast } from 'react-toastify';
 import { ConfirmationModal } from '../ui/ConfirmationModal';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/Tooltip';
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../ui/dialog';
+import {
   deleteSession,
   exportSession,
   forkSession,
   importSession,
+  importSessionNostr,
   listSessions,
   searchSessions,
+  shareSessionNostr,
   Session,
   updateSessionName,
   ExtensionConfig,
   ExtensionData,
 } from '../../api';
+import { getTunnelStatus } from '../../api/sdk.gen';
 import { formatExtensionName } from '../settings/extensions/subcomponents/ExtensionList';
 import { getSearchShortcutText } from '../../utils/keyboardShortcuts';
 import { shouldShowNewChatTitle } from '../../sessions';
 import { DEFAULT_CHAT_TITLE } from '../../contexts/ChatContext';
+
+const i18n = defineMessages({
+  editSessionTitle: { id: 'sessions.edit.title', defaultMessage: 'Edit Session Description' },
+  editSessionPlaceholder: { id: 'sessions.edit.placeholder', defaultMessage: 'Enter session description' },
+  cancel: { id: 'sessions.cancel', defaultMessage: 'Cancel' },
+  save: { id: 'sessions.save', defaultMessage: 'Save' },
+  saving: { id: 'sessions.saving', defaultMessage: 'Saving...' },
+  sessionUpdated: { id: 'sessions.toast.updated', defaultMessage: 'Session description updated successfully' },
+  sessionUpdateFailed: { id: 'sessions.toast.updateFailed', defaultMessage: 'Failed to update session description: {error}' },
+  chatHistory: { id: 'sessions.chatHistory', defaultMessage: 'Chat history' },
+  importSession: { id: 'sessions.import', defaultMessage: 'Import Session' },
+  importNostrSession: { id: 'sessions.importNostr', defaultMessage: 'Import Link' },
+  importNostrTitle: { id: 'sessions.importNostr.title', defaultMessage: 'Import Nostr Session' },
+  importNostrDesc: { id: 'sessions.importNostr.description', defaultMessage: 'Paste a Goose Nostr share link to fetch, decrypt, and import the session.' },
+  importNostrPlaceholder: { id: 'sessions.importNostr.placeholder', defaultMessage: 'goose://sessions/nostr?nevent=...&key=...' },
+  importing: { id: 'sessions.importing', defaultMessage: 'Importing...' },
+  chatHistoryDesc: { id: 'sessions.chatHistoryDesc', defaultMessage: 'View and search your past conversations with Goose. {shortcut} to search.' },
+  searchPlaceholder: { id: 'sessions.searchPlaceholder', defaultMessage: 'Search history...' },
+  errorLoading: { id: 'sessions.error.loading', defaultMessage: 'Error Loading Sessions' },
+  tryAgain: { id: 'sessions.error.tryAgain', defaultMessage: 'Try Again' },
+  noSessions: { id: 'sessions.empty.title', defaultMessage: 'No chat sessions found' },
+  noSessionsDesc: { id: 'sessions.empty.description', defaultMessage: 'Your chat history will appear here' },
+  noMatching: { id: 'sessions.search.noResults', defaultMessage: 'No matching sessions found' },
+  noMatchingDesc: { id: 'sessions.search.noResultsDesc', defaultMessage: 'Try adjusting your search terms' },
+  loadingMore: { id: 'sessions.loadingMore', defaultMessage: 'Loading more sessions...' },
+  deleteTitle: { id: 'sessions.delete.title', defaultMessage: 'Delete Session' },
+  deleteMessage: { id: 'sessions.delete.message', defaultMessage: 'Are you sure you want to delete the session "{name}"? This action cannot be undone.' },
+  duplicateSuccess: { id: 'sessions.toast.duplicated', defaultMessage: 'Session "{name}" duplicated successfully' },
+  duplicateFailed: { id: 'sessions.toast.duplicateFailed', defaultMessage: 'Failed to duplicate session: {error}' },
+  deleteSuccess: { id: 'sessions.toast.deleted', defaultMessage: 'Session deleted successfully' },
+  deleteFailed: { id: 'sessions.toast.deleteFailed', defaultMessage: 'Failed to delete session "{name}": {error}' },
+  importSuccess: { id: 'sessions.toast.imported', defaultMessage: 'Session imported successfully' },
+  importFailed: { id: 'sessions.toast.importFailed', defaultMessage: 'Failed to import session: {error}' },
+  exportSuccess: { id: 'sessions.toast.exported', defaultMessage: 'Session exported successfully' },
+  shareNostrSuccess: { id: 'sessions.toast.shareNostr', defaultMessage: 'Encrypted Nostr share link created' },
+  shareNostrFailed: { id: 'sessions.toast.shareNostrFailed', defaultMessage: 'Failed to create Nostr share link: {error}' },
+  copied: { id: 'sessions.toast.copied', defaultMessage: 'Copied to clipboard' },
+  openInNewWindow: { id: 'sessions.action.openNewWindow', defaultMessage: 'Open in new window' },
+  editSessionName: { id: 'sessions.action.editName', defaultMessage: 'Edit session name' },
+  duplicateSession: { id: 'sessions.action.duplicate', defaultMessage: 'Duplicate session' },
+  deleteSession: { id: 'sessions.action.delete', defaultMessage: 'Delete session' },
+  exportSession: { id: 'sessions.action.export', defaultMessage: 'Export session' },
+  shareNostrSession: { id: 'sessions.action.shareNostr', defaultMessage: 'Share encrypted Nostr link' },
+  extensions: { id: 'sessions.extensions', defaultMessage: 'Extensions:' },
+  shareNostrTitle: { id: 'sessions.shareNostr.title', defaultMessage: 'Encrypted Nostr Share Link' },
+  shareNostrDesc: { id: 'sessions.shareNostr.description', defaultMessage: 'Anyone with this link can fetch and decrypt the session. Treat it like a secret.' },
+  close: { id: 'sessions.close', defaultMessage: 'Close' },
+});
 
 function getSessionExtensionNames(extensionData: ExtensionData): string[] {
   try {
@@ -67,6 +129,7 @@ interface EditSessionModalProps {
 
 const EditSessionModal = React.memo<EditSessionModalProps>(
   ({ session, isOpen, onClose, onSave, disabled = false }) => {
+    const intl = useIntl();
     const [description, setDescription] = useState('');
     const [isUpdating, setIsUpdating] = useState(false);
 
@@ -98,17 +161,17 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
         await onSave(session.id, trimmedDescription);
         onClose();
         setTimeout(() => {
-          toast.success('Session description updated successfully');
+          toast.success(intl.formatMessage(i18n.sessionUpdated));
         }, 300);
       } catch (error) {
         const errMsg = errorMessage(error, 'Unknown error occurred');
         console.error('Failed to update session description:', errMsg);
-        toast.error(`Failed to update session description: ${errMsg}`);
+        toast.error(intl.formatMessage(i18n.sessionUpdateFailed, { error: errMsg }));
         setDescription(session.name);
       } finally {
         setIsUpdating(false);
       }
-    }, [session, description, onSave, onClose, disabled]);
+    }, [session, description, onSave, onClose, disabled, intl]);
 
     const handleCancel = useCallback(() => {
       if (!isUpdating) {
@@ -136,7 +199,7 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
     return (
       <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50">
         <div className="bg-background-primary border border-border-primary rounded-lg p-6 w-[500px] max-w-[90vw]">
-          <h3 className="text-lg font-medium text-text-primary mb-4">Edit Session Description</h3>
+          <h3 className="text-lg font-medium text-text-primary mb-4">{intl.formatMessage(i18n.editSessionTitle)}</h3>
 
           <div className="space-y-4">
             <div>
@@ -146,7 +209,7 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
                 value={description}
                 onChange={handleInputChange}
                 className="w-full p-3 border border-border-primary rounded-lg bg-background-primary text-text-primary focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Enter session description"
+                placeholder={intl.formatMessage(i18n.editSessionPlaceholder)}
                 autoFocus
                 maxLength={200}
                 onKeyDown={handleKeyDown}
@@ -157,14 +220,14 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
 
           <div className="flex justify-end space-x-3 mt-6">
             <Button onClick={handleCancel} variant="ghost" disabled={isUpdating || disabled}>
-              Cancel
+              {intl.formatMessage(i18n.cancel)}
             </Button>
             <Button
               onClick={handleSave}
               disabled={!description.trim() || isUpdating || disabled}
               variant="default"
             >
-              {isUpdating ? 'Saving...' : 'Save'}
+              {isUpdating ? intl.formatMessage(i18n.saving) : intl.formatMessage(i18n.save)}
             </Button>
           </div>
         </div>
@@ -203,6 +266,7 @@ interface SessionListViewProps {
 
 const SessionListView: React.FC<SessionListViewProps> = React.memo(
   ({ onSelectSession, selectedSessionId }) => {
+    const intl = useIntl();
     const [sessions, setSessions] = useState<Session[]>([]);
     const [filteredSessions, setFilteredSessions] = useState<Session[]>([]);
     const [dateGroups, setDateGroups] = useState<DateGroup[]>([]);
@@ -225,6 +289,14 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
     // Delete confirmation modal state
     const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
     const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
+
+    const [showImportLinkModal, setShowImportLinkModal] = useState(false);
+    const [nostrImportLink, setNostrImportLink] = useState('');
+    const [isImportingNostr, setIsImportingNostr] = useState(false);
+    const [shareLink, setShareLink] = useState('');
+    const [showShareLinkModal, setShowShareLinkModal] = useState(false);
+    const [sharingSessionId, setSharingSessionId] = useState<string | null>(null);
+    const [nostrEnabled, setNostrEnabled] = useState(true);
 
     // Search state for debouncing
     const [searchTerm, setSearchTerm] = useState('');
@@ -298,6 +370,17 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
     useEffect(() => {
       loadSessions();
     }, [loadSessions]);
+
+    // Hide Nostr sharing when tunnel is disabled (restricted/enterprise bundles)
+    useEffect(() => {
+      getTunnelStatus()
+        .then(({ data }) => {
+          if (data?.state === 'disabled') {
+            setNostrEnabled(false);
+          }
+        })
+        .catch(() => {});
+    }, []);
 
     // Timing logic to prevent flicker between skeleton and content on initial load
     useEffect(() => {
@@ -443,14 +526,14 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
             body: { truncate: false, copy: true },
             throwOnError: true,
           });
-          toast.success(`Session "${session.name}" duplicated successfully`);
+          toast.success(intl.formatMessage(i18n.duplicateSuccess, { name: session.name }));
           await loadSessions();
         } catch (error) {
           console.error('Error duplicating session:', error);
-          toast.error(`Failed to duplicate session: ${errorMessage(error, 'Unknown error')}`);
+          toast.error(intl.formatMessage(i18n.duplicateFailed, { error: errorMessage(error, 'Unknown error') }));
         }
       },
-      [loadSessions]
+      [loadSessions, intl]
     );
 
     const handleConfirmDelete = useCallback(async () => {
@@ -466,18 +549,16 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
           path: { session_id: sessionToDeleteId },
           throwOnError: true,
         });
-        toast.success('Session deleted successfully');
+        toast.success(intl.formatMessage(i18n.deleteSuccess));
         window.dispatchEvent(
           new CustomEvent(AppEvents.SESSION_DELETED, { detail: { sessionId: sessionToDeleteId } })
         );
       } catch (error) {
         console.error('Error deleting session:', error);
-        toast.error(
-          `Failed to delete session "${sessionName}": ${errorMessage(error, 'Unknown error')}`
-        );
+        toast.error(intl.formatMessage(i18n.deleteFailed, { name: sessionName, error: errorMessage(error, 'Unknown error') }));
       }
       await loadSessions();
-    }, [sessionToDelete, loadSessions]);
+    }, [sessionToDelete, loadSessions, intl]);
 
     const handleCancelDelete = useCallback(() => {
       setShowDeleteConfirmation(false);
@@ -502,12 +583,87 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast.success('Session exported successfully');
-    }, []);
+      toast.success(intl.formatMessage(i18n.exportSuccess));
+    }, [intl]);
 
-    const handleImportClick = useCallback(() => {
+    const handleShareSessionNostr = useCallback(
+      async (session: Session, e: React.MouseEvent) => {
+        e.stopPropagation();
+        setSharingSessionId(session.id);
+        try {
+          const response = await shareSessionNostr({
+            path: { session_id: session.id },
+            body: {},
+            throwOnError: true,
+          });
+          setShareLink(response.data.deeplink);
+          setShowShareLinkModal(true);
+          toast.success(intl.formatMessage(i18n.shareNostrSuccess));
+        } catch (error) {
+          toast.error(intl.formatMessage(i18n.shareNostrFailed, { error: errorMessage(error, 'Unknown error') }));
+        } finally {
+          setSharingSessionId(null);
+        }
+      },
+      [intl]
+    );
+
+    const handleImportClick = useCallback(async () => {
+      const native = window.electron?.selectImportSessionFile;
+      if (typeof native === 'function') {
+        try {
+          const result = await native();
+          if (!result) return;
+          if (result.error) {
+            toast.error(intl.formatMessage(i18n.importFailed, { error: result.error }));
+            return;
+          }
+          await importSession({
+            body: { json: result.contents },
+            throwOnError: true,
+          });
+          toast.success(intl.formatMessage(i18n.importSuccess));
+          await loadSessions();
+        } catch (error) {
+          toast.error(
+            intl.formatMessage(i18n.importFailed, { error: errorMessage(error, 'Unknown error') })
+          );
+        }
+        return;
+      }
+      // Fallback for non-Electron contexts (tests, web build).
       fileInputRef.current?.click();
-    }, []);
+    }, [intl, loadSessions]);
+
+    const handleImportNostrLink = useCallback(async () => {
+      const deeplink = nostrImportLink.trim();
+      if (!deeplink) return;
+
+      setIsImportingNostr(true);
+      try {
+        await importSessionNostr({
+          body: { deeplink },
+          throwOnError: true,
+        });
+        setNostrImportLink('');
+        setShowImportLinkModal(false);
+        toast.success(intl.formatMessage(i18n.importSuccess));
+        await loadSessions();
+      } catch (error) {
+        toast.error(intl.formatMessage(i18n.importFailed, { error: errorMessage(error, 'Unknown error') }));
+      } finally {
+        setIsImportingNostr(false);
+      }
+    }, [intl, loadSessions, nostrImportLink]);
+
+    const handleCopyShareLink = useCallback(async () => {
+      try {
+        await navigator.clipboard.writeText(shareLink);
+        toast.success(intl.formatMessage(i18n.copied));
+      } catch (error) {
+        toast.error(`Failed to copy: ${errorMessage(error, 'Unknown error')}`);
+      }
+    }, [intl, shareLink]);
 
     const handleImportSession = useCallback(
       async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -521,17 +677,17 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
             throwOnError: true,
           });
 
-          toast.success('Session imported successfully');
+          toast.success(intl.formatMessage(i18n.importSuccess));
           await loadSessions();
         } catch (error) {
-          toast.error(`Failed to import session: ${error}`);
+          toast.error(intl.formatMessage(i18n.importFailed, { error: String(error) }));
         } finally {
           if (fileInputRef.current) {
             fileInputRef.current.value = '';
           }
         }
       },
-      [loadSessions]
+      [loadSessions, intl]
     );
 
     const handleOpenInNewWindow = useCallback((session: Session, e: React.MouseEvent) => {
@@ -549,14 +705,18 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       onDuplicateClick,
       onDeleteClick,
       onExportClick,
+      onShareClick,
       onOpenInNewWindow,
+      isSharing,
     }: {
       session: Session;
       onEditClick: (session: Session) => void;
       onDuplicateClick: (session: Session) => void;
       onDeleteClick: (session: Session) => void;
       onExportClick: (session: Session, e: React.MouseEvent) => void;
+      onShareClick: (session: Session, e: React.MouseEvent) => void;
       onOpenInNewWindow: (session: Session, e: React.MouseEvent) => void;
+      isSharing: boolean;
     }) {
       const handleEditClick = useCallback(
         (e: React.MouseEvent) => {
@@ -591,6 +751,13 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
           onExportClick(session, e);
         },
         [onExportClick, session]
+      );
+
+      const handleShareClick = useCallback(
+        (e: React.MouseEvent) => {
+          onShareClick(session, e);
+        },
+        [onShareClick, session]
       );
 
       const handleOpenInNewWindowClick = useCallback(
@@ -650,7 +817,7 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
                     </TooltipTrigger>
                     <TooltipContent side="top" className="max-w-xs">
                       <div className="text-xs">
-                        <div className="font-medium mb-1">Extensions:</div>
+                        <div className="font-medium mb-1">{intl.formatMessage(i18n.extensions)}</div>
                         <ul className="list-disc list-inside">
                           {extensionNames.map((name) => (
                             <li key={name}>{name}</li>
@@ -667,38 +834,52 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
             <button
               onClick={handleOpenInNewWindowClick}
               className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-              title="Open in new window"
+              title={intl.formatMessage(i18n.openInNewWindow)}
             >
               <ExternalLink className="w-3 h-3 text-text-secondary hover:text-text-primary" />
             </button>
             <button
               onClick={handleEditClick}
               className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-              title="Edit session name"
+              title={intl.formatMessage(i18n.editSessionName)}
             >
               <Edit2 className="w-3 h-3 text-text-secondary hover:text-text-primary" />
             </button>
             <button
               onClick={handleDuplicateClick}
               className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-              title="Duplicate session"
+              title={intl.formatMessage(i18n.duplicateSession)}
             >
               <Copy className="w-3 h-3 text-text-secondary hover:text-text-primary" />
             </button>
             <button
               onClick={handleDeleteClick}
               className="p-2 rounded hover:bg-red-50 dark:hover:bg-red-900/20 cursor-pointer transition-colors"
-              title="Delete session"
+              title={intl.formatMessage(i18n.deleteSession)}
             >
               <Trash2 className="w-3 h-3 text-red-500 hover:text-red-600" />
             </button>
             <button
               onClick={handleExportClick}
               className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-              title="Export session"
+              title={intl.formatMessage(i18n.exportSession)}
             >
               <Download className="w-3 h-3 text-text-secondary hover:text-text-primary" />
             </button>
+            {nostrEnabled && (
+              <button
+                onClick={handleShareClick}
+                disabled={isSharing}
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer disabled:cursor-wait disabled:opacity-60"
+                title={intl.formatMessage(i18n.shareNostrSession)}
+              >
+                {isSharing ? (
+                  <LoaderCircle className="w-3 h-3 text-text-secondary animate-spin" />
+                ) : (
+                  <Share2 className="w-3 h-3 text-text-secondary hover:text-text-primary" />
+                )}
+              </button>
+            )}
           </div>
         </Card>
       );
@@ -746,10 +927,10 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
         return (
           <div className="flex flex-col items-center justify-center h-full text-text-secondary">
             <AlertCircle className="h-12 w-12 text-red-500 mb-4" />
-            <p className="text-lg mb-2">Error Loading Sessions</p>
+            <p className="text-lg mb-2">{intl.formatMessage(i18n.errorLoading)}</p>
             <p className="text-sm text-center mb-4">{error}</p>
             <Button onClick={loadSessions} variant="default">
-              Try Again
+              {intl.formatMessage(i18n.tryAgain)}
             </Button>
           </div>
         );
@@ -759,8 +940,8 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
         return (
           <div className="flex flex-col justify-center h-full text-text-secondary">
             <MessageSquareText className="h-12 w-12 mb-4" />
-            <p className="text-lg mb-2">No chat sessions found</p>
-            <p className="text-sm">Your chat history will appear here</p>
+            <p className="text-lg mb-2">{intl.formatMessage(i18n.noSessions)}</p>
+            <p className="text-sm">{intl.formatMessage(i18n.noSessionsDesc)}</p>
           </div>
         );
       }
@@ -769,8 +950,8 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
         return (
           <div className="flex flex-col items-center justify-center h-full text-text-secondary mt-4">
             <MessageSquareText className="h-12 w-12 mb-4" />
-            <p className="text-lg mb-2">No matching sessions found</p>
-            <p className="text-sm">Try adjusting your search terms</p>
+            <p className="text-lg mb-2">{intl.formatMessage(i18n.noMatching)}</p>
+            <p className="text-sm">{intl.formatMessage(i18n.noMatchingDesc)}</p>
           </div>
         );
       }
@@ -791,7 +972,9 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
                     onDuplicateClick={handleDuplicateSession}
                     onDeleteClick={handleDeleteSession}
                     onExportClick={handleExportSession}
+                    onShareClick={handleShareSessionNostr}
                     onOpenInNewWindow={handleOpenInNewWindow}
+                    isSharing={sharingSessionId === session.id}
                   />
                 ))}
               </div>
@@ -802,7 +985,7 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
             <div className="flex justify-center py-8">
               <div className="flex items-center space-x-2 text-text-secondary">
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2"></div>
-                <span>Loading more sessions...</span>
+                <span>{intl.formatMessage(i18n.loadingMore)}</span>
               </div>
             </div>
           )}
@@ -817,20 +1000,32 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
             <div className="bg-background-primary px-8 pb-8 pt-16">
               <div className="flex flex-col page-transition">
                 <div className="flex justify-between items-center mb-1">
-                  <h1 className="text-4xl font-light">Chat history</h1>
-                  <Button
-                    onClick={handleImportClick}
-                    variant="outline"
-                    size="sm"
-                    className="flex items-center gap-2"
-                  >
-                    <Upload className="w-4 h-4" />
-                    Import Session
-                  </Button>
+                  <h1 className="text-4xl font-light">{intl.formatMessage(i18n.chatHistory)}</h1>
+                  <div className="flex items-center gap-2">
+                    {nostrEnabled && (
+                      <Button
+                        onClick={() => setShowImportLinkModal(true)}
+                        variant="outline"
+                        size="sm"
+                        className="flex items-center gap-2"
+                      >
+                        <Share2 className="w-4 h-4" />
+                        {intl.formatMessage(i18n.importNostrSession)}
+                      </Button>
+                    )}
+                    <Button
+                      onClick={handleImportClick}
+                      variant="outline"
+                      size="sm"
+                      className="flex items-center gap-2"
+                    >
+                      <Upload className="w-4 h-4" />
+                      {intl.formatMessage(i18n.importSession)}
+                    </Button>
+                  </div>
                 </div>
                 <p className="text-sm text-text-secondary mb-4">
-                  View and search your past conversations with Goose. {getSearchShortcutText()} to
-                  search.
+                  {intl.formatMessage(i18n.chatHistoryDesc, { shortcut: getSearchShortcutText() })}
                 </p>
               </div>
             </div>
@@ -843,7 +1038,7 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
                     onNavigate={handleSearchNavigation}
                     searchResults={searchResults}
                     className="relative"
-                    placeholder="Search history..."
+                    placeholder={intl.formatMessage(i18n.searchPlaceholder)}
                   >
                     {/* Skeleton layer - always rendered but conditionally visible */}
                     <div
@@ -909,7 +1104,7 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
         <input
           ref={fileInputRef}
           type="file"
-          accept=".json"
+          accept=".json,.jsonl,application/json,application/x-ndjson"
           onChange={handleImportSession}
           className="hidden"
         />
@@ -921,12 +1116,89 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
           onSave={handleModalSave}
         />
 
+        <Dialog open={showImportLinkModal} onOpenChange={setShowImportLinkModal}>
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Share2 className="w-5 h-5" />
+                {intl.formatMessage(i18n.importNostrTitle)}
+              </DialogTitle>
+              <DialogDescription>{intl.formatMessage(i18n.importNostrDesc)}</DialogDescription>
+            </DialogHeader>
+
+            <textarea
+              value={nostrImportLink}
+              onChange={(event) => setNostrImportLink(event.target.value)}
+              placeholder={intl.formatMessage(i18n.importNostrPlaceholder)}
+              className="min-h-28 w-full resize-none rounded-lg border border-border-primary bg-background-primary p-3 text-sm text-text-primary outline-none focus:ring-2 focus:ring-border-active"
+              disabled={isImportingNostr}
+            />
+
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowImportLinkModal(false)}
+                disabled={isImportingNostr}
+              >
+                {intl.formatMessage(i18n.cancel)}
+              </Button>
+              <Button
+                onClick={handleImportNostrLink}
+                disabled={isImportingNostr || !nostrImportLink.trim()}
+              >
+                {isImportingNostr ? (
+                  <>
+                    <LoaderCircle className="w-4 h-4 animate-spin" />
+                    {intl.formatMessage(i18n.importing)}
+                  </>
+                ) : (
+                  intl.formatMessage(i18n.importSession)
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={showShareLinkModal} onOpenChange={setShowShareLinkModal}>
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Share2 className="w-5 h-5" />
+                {intl.formatMessage(i18n.shareNostrTitle)}
+              </DialogTitle>
+              <DialogDescription>{intl.formatMessage(i18n.shareNostrDesc)}</DialogDescription>
+            </DialogHeader>
+
+            <div className="relative rounded-lg border border-border-primary bg-background-secondary p-3 pr-12">
+              <code className="block max-h-36 overflow-y-auto break-all text-sm text-text-primary">
+                {shareLink}
+              </code>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="absolute right-2 top-2"
+                onClick={handleCopyShareLink}
+                disabled={!shareLink}
+              >
+                <Copy className="h-4 w-4" />
+                <span className="sr-only">{intl.formatMessage(i18n.copied)}</span>
+              </Button>
+            </div>
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowShareLinkModal(false)}>
+                {intl.formatMessage(i18n.close)}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         <ConfirmationModal
           isOpen={showDeleteConfirmation}
-          title="Delete Session"
-          message={`Are you sure you want to delete the session "${sessionToDelete?.name}"? This action cannot be undone.`}
-          confirmLabel="Delete Session"
-          cancelLabel="Cancel"
+          title={intl.formatMessage(i18n.deleteTitle)}
+          message={intl.formatMessage(i18n.deleteMessage, { name: sessionToDelete?.name ?? '' })}
+          confirmLabel={intl.formatMessage(i18n.deleteTitle)}
+          cancelLabel={intl.formatMessage(i18n.cancel)}
           confirmVariant="destructive"
           onConfirm={handleConfirmDelete}
           onCancel={handleCancelDelete}

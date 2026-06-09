@@ -1,6 +1,6 @@
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_appender_tracing::layer::{OpenTelemetryTracingBridge, TracingSpanAttributes};
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -24,6 +24,27 @@ static TRACER_PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
 static METER_PROVIDER: Mutex<Option<SdkMeterProvider>> = Mutex::new(None);
 static LOGGER_PROVIDER: Mutex<Option<SdkLoggerProvider>> = Mutex::new(None);
 
+static GRPC_PROTOCOL_WARNING_EMITTED: std::sync::Once = std::sync::Once::new();
+
+/// One-shot stderr warning when `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is set
+/// in an environment where goose was built without the `grpc-tonic`
+/// transport feature. Using `tracing::warn!` here would race the OTel
+/// subscriber that is being initialized; eprintln keeps it visible
+/// regardless of subscriber state.
+fn warn_grpc_protocol_skipped_once() {
+    GRPC_PROTOCOL_WARNING_EMITTED.call_once(|| {
+        eprintln!(
+            "goose otel: OTEL_EXPORTER_OTLP_PROTOCOL is set to a gRPC \
+             variant, but this goose build only includes the HTTP \
+             transport (http-proto). OTLP signals are disabled to \
+             avoid background-thread panics. Set \
+             OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf and point \
+             OTEL_EXPORTER_OTLP_ENDPOINT at an http://…:4318 collector \
+             to re-enable export."
+        );
+    });
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExporterType {
     Otlp,
@@ -38,6 +59,35 @@ impl ExporterType {
             "console" | "stdout" => ExporterType::Console,
             _ => ExporterType::None,
         }
+    }
+}
+
+/// Resolved transport protocol for an OTLP signal, per OTel spec:
+/// signal-specific `OTEL_EXPORTER_OTLP_{SIGNAL}_PROTOCOL` overrides the
+/// shared `OTEL_EXPORTER_OTLP_PROTOCOL`, and the default is `http/protobuf`
+/// (matching what `.with_http()` produces in this build).
+///
+/// goose's `opentelemetry-otlp` build only enables the `http-proto` /
+/// `reqwest-client` transport features — not `grpc-tonic`. If the caller's
+/// environment sets `…_PROTOCOL=grpc`, the `.with_http()` exporter still
+/// builds successfully but its background batch / metric reader threads
+/// panic on the first export with
+/// `internal error: entered unreachable code: HTTP client should not
+/// receive Grpc protocol`. We honour the env var by skipping the signal
+/// rather than crashing detached threads.
+fn signal_protocol_is_http(signal: &str) -> bool {
+    let signal_var = format!("OTEL_EXPORTER_OTLP_{}_PROTOCOL", signal.to_uppercase());
+    let raw = env::var(&signal_var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var("OTEL_EXPORTER_OTLP_PROTOCOL").ok())
+        .unwrap_or_default();
+    match raw.trim().to_lowercase().as_str() {
+        // Default per spec when unset — matches `.with_http()`.
+        "" | "http/protobuf" | "http/json" => true,
+        // gRPC variants require the `grpc-tonic` feature, which goose
+        // does not enable.
+        _ => false,
     }
 }
 
@@ -131,8 +181,8 @@ pub fn init_otlp_layers(
     if let Ok(layer) = create_otlp_metrics_layer() {
         layers.push(layer.with_filter(create_otlp_metrics_filter()).boxed());
     }
-    if let Ok(layer) = create_otlp_logs_layer() {
-        layers.push(layer.with_filter(create_otlp_logs_filter()).boxed());
+    if let Ok(bridge) = create_otlp_logs_layer() {
+        layers.push(bridge.with_filter(create_otlp_logs_filter()).boxed());
     }
 
     if !layers.is_empty() {
@@ -148,6 +198,10 @@ fn create_otlp_tracing_layer() -> OtlpResult<OtlpTracingLayer> {
 
     let tracer_provider = match exporter {
         ExporterType::Otlp => {
+            if !signal_protocol_is_http("traces") {
+                warn_grpc_protocol_skipped_once();
+                return Err("OTLP traces protocol is grpc but goose was built without grpc-tonic; skipping traces exporter".into());
+            }
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .build()?;
@@ -192,6 +246,10 @@ fn create_otlp_metrics_layer() -> OtlpResult<OtlpMetricsLayer> {
 
     let meter_provider = match exporter {
         ExporterType::Otlp => {
+            if !signal_protocol_is_http("metrics") {
+                warn_grpc_protocol_skipped_once();
+                return Err("OTLP metrics protocol is grpc but goose was built without grpc-tonic; skipping metrics exporter".into());
+            }
             let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_http()
                 .with_temporality(temporality_preference())
@@ -223,6 +281,10 @@ fn create_otlp_logs_layer() -> OtlpResult<OtlpLogsLayer> {
 
     let logger_provider = match exporter {
         ExporterType::Otlp => {
+            if !signal_protocol_is_http("logs") {
+                warn_grpc_protocol_skipped_once();
+                return Err("OTLP logs protocol is grpc but goose was built without grpc-tonic; skipping logs exporter".into());
+            }
             let exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_http()
                 .build()?;
@@ -241,7 +303,9 @@ fn create_otlp_logs_layer() -> OtlpResult<OtlpLogsLayer> {
         ExporterType::None => return Err("Logs exporter set to none".into()),
     };
 
-    let bridge = OpenTelemetryTracingBridge::new(&logger_provider);
+    let bridge = OpenTelemetryTracingBridge::builder(&logger_provider)
+        .with_tracing_span_attributes(TracingSpanAttributes::allowlist(["session.id"]))
+        .build();
     *LOGGER_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(logger_provider);
 
     Ok(bridge)
@@ -333,104 +397,72 @@ fn otel_logs_level() -> Level {
         .unwrap_or(Level::INFO)
 }
 
+/// Targets suppressed from OTLP log export.
+///
+/// `rmcp::service` logs the full `InitializeResult` (including extension instructions
+/// and user memory content) as a `peer_info` attribute on every MCP handshake.
+/// This can be 400KB+ per session init and contains PII/sensitive data.
+/// These logs have no analytical value in OTLP — suppress them entirely.
+const OTLP_LOGS_SUPPRESSED_TARGETS: &[&str] = &["rmcp::service"];
+
 /// Creates a custom filter for OTLP logs.
 /// Level is resolved via RUST_LOG → OTEL_LOG_LEVEL → default INFO.
+/// Suppresses targets listed in `OTLP_LOGS_SUPPRESSED_TARGETS`.
 fn create_otlp_logs_filter() -> FilterFn<impl Fn(&Metadata<'_>) -> bool> {
     let min_level = otel_logs_level();
-    FilterFn::new(move |metadata: &Metadata<'_>| metadata.level() <= &min_level)
+    FilterFn::new(move |metadata: &Metadata<'_>| {
+        if metadata.level() > &min_level {
+            return false;
+        }
+        let target = metadata.target();
+        !OTLP_LOGS_SUPPRESSED_TARGETS
+            .iter()
+            .any(|suppressed| target.starts_with(suppressed))
+    })
 }
 
-/// Shutdown OTLP providers gracefully
 pub fn shutdown_otlp() {
+    let timeout = std::time::Duration::from_millis(
+        crate::config::Config::global()
+            .get_param::<u64>("otel_shutdown_timeout_ms")
+            .unwrap_or(5000),
+    );
+
     if let Some(provider) = TRACER_PROVIDER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
-        let _ = provider.shutdown();
+        if let Err(e) = provider.shutdown_with_timeout(timeout) {
+            tracing::warn!("OTLP tracer provider shutdown error: {e}");
+        }
     }
     if let Some(provider) = METER_PROVIDER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
-        let _ = provider.shutdown();
+        if let Err(e) = provider.shutdown_with_timeout(timeout) {
+            tracing::warn!("OTLP meter provider shutdown error: {e}");
+        }
     }
     if let Some(provider) = LOGGER_PROVIDER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
-        let _ = provider.shutdown();
+        if let Err(e) = provider.shutdown_with_timeout(timeout) {
+            tracing::warn!("OTLP logger provider shutdown error: {e}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry::metrics::{Meter, MeterProvider};
-    use opentelemetry::InstrumentationScope;
+    use goose_test_support::otel::clear_otel_env;
     use opentelemetry_sdk::metrics::Temporality;
-    use std::sync::Arc;
     use test_case::test_case;
-
-    // set_meter_provider requires P: MeterProvider, not Arc<dyn MeterProvider>
-    struct SavedMeterProvider(Arc<dyn MeterProvider + Send + Sync>);
-
-    impl MeterProvider for SavedMeterProvider {
-        fn meter_with_scope(&self, scope: InstrumentationScope) -> Meter {
-            self.0.meter_with_scope(scope)
-        }
-    }
-
-    struct OtelTestGuard {
-        _env: env_lock::EnvGuard<'static>,
-        prev_tracer: global::GlobalTracerProvider,
-        prev_meter: Arc<dyn MeterProvider + Send + Sync>,
-    }
-
-    impl Drop for OtelTestGuard {
-        fn drop(&mut self) {
-            global::set_tracer_provider(self.prev_tracer.clone());
-            global::set_meter_provider(SavedMeterProvider(self.prev_meter.clone()));
-        }
-    }
-
-    fn clear_otel_env(overrides: &[(&'static str, &'static str)]) -> OtelTestGuard {
-        let prev_tracer = global::tracer_provider();
-        let prev_meter = global::meter_provider();
-
-        let mut keys: Vec<&'static str> = vec![
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
-            "OTEL_EXPORTER_OTLP_TIMEOUT",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "OTEL_LOG_LEVEL",
-            "OTEL_LOGS_EXPORTER",
-            "OTEL_METRICS_EXPORTER",
-            "OTEL_RESOURCE_ATTRIBUTES",
-            "OTEL_SDK_DISABLED",
-            "OTEL_SERVICE_NAME",
-            "OTEL_TRACES_EXPORTER",
-        ];
-        for &(k, _) in overrides {
-            if !keys.contains(&k) {
-                keys.push(k);
-            }
-        }
-
-        let guard = env_lock::lock_env(keys.into_iter().map(|k| (k, None::<&str>)));
-        for &(k, v) in overrides {
-            env::set_var(k, v);
-        }
-        OtelTestGuard {
-            _env: guard,
-            prev_tracer,
-            prev_meter,
-        }
-    }
 
     #[test]
     fn exporter_type_from_env_value() {
@@ -486,6 +518,67 @@ mod tests {
     ) {
         let _guard = clear_otel_env(env);
         assert_eq!(signal_exporter(signal), expected);
+    }
+
+    #[test_case(&[], true; "default unset is http")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")], true; "http/protobuf shared")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")], true; "http/json shared")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "HTTP/PROTOBUF")], true; "case insensitive")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "  http/protobuf  ")], true; "trimmed")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "")], true; "empty falls through to default")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")], false; "shared grpc is not http")]
+    #[test_case(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "GRPC")], false; "grpc case insensitive")]
+    fn signal_protocol_is_http_shared(env: &[(&'static str, &'static str)], expected: bool) {
+        let _guard = clear_otel_env(env);
+        assert_eq!(signal_protocol_is_http("traces"), expected);
+        assert_eq!(signal_protocol_is_http("metrics"), expected);
+        assert_eq!(signal_protocol_is_http("logs"), expected);
+    }
+
+    #[test_case(
+        &[("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"), ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf")],
+        true, false, false;
+        "signal override beats shared grpc for traces only"
+    )]
+    #[test_case(
+        &[("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"), ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "grpc")],
+        true, false, true;
+        "signal override flips metrics to grpc"
+    )]
+    #[test_case(
+        &[("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "")],
+        true, true, true;
+        "empty signal override falls through to default http"
+    )]
+    fn signal_protocol_is_http_per_signal(
+        env: &[(&'static str, &'static str)],
+        traces: bool,
+        metrics: bool,
+        logs: bool,
+    ) {
+        let _guard = clear_otel_env(env);
+        assert_eq!(signal_protocol_is_http("traces"), traces);
+        assert_eq!(signal_protocol_is_http("metrics"), metrics);
+        assert_eq!(signal_protocol_is_http("logs"), logs);
+    }
+
+    /// When `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is set (matching the
+    /// Blox + Datadog Agent environment that produced the
+    /// "HTTP client should not receive Grpc protocol" panic), each
+    /// signal layer must short-circuit with an error instead of
+    /// building a panic-prone exporter.
+    #[test]
+    fn grpc_protocol_skips_layers() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let _env = clear_otel_env(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+        ]);
+        assert!(create_otlp_tracing_layer().is_err());
+        assert!(create_otlp_metrics_layer().is_err());
+        assert!(create_otlp_logs_layer().is_err());
+        shutdown_otlp();
     }
 
     #[test_case("console"; "console")]

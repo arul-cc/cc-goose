@@ -1,20 +1,19 @@
 import { AppEvents } from '../constants/events';
 import React, {
-  createContext,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from 'react';
+import { defineMessages, useIntl } from '../i18n';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { SearchView } from './conversation/SearchView';
 import LoadingGoose from './LoadingGoose';
-import PopularChatTopics from './PopularChatTopics';
 import ProgressiveMessageList from './ProgressiveMessageList';
 import { MainPanelLayout } from './Layout/MainPanelLayout';
 import ChatInput from './ChatInput';
+import { ChatInputCard } from './ChatInputCard';
 import { ScrollArea, ScrollAreaHandle } from './ui/scroll-area';
 import { useFileDrop } from '../hooks/useFileDrop';
 import { Message } from '../api';
@@ -29,13 +28,11 @@ import { RecipeHeader } from './RecipeHeader';
 import { RecipeWarningModal } from './ui/RecipeWarningModal';
 import { scanRecipe } from '../recipe';
 import { UserInput } from '../types/message';
-import { useCostTracking } from '../hooks/useCostTracking';
 import RecipeActivities from './recipes/RecipeActivities';
 import { useToolCount } from './alerts/useToolCount';
 import { getThinkingMessage, getTextAndImageContent } from '../types/message';
 import ParameterInputModal from './ParameterInputModal';
 import { substituteParameters } from '../utils/parameterSubstitution';
-import { useModelAndProvider } from './ModelAndProviderContext';
 import CreateRecipeFromSessionModal from './recipes/CreateRecipeFromSessionModal';
 import { toastSuccess } from '../toasts';
 import { Recipe } from '../recipe';
@@ -43,8 +40,28 @@ import { useAutoSubmit } from '../hooks/useAutoSubmit';
 import { Goose } from './icons';
 import EnvironmentBadge from './GooseSidebar/EnvironmentBadge';
 
-const CurrentModelContext = createContext<{ model: string; mode: string } | null>(null);
-export const useCurrentModelInfo = () => useContext(CurrentModelContext);
+const i18n = defineMessages({
+  failedToLoadSession: {
+    id: 'baseChat.failedToLoadSession',
+    defaultMessage: 'Failed to Load Session',
+  },
+  goHome: {
+    id: 'baseChat.goHome',
+    defaultMessage: 'Go home',
+  },
+  noSession: {
+    id: 'baseChat.noSession',
+    defaultMessage: 'No Session',
+  },
+  recipeCreatedTitle: {
+    id: 'baseChat.recipeCreatedTitle',
+    defaultMessage: 'Recipe created successfully!',
+  },
+  recipeCreatedMessage: {
+    id: 'baseChat.recipeCreatedMessage',
+    defaultMessage: '"{title}" has been saved and is ready to use.',
+  },
+});
 
 interface BaseChatProps {
   setChat: (chat: ChatType) => void;
@@ -54,7 +71,6 @@ interface BaseChatProps {
   customMainLayoutProps?: Record<string, unknown>;
   contentClassName?: string;
   disableSearch?: boolean;
-  showPopularTopics?: boolean;
   suppressEmptyState: boolean;
   sessionId: string;
   isActiveSession: boolean;
@@ -70,6 +86,7 @@ export default function BaseChat({
   initialMessage,
   isActiveSession,
 }: BaseChatProps) {
+  const intl = useIntl();
   const location = useLocation();
   const navigate = useNavigate();
   const scrollRef = useRef<ScrollAreaHandle>(null);
@@ -118,12 +135,15 @@ export default function BaseChat({
     return initialMessage;
   }, [initialMessage, recipe?.prompt, session?.user_recipe_values]);
 
+  const canAutoSubmit = session?.session_type === 'scheduled' || !recipe || hasNotAcceptedRecipe === false;
+
   useAutoSubmit({
     sessionId,
     session,
     messages,
     chatState,
     initialMessage: resolvedInitialMessage,
+    canAutoSubmit,
     handleSubmit,
   });
 
@@ -174,24 +194,21 @@ export default function BaseChat({
     handleSubmit(input);
   };
 
-  const { sessionCosts } = useCostTracking({
-    sessionInputTokens: session?.accumulated_input_tokens || 0,
-    sessionOutputTokens: session?.accumulated_output_tokens || 0,
-    localInputTokens: 0,
-    localOutputTokens: 0,
-    session,
-  });
-
-  const { setProviderAndModel } = useModelAndProvider();
-
-  useEffect(() => {
-    if (session?.provider_name && session?.model_config?.model_name) {
-      setProviderAndModel(session.provider_name, session.model_config.model_name);
+  const sessionModel = session?.model_config?.model_name ?? null;
+  const sessionProvider = session?.provider_name ?? null;
+  const sessionLoaded = session !== undefined;
+  const latestInference = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role === 'assistant' && message.metadata.userVisible && message.metadata.inference) {
+        return message.metadata.inference;
+      }
     }
-  }, [session?.provider_name, session?.model_config?.model_name, setProviderAndModel]);
+    return null;
+  }, [messages]);
 
   useEffect(() => {
-    if (!recipe) return;
+    if (!recipe || !isActiveSession || session?.session_type === 'scheduled') return;
 
     (async () => {
       const accepted = await window.electron.hasAcceptedRecipeBefore(recipe);
@@ -202,7 +219,7 @@ export default function BaseChat({
         setHasRecipeSecurityWarnings(scanResult.has_security_warnings);
       }
     })();
-  }, [recipe]);
+  }, [recipe, isActiveSession, session?.session_type]);
 
   const handleRecipeAccept = async (accept: boolean) => {
     if (recipe && accept) {
@@ -306,19 +323,16 @@ export default function BaseChat({
 
   const handleRecipeCreated = (recipe: Recipe) => {
     toastSuccess({
-      title: 'Recipe created successfully!',
-      msg: `"${recipe.title}" has been saved and is ready to use.`,
+      title: intl.formatMessage(i18n.recipeCreatedTitle),
+      msg: intl.formatMessage(i18n.recipeCreatedMessage, { title: recipe.title }),
     });
   };
-
-  const showPopularTopics =
-    messages.length === 0 && !initialMessage && chatState === ChatState.Idle;
 
   const chat: ChatType = {
     messages,
     recipe,
     sessionId,
-    name: session?.name || 'No Session',
+    name: session?.name || intl.formatMessage(i18n.noSession),
   };
 
   const lastSetNameRef = useRef<string>('');
@@ -351,16 +365,16 @@ export default function BaseChat({
     return (
       <div className="h-full flex flex-col min-h-0">
         <MainPanelLayout
-          backgroundColor={'bg-background-secondary'}
+          backgroundColor={'bg-background-primary'}
           removeTopPadding={true}
           {...customMainLayoutProps}
         >
           {renderHeader && renderHeader()}
-          <div className="flex flex-col flex-1 mb-0.5 min-h-0 relative">
-            <div className="flex-1 bg-background-primary rounded-b-2xl flex items-center justify-center">
+          <div className="flex flex-col flex-1 min-h-0 relative">
+            <div className="flex-1 flex items-center justify-center">
               <div className="flex flex-col items-center justify-center p-8">
                 <div className="text-red-700 dark:text-red-300 bg-red-400/50 p-4 rounded-lg mb-4 max-w-md">
-                  <h3 className="font-semibold mb-2">Failed to Load Session</h3>
+                  <h3 className="font-semibold mb-2">{intl.formatMessage(i18n.failedToLoadSession)}</h3>
                   <p className="text-sm">{sessionLoadError}</p>
                 </div>
                 <button
@@ -369,7 +383,7 @@ export default function BaseChat({
                   }}
                   className="px-4 py-2 text-center cursor-pointer text-text-primary border border-border-primary hover:bg-background-secondary rounded-lg transition-all duration-150"
                 >
-                  Go home
+                  {intl.formatMessage(i18n.goHome)}
                 </button>
               </div>
             </div>
@@ -382,7 +396,7 @@ export default function BaseChat({
   return (
     <div className="h-full flex flex-col min-h-0">
       <MainPanelLayout
-        backgroundColor={'bg-background-secondary'}
+        backgroundColor={'bg-background-primary'}
         removeTopPadding={true}
         {...customMainLayoutProps}
       >
@@ -390,11 +404,11 @@ export default function BaseChat({
         {renderHeader && renderHeader()}
 
         {/* Chat container with sticky recipe header */}
-        <div className="flex flex-col flex-1 mb-0.5 min-h-0 relative">
+        <div className="flex flex-col flex-1 min-h-0 relative">
           {/* Goose watermark - top right */}
           <div className="absolute top-3 right-4 z-[60] flex flex-row items-center gap-1">
             <a
-              href="https://block.github.io/goose"
+              href="https://goose-docs.ai"
               target="_blank"
               rel="noopener noreferrer"
               className="no-drag flex flex-row items-center gap-1 hover:opacity-80 transition-opacity"
@@ -409,7 +423,7 @@ export default function BaseChat({
 
           <ScrollArea
             ref={scrollRef}
-            className={`flex-1 bg-background-primary rounded-b-2xl min-h-0 relative ${contentClassName}`}
+            className={`flex-1 min-h-0 relative ${contentClassName}`}
             autoScroll
             onDrop={handleDrop}
             onDragOver={handleDragOver}
@@ -452,10 +466,6 @@ export default function BaseChat({
 
                 <div className="block h-8" />
               </>
-            ) : !recipe && showPopularTopics ? (
-              <PopularChatTopics
-                append={(text: string) => handleSubmit({ msg: text, images: [] })}
-              />
             ) : null}
           </ScrollArea>
 
@@ -473,8 +483,11 @@ export default function BaseChat({
           )}
         </div>
 
-        <div
-          className={`relative z-10 ${disableAnimation ? '' : 'animate-[fadein_400ms_ease-in_forwards]'}`}
+        <ChatInputCard
+          className={cn(
+            'relative z-10 mx-4 mb-4',
+            !disableAnimation && 'animate-[fadein_400ms_ease-in_forwards]'
+          )}
         >
           <ChatInput
             inputRef={chatInputRef}
@@ -493,21 +506,28 @@ export default function BaseChat({
             accumulatedOutputTokens={
               tokenState?.accumulatedOutputTokens ?? session?.accumulated_output_tokens ?? undefined
             }
+            accumulatedCost={
+              tokenState?.accumulatedCost ?? session?.accumulated_cost ?? undefined
+            }
             droppedFiles={droppedFiles}
             onFilesProcessed={() => setDroppedFiles([])} // Clear dropped files after processing
             messages={messages}
             disableAnimation={disableAnimation}
-            sessionCosts={sessionCosts}
+
             recipe={recipe}
             recipeAccepted={!hasNotAcceptedRecipe}
             initialPrompt={initialPrompt}
             toolCount={toolCount || 0}
+            sessionModel={sessionModel}
+            sessionProvider={sessionProvider}
+            sessionLoaded={sessionLoaded}
+            latestInference={latestInference}
             {...customChatInputProps}
           />
-        </div>
+        </ChatInputCard>
       </MainPanelLayout>
 
-      {recipe && (
+      {recipe && isActiveSession && session?.session_type !== 'scheduled' && (
         <RecipeWarningModal
           isOpen={!!hasNotAcceptedRecipe}
           onConfirm={() => handleRecipeAccept(true)}
@@ -521,7 +541,10 @@ export default function BaseChat({
         />
       )}
 
-      {recipe?.parameters && recipe.parameters.length > 0 && !session?.user_recipe_values && (
+      {recipe?.parameters &&
+        recipe.parameters.length > 0 &&
+        !session?.user_recipe_values &&
+        session?.session_type !== 'scheduled' && (
         <ParameterInputModal
           parameters={recipe.parameters}
           onSubmit={setRecipeUserParams}

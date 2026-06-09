@@ -6,12 +6,16 @@ use goose::session::SessionManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "local-inference")]
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::session_event_bus::SessionEventBus;
 use crate::tunnel::TunnelManager;
 use goose::agents::ExtensionLoadResult;
 use goose::gateway::manager::GatewayManager;
+#[cfg(feature = "local-inference")]
 use goose::providers::local_inference::InferenceRuntime;
 
 type ExtensionLoadingTasks =
@@ -25,15 +29,17 @@ pub struct AppState {
     pub tunnel_manager: Arc<TunnelManager>,
     pub gateway_manager: Arc<GatewayManager>,
     pub extension_loading_tasks: ExtensionLoadingTasks,
-    pub inference_runtime: Arc<InferenceRuntime>,
+    #[cfg(feature = "local-inference")]
+    inference_runtime: Arc<OnceLock<Arc<InferenceRuntime>>>,
+    session_buses: Arc<Mutex<HashMap<String, Arc<SessionEventBus>>>>,
 }
 
 impl AppState {
-    pub async fn new() -> anyhow::Result<Arc<AppState>> {
+    pub async fn new(tls: bool) -> anyhow::Result<Arc<AppState>> {
         register_builtin_extensions(goose_mcp::BUILTIN_EXTENSIONS.clone());
 
         let agent_manager = AgentManager::instance().await?;
-        let tunnel_manager = Arc::new(TunnelManager::new());
+        let tunnel_manager = Arc::new(TunnelManager::new(tls));
         let gateway_manager = Arc::new(GatewayManager::new(agent_manager.clone())?);
 
         Ok(Arc::new(Self {
@@ -43,8 +49,30 @@ impl AppState {
             tunnel_manager,
             gateway_manager,
             extension_loading_tasks: Arc::new(Mutex::new(HashMap::new())),
-            inference_runtime: InferenceRuntime::get_or_init(),
+            #[cfg(feature = "local-inference")]
+            inference_runtime: Arc::new(OnceLock::new()),
+            session_buses: Arc::new(Mutex::new(HashMap::new())),
         }))
+    }
+
+    #[cfg(feature = "local-inference")]
+    pub fn get_inference_runtime(&self) -> anyhow::Result<Arc<InferenceRuntime>> {
+        if let Some(runtime) = self.inference_runtime.get() {
+            return Ok(runtime.clone());
+        }
+
+        let runtime = InferenceRuntime::get_or_init()?;
+
+        // Another thread may win the race to cache the runtime in AppState.
+        // In that case, return the already-initialized cached runtime.
+        match self.inference_runtime.set(runtime.clone()) {
+            Ok(()) => Ok(runtime),
+            Err(_) => Ok(self
+                .inference_runtime
+                .get()
+                .expect("inference runtime initialized by another thread")
+                .clone()),
+        }
     }
 
     pub async fn set_extension_loading_task(
@@ -105,6 +133,26 @@ impl AppState {
             sessions.insert(session_id.to_string());
             true
         }
+    }
+
+    pub async fn get_or_create_event_bus(&self, session_id: &str) -> Arc<SessionEventBus> {
+        let mut buses = self.session_buses.lock().await;
+        buses
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(SessionEventBus::new()))
+            .clone()
+    }
+
+    /// Get an existing event bus for a session without creating one.
+    pub async fn get_event_bus(&self, session_id: &str) -> Option<Arc<SessionEventBus>> {
+        let buses = self.session_buses.lock().await;
+        buses.get(session_id).cloned()
+    }
+
+    /// Remove the event bus for a session, freeing its replay buffer.
+    pub async fn remove_event_bus(&self, session_id: &str) {
+        let mut buses = self.session_buses.lock().await;
+        buses.remove(session_id);
     }
 
     pub async fn get_agent(&self, session_id: String) -> anyhow::Result<Arc<goose::agents::Agent>> {

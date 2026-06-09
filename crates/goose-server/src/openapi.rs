@@ -9,19 +9,20 @@ use goose::model::ModelConfig;
 use goose::permission::permission_confirmation::{Permission, PrincipalType};
 use goose::providers::base::{ConfigKey, ModelInfo, ProviderMetadata, ProviderType};
 use goose::session::{Session, SessionInsights, SessionType, SystemInfo};
+use goose_providers::thinking::ThinkingEffort;
 use rmcp::model::{
-    Annotations, Content, EmbeddedResource, Icon, ImageContent, JsonObject, RawAudioContent,
-    RawEmbeddedResource, RawImageContent, RawResource, RawTextContent, ResourceContents, Role,
-    TaskSupport, TextContent, Tool, ToolAnnotations, ToolExecution,
+    Annotations, Content, EmbeddedResource, Icon, IconTheme, ImageContent, JsonObject,
+    RawAudioContent, RawContent, RawEmbeddedResource, RawImageContent, RawResource, RawTextContent,
+    ResourceContents, Role, TaskSupport, TextContent, Tool, ToolAnnotations, ToolExecution,
 };
 use utoipa::{OpenApi, ToSchema};
 
 use goose::config::declarative_providers::{
-    DeclarativeProviderConfig, LoadedProvider, ProviderEngine,
+    DeclarativeProviderConfig, EnvVarConfig, LoadedProvider, ProviderEngine,
 };
 use goose::conversation::message::{
-    ActionRequired, ActionRequiredData, FrontendToolRequest, Message, MessageContent,
-    MessageMetadata, ReasoningContent, RedactedThinkingContent, SystemNotificationContent,
+    ActionRequired, ActionRequiredData, FrontendToolRequest, InferenceMetadata, Message,
+    MessageContent, MessageMetadata, RedactedThinkingContent, SystemNotificationContent,
     SystemNotificationType, ThinkingContent, TokenState, ToolConfirmationRequest, ToolRequest,
     ToolResponse,
 };
@@ -36,7 +37,7 @@ use utoipa::openapi::{AllOfBuilder, Ref, RefOr};
 
 macro_rules! derive_utoipa {
     ($inner_type:ident as $schema_name:ident) => {
-        struct $schema_name {}
+        pub struct $schema_name {}
 
         impl<'__s> ToSchema<'__s> for $schema_name {
             fn schema() -> (&'__s str, utoipa::openapi::RefOr<utoipa::openapi::Schema>) {
@@ -45,6 +46,23 @@ macro_rules! derive_utoipa {
                 let schema = generator.into_root_schema_for::<$inner_type>();
                 let schema = convert_schemars_to_utoipa(schema);
                 (stringify!($inner_type), schema)
+            }
+
+            fn aliases() -> Vec<(&'__s str, utoipa::openapi::schema::Schema)> {
+                Vec::new()
+            }
+        }
+    };
+    ($inner_type:ident as $schema_name:ident => $output_name:expr) => {
+        pub struct $schema_name {}
+
+        impl<'__s> ToSchema<'__s> for $schema_name {
+            fn schema() -> (&'__s str, utoipa::openapi::RefOr<utoipa::openapi::Schema>) {
+                let settings = rmcp::schemars::generate::SchemaSettings::openapi3();
+                let generator = settings.into_generator();
+                let schema = generator.into_root_schema_for::<$inner_type>();
+                let schema = convert_schemars_to_utoipa(schema);
+                ($output_name, schema)
             }
 
             fn aliases() -> Vec<(&'__s str, utoipa::openapi::schema::Schema)> {
@@ -89,7 +107,26 @@ fn convert_json_object_to_utoipa(
         return RefOr::T(Schema::OneOf(builder.build()));
     }
 
+    // Handle the discriminated union pattern from schemars: an object with
+    // `type`, `properties`, `required` AND `allOf` (e.g. each variant of a
+    // `#[serde(tag = "type")]` enum). We merge the inline object (which carries
+    // the discriminator property) with the `allOf` refs into a single `allOf`.
     if let Some(Value::Array(all_of)) = obj.get("allOf") {
+        let has_inline_properties = obj.contains_key("properties") || obj.contains_key("type");
+        if has_inline_properties {
+            let mut builder = AllOfBuilder::new();
+            // Build an object schema from the inline properties/required
+            let mut obj_without_allof = obj.clone();
+            obj_without_allof.remove("allOf");
+            builder = builder.item(convert_json_object_to_utoipa(&obj_without_allof));
+            for item in all_of {
+                if let Ok(schema) = rmcp::schemars::Schema::try_from(item.clone()) {
+                    builder = builder.item(convert_schemars_to_utoipa(schema));
+                }
+            }
+            return RefOr::T(Schema::AllOf(builder.build()));
+        }
+
         let mut builder = AllOfBuilder::new();
         for item in all_of {
             if let Ok(schema) = rmcp::schemars::Schema::try_from(item.clone()) {
@@ -215,6 +252,22 @@ fn convert_typed_schema(
         "string" => {
             let mut object_builder = ObjectBuilder::new().schema_type(SchemaType::String);
 
+            if let Some(Value::Array(enum_values)) = obj.get("enum") {
+                let values: Vec<serde_json::Value> = enum_values
+                    .iter()
+                    .filter_map(|v| {
+                        if let Value::String(s) = v {
+                            Some(Value::String(s.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !values.is_empty() {
+                    object_builder = object_builder.enum_values(Some(values));
+                }
+            }
+
             if let Some(Value::Number(min_length)) = obj.get("minLength") {
                 if let Some(min) = min_length.as_u64() {
                     object_builder = object_builder.min_length(Some(min as usize));
@@ -310,6 +363,7 @@ fn convert_typed_schema(
 
 derive_utoipa!(Role as RoleSchema);
 derive_utoipa!(Content as ContentSchema);
+derive_utoipa!(RawContent as ContentBlockSchema => "ContentBlock");
 derive_utoipa!(EmbeddedResource as EmbeddedResourceSchema);
 derive_utoipa!(ImageContent as ImageContentSchema);
 derive_utoipa!(TextContent as TextContentSchema);
@@ -326,6 +380,7 @@ derive_utoipa!(Annotations as AnnotationsSchema);
 derive_utoipa!(ResourceContents as ResourceContentsSchema);
 derive_utoipa!(JsonObject as JsonObjectSchema);
 derive_utoipa!(Icon as IconSchema);
+derive_utoipa!(IconTheme as IconThemeSchema);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -334,11 +389,7 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::status::system_info,
         super::routes::status::diagnostics,
         super::routes::mcp_ui_proxy::mcp_ui_proxy,
-        super::routes::config_management::backup_config,
-        super::routes::config_management::detect_provider,
-        super::routes::config_management::recover_config,
         super::routes::config_management::validate_config,
-        super::routes::config_management::init_config,
         super::routes::config_management::upsert_config,
         super::routes::config_management::remove_config,
         super::routes::config_management::read_config,
@@ -346,8 +397,11 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::config_management::remove_extension,
         super::routes::config_management::get_extensions,
         super::routes::config_management::read_all_config,
+        super::routes::config_management::list_provider_secrets,
+        super::routes::config_management::delete_provider_secret,
         super::routes::config_management::providers,
         super::routes::config_management::get_provider_models,
+        super::routes::config_management::get_provider_model_info,
         super::routes::config_management::get_slash_commands,
         super::routes::config_management::upsert_permissions,
         super::routes::config_management::create_custom_provider,
@@ -356,6 +410,7 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::config_management::remove_custom_provider,
         super::routes::config_management::get_provider_catalog,
         super::routes::config_management::get_provider_catalog_template,
+        super::routes::config_management::cleanup_provider_cache,
         super::routes::config_management::check_provider,
         super::routes::config_management::set_config_provider,
         super::routes::config_management::configure_provider_oauth,
@@ -379,8 +434,12 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::agent::agent_add_extension,
         super::routes::agent::agent_remove_extension,
         super::routes::agent::update_agent_provider,
+        super::routes::agent::update_session,
         super::routes::action_required::confirm_tool_action,
         super::routes::reply::reply,
+        super::routes::session_events::session_events,
+        super::routes::session_events::session_reply,
+        super::routes::session_events::session_cancel,
         super::routes::session::list_sessions,
         super::routes::session::search_sessions,
         super::routes::session::get_session,
@@ -389,6 +448,8 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::session::delete_session,
         super::routes::session::export_session,
         super::routes::session::import_session,
+        super::routes::session::share_session_nostr,
+        super::routes::session::import_session_nostr,
         super::routes::session::update_session_user_recipe_values,
         super::routes::session::fork_session,
         super::routes::session::get_session_extensions,
@@ -415,35 +476,25 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::recipe::recipe_to_yaml,
         super::routes::setup::start_openrouter_setup,
         super::routes::setup::start_tetrate_setup,
+        super::routes::setup::start_nanogpt_setup,
         super::routes::tunnel::start_tunnel,
         super::routes::tunnel::stop_tunnel,
         super::routes::tunnel::get_tunnel_status,
         super::routes::telemetry::send_telemetry_event,
         super::routes::dictation::transcribe_dictation,
         super::routes::dictation::get_dictation_config,
-        super::routes::dictation::list_models,
-        super::routes::dictation::download_model,
-        super::routes::dictation::get_download_progress,
-        super::routes::dictation::cancel_download,
-        super::routes::dictation::delete_model,
-        super::routes::local_inference::list_local_models,
-        super::routes::local_inference::search_hf_models,
-        super::routes::local_inference::get_repo_files,
-        super::routes::local_inference::download_hf_model,
-        super::routes::local_inference::get_local_model_download_progress,
-        super::routes::local_inference::cancel_local_model_download,
-        super::routes::local_inference::delete_local_model,
-        super::routes::local_inference::get_model_settings,
-        super::routes::local_inference::update_model_settings,
+        super::routes::features::get_features,
     ),
     components(schemas(
         super::routes::config_management::UpsertConfigQuery,
         super::routes::config_management::ConfigKeyQuery,
-        super::routes::config_management::DetectProviderRequest,
-        super::routes::config_management::DetectProviderResponse,
         super::routes::config_management::ConfigResponse,
         super::routes::config_management::ProvidersResponse,
         super::routes::config_management::ProviderDetails,
+        super::routes::config_management::ProviderSecretsResponse,
+        super::routes::config_management::ProviderSecret,
+        super::routes::config_management::ProviderSecretStorage,
+        super::routes::config_management::ProviderSecretStatus,
         super::routes::config_management::SlashCommandsResponse,
         super::routes::config_management::SlashCommand,
         super::routes::config_management::CommandType,
@@ -456,6 +507,7 @@ derive_utoipa!(Icon as IconSchema);
         goose::providers::catalog::ProviderTemplate,
         goose::providers::catalog::ModelTemplate,
         goose::providers::catalog::ModelCapabilities,
+        super::routes::config_management::CreateCustomProviderResponse,
         super::routes::config_management::CheckProviderRequest,
         super::routes::config_management::SetProviderRequest,
         super::routes::config_management::ModelInfoQuery,
@@ -467,7 +519,13 @@ derive_utoipa!(Icon as IconSchema);
         goose::prompt_template::Template,
         super::routes::action_required::ConfirmToolActionRequest,
         super::routes::reply::ChatRequest,
+        super::routes::session_events::SessionReplyRequest,
+        super::routes::session_events::SessionReplyResponse,
+        super::routes::session_events::CancelRequest,
         super::routes::session::ImportSessionRequest,
+        super::routes::session::ShareSessionNostrRequest,
+        super::routes::session::ShareSessionNostrResponse,
+        super::routes::session::ImportSessionNostrRequest,
         super::routes::session::SessionListResponse,
         super::routes::session::UpdateSessionNameRequest,
         super::routes::session::UpdateSessionUserRecipeValuesRequest,
@@ -478,6 +536,7 @@ derive_utoipa!(Icon as IconSchema);
         Message,
         MessageContent,
         MessageMetadata,
+        InferenceMetadata,
         TokenState,
         ContentSchema,
         EmbeddedResourceSchema,
@@ -496,7 +555,6 @@ derive_utoipa!(Icon as IconSchema);
         ActionRequiredData,
         ThinkingContent,
         RedactedThinkingContent,
-        ReasoningContent,
         FrontendToolRequest,
         ResourceContentsSchema,
         SystemNotificationType,
@@ -509,6 +567,7 @@ derive_utoipa!(Icon as IconSchema);
         LoadedProvider,
         ProviderEngine,
         DeclarativeProviderConfig,
+        EnvVarConfig,
         ExtensionEntry,
         ExtensionConfig,
         ConfigKey,
@@ -524,12 +583,16 @@ derive_utoipa!(Icon as IconSchema);
         PrincipalType,
         ModelInfo,
         ModelConfig,
+        ThinkingEffort,
+        super::routes::config_management::ProviderModelInfoQuery,
         Session,
+        goose::config::goose_mode::GooseMode,
         SessionInsights,
         SessionType,
         SystemInfo,
         Conversation,
         IconSchema,
+        IconThemeSchema,
         goose::session::extension_data::ExtensionData,
         super::routes::schedule::CreateScheduleRequest,
         super::routes::schedule::UpdateScheduleRequest,
@@ -571,11 +634,13 @@ derive_utoipa!(Icon as IconSchema);
         goose::agents::types::RetryConfig,
         goose::agents::types::SuccessCheck,
         super::routes::agent::UpdateProviderRequest,
+        super::routes::agent::UpdateSessionRequest,
         super::routes::agent::GetToolsQuery,
         super::routes::agent::ReadResourceRequest,
         super::routes::agent::ReadResourceResponse,
         super::routes::agent::CallToolRequest,
         super::routes::agent::CallToolResponse,
+        ContentBlockSchema,
         super::routes::agent::ListAppsRequest,
         super::routes::agent::ListAppsResponse,
         super::routes::agent::ImportAppRequest,
@@ -606,6 +671,35 @@ derive_utoipa!(Icon as IconSchema);
         super::routes::dictation::TranscribeResponse,
         goose::dictation::providers::DictationProvider,
         super::routes::dictation::DictationProviderStatus,
+        super::routes::features::FeaturesResponse,
+        DownloadProgress,
+        DownloadStatus,
+    ))
+)]
+pub struct ApiDoc;
+
+#[cfg(feature = "local-inference")]
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        super::routes::dictation::list_models,
+        super::routes::dictation::download_model,
+        super::routes::dictation::get_download_progress,
+        super::routes::dictation::cancel_download,
+        super::routes::dictation::delete_model,
+        super::routes::local_inference::list_local_models,
+        super::routes::local_inference::sync_featured_models,
+        super::routes::local_inference::search_hf_models,
+        super::routes::local_inference::list_builtin_chat_templates,
+        super::routes::local_inference::get_repo_files,
+        super::routes::local_inference::download_hf_model,
+        super::routes::local_inference::get_local_model_download_progress,
+        super::routes::local_inference::cancel_local_model_download,
+        super::routes::local_inference::delete_local_model,
+        super::routes::local_inference::get_model_settings,
+        super::routes::local_inference::update_model_settings,
+    ),
+    components(schemas(
         super::routes::dictation::WhisperModelResponse,
         super::routes::local_inference::LocalModelResponse,
         super::routes::local_inference::ModelDownloadStatus,
@@ -615,15 +709,20 @@ derive_utoipa!(Icon as IconSchema);
         goose::providers::local_inference::hf_models::HfQuantVariant,
         super::routes::local_inference::RepoVariantsResponse,
         goose::providers::local_inference::local_model_registry::ModelSettings,
+        goose::providers::local_inference::local_model_registry::ChatTemplate,
         goose::providers::local_inference::local_model_registry::SamplingConfig,
-        DownloadProgress,
-        DownloadStatus,
+        goose::providers::local_inference::local_model_registry::ToolCallingMode,
     ))
 )]
-pub struct ApiDoc;
+pub struct LocalInferenceApiDoc;
 
 #[allow(dead_code)] // Used by generate_schema binary
 pub fn generate_schema() -> String {
-    let api_doc = ApiDoc::openapi();
+    #[allow(unused_mut)]
+    let mut api_doc = ApiDoc::openapi();
+
+    #[cfg(feature = "local-inference")]
+    api_doc.merge(LocalInferenceApiDoc::openapi());
+
     serde_json::to_string_pretty(&api_doc).unwrap()
 }

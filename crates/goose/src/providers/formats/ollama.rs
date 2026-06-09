@@ -10,18 +10,20 @@
 //! - qwen3-coder-32b
 
 use crate::conversation::message::{Message, MessageContent};
-use crate::providers::base::ProviderUsage;
-use crate::providers::utils::is_valid_function_name;
 use async_stream::try_stream;
 use chrono;
 use futures::Stream;
+use goose_providers::{
+    conversation::token_usage::ProviderUsage,
+    formats::openai::{self, is_valid_function_name},
+};
 use regex::Regex;
 use rmcp::model::{object, CallToolRequestParams, ErrorCode, ErrorData, Role};
 use serde_json::Value;
 use std::borrow::Cow;
 use uuid::Uuid;
 
-pub use super::openai::{
+pub use goose_providers::formats::openai::{
     create_request, format_messages, format_tools, get_usage, validate_tool_schemas,
 };
 
@@ -58,12 +60,8 @@ pub fn parse_xml_tool_calls(content: &str) -> (Option<String>, Vec<MessageConten
         if is_valid_function_name(&function_name) {
             tool_calls.push(MessageContent::tool_request(
                 id,
-                Ok(CallToolRequestParams {
-                    meta: None,
-                    task: None,
-                    name: function_name.into(),
-                    arguments: Some(object(serde_json::Value::Object(arguments))),
-                }),
+                Ok(CallToolRequestParams::new(function_name)
+                    .with_arguments(object(serde_json::Value::Object(arguments)))),
             ));
         } else {
             let error = ErrorData {
@@ -86,7 +84,7 @@ pub fn parse_xml_tool_calls(content: &str) -> (Option<String>, Vec<MessageConten
 /// This wraps the standard OpenAI response parsing and adds XML fallback for models
 /// like Qwen3-coder that output XML tool calls when given many tools.
 pub fn response_to_message(response: &Value) -> anyhow::Result<Message> {
-    let message = super::openai::response_to_message(response)?;
+    let message = openai::response_to_message(response)?;
 
     let has_tool_requests = message
         .content
@@ -167,7 +165,7 @@ where
     try_stream! {
         use futures::StreamExt;
 
-        let base_stream = super::openai::response_to_streaming_message(stream);
+        let base_stream = openai::response_to_streaming_message(stream);
         let mut base_stream = std::pin::pin!(base_stream);
 
         let mut accumulated_text = String::new();

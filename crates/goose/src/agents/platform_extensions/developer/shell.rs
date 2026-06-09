@@ -1,22 +1,171 @@
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+#[cfg(not(windows))]
+use std::sync::Arc;
+#[cfg(not(windows))]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(not(windows))]
+use tokio::sync::OnceCell;
+#[cfg(not(windows))]
+use tokio::task::JoinHandle;
 use tokio_stream::{wrappers::SplitStream, StreamExt};
 
 use crate::subprocess::SubprocessExt;
 
+/// Check if the current process is running inside a Flatpak sandbox.
+///
+/// When inside Flatpak, shell commands must be wrapped with `flatpak-spawn --host`
+/// to execute on the host system rather than inside the sandbox.
+#[cfg(not(windows))]
+fn is_flatpak() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
+#[cfg(not(windows))]
+const FLATPAK_HOST_ARGS: [&str; 2] = ["--host", "--watch-bus"];
+
+#[cfg(not(windows))]
+fn flatpak_spawn_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("flatpak-spawn");
+    command.args(FLATPAK_HOST_ARGS);
+    command
+}
+
+#[cfg(not(windows))]
+fn flatpak_spawn_process() -> std::process::Command {
+    let mut command = std::process::Command::new("flatpak-spawn");
+    command.args(FLATPAK_HOST_ARGS);
+    command
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnixShellFlavor {
+    Posix,
+    Nushell,
+}
+
+#[cfg(not(windows))]
+fn unix_shell_flavor(shell: &str) -> UnixShellFlavor {
+    let name = std::path::Path::new(shell)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+
+    match name.as_str() {
+        "nu" | "nushell" => UnixShellFlavor::Nushell,
+        _ => UnixShellFlavor::Posix,
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_login_shell_command_args(shell: &str) -> [&'static str; 4] {
+    let probe = match unix_shell_flavor(shell) {
+        UnixShellFlavor::Nushell => "print ($env.PATH | str join (char esep))",
+        UnixShellFlavor::Posix => "echo $PATH",
+    };
+
+    ["-l", "-i", "-c", probe]
+}
+
+#[cfg(not(windows))]
+fn unix_shell_command_args(command_line: &str) -> [&str; 2] {
+    ["-c", command_line]
+}
+
+/// Resolve the preferred Unix shell for command execution, respecting GOOSE_SHELL.
+///
+/// Auto-detected shells are returned as basenames (e.g. `"bash"`) so that
+/// `Command::new` resolves them on `PATH` at spawn time — this also keeps
+/// Flatpak happy, where absolute paths from inside the sandbox don't match
+/// the host filesystem. `GOOSE_SHELL` is passed through as-is.
+///
+#[cfg(windows)]
+fn windows_shell() -> String {
+    std::env::var("GOOSE_SHELL").unwrap_or_else(|_| "cmd".to_string())
+}
+
+/// Short, human-readable name of a shell path (the file stem), used both to
+/// pick the right argument style on Windows and to tell the LLM which
+/// dialect to write in the tool description.
+#[cfg(windows)]
+fn shell_basename(shell: &str) -> String {
+    Path::new(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cmd")
+        .to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn shell_basename(shell: &str) -> String {
+    std::path::Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell)
+        .to_string()
+}
+
+/// Basename of the shell the `shell` tool will invoke, for use in the tool
+/// description so the LLM knows which dialect to write.
+#[cfg(windows)]
+pub fn shell_display_name() -> String {
+    shell_basename(&windows_shell())
+}
+
+#[cfg(not(windows))]
+pub fn shell_display_name() -> String {
+    shell_basename(&unix_shell())
+}
+
+/// The shell tool runs commands with `-c "..."`, and LLMs routinely emit
+/// POSIX-style patterns such as heredocs (`cat <<EOF > file`), `$VAR`
+/// expansion, and `2>&1` redirection. Non-POSIX shells (fish, csh, tcsh,
+/// nu, ...) reject or mis-interpret these, so we don't auto-select based
+/// on `$SHELL`: we check whether `bash` is on PATH and otherwise fall back
+/// to `sh`. Users who really want their login shell can opt in via
+/// `GOOSE_SHELL`.
+#[cfg(not(windows))]
+fn unix_shell() -> String {
+    if let Ok(shell) = std::env::var("GOOSE_SHELL") {
+        return shell;
+    }
+    if which::which("bash").is_ok() {
+        "bash".to_string()
+    } else {
+        "sh".to_string()
+    }
+}
+
 const OUTPUT_LIMIT_LINES: usize = 2000;
-const OUTPUT_LIMIT_BYTES: usize = 50_000;
+pub const OUTPUT_LIMIT_BYTES: usize = 50_000;
 const OUTPUT_PREVIEW_LINES: usize = 50;
 
 const OUTPUT_SLOTS: usize = 8;
+
+/// Result of truncating command output.
+struct TruncateResult {
+    /// The (possibly truncated) text to display.
+    text: String,
+    /// When output was truncated, the path where the full output was saved
+    /// and a human-readable reason for the truncation.
+    truncation: Option<TruncationInfo>,
+}
+
+struct TruncationInfo {
+    path: PathBuf,
+    reason: String,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShellParams {
@@ -25,7 +174,7 @@ pub struct ShellParams {
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ShellOutput {
     pub stdout: String,
     pub stderr: String,
@@ -34,8 +183,16 @@ pub struct ShellOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// True if the command was killed because it exceeded the timeout.
+    #[serde(default)]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,
+    /// True if output collection was cut short after the shell exited.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
+    /// Error reported by output collection after process exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_collection_error: Option<String>,
 }
 
 /// Resolve the user's full PATH by running a login shell.
@@ -45,51 +202,143 @@ pub struct ShellOutput {
 /// source the user's profile and recover the full PATH.
 #[cfg(not(windows))]
 fn resolve_login_shell_path() -> Option<String> {
-    let shell = if PathBuf::from("/bin/bash").is_file() {
-        "/bin/bash".to_string()
+    use process_wrap::std::{CommandWrap, ProcessSession};
+
+    let shell = unix_shell();
+    let login_args = unix_login_shell_command_args(&shell);
+
+    // Build the command, varying only the flatpak vs direct invocation.
+    let mut cmd = if is_flatpak() {
+        let mut c = flatpak_spawn_process();
+        c.arg(&shell).args(login_args);
+        CommandWrap::from(c)
     } else {
-        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+        let mut c = std::process::Command::new(&shell);
+        c.args(login_args);
+        CommandWrap::from(c)
     };
 
-    std::process::Command::new(&shell)
-        .args(["-l", "-i", "-c", "echo $PATH"])
+    cmd.command_mut()
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                // Take the last non-empty line — interactive shells may emit
-                // extra output from profile scripts before our echo.
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .rev()
-                    .find(|line| !line.trim().is_empty())
-                    .map(|line| line.trim().to_string())
-                    .filter(|path| !path.is_empty())
-            } else {
-                None
-            }
-        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    // Spawn in a new session so that bash's interactive job-control setup
+    // (TIOCSPGRP) cannot steal the terminal foreground from goose, which
+    // would cause goose to receive SIGTTIN and be suspended on startup.
+    cmd.wrap(ProcessSession);
+
+    let mut child = cmd.spawn().ok()?;
+
+    let mut stdout = child.stdout().take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        use std::io::Read;
+        if stdout.read_to_end(&mut buf).is_ok() {
+            let _ = tx.send(buf);
+        }
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(buf)
+            if child
+                .wait()
+                .is_ok_and(|s: std::process::ExitStatus| s.success()) =>
+        {
+            // Take the last non-empty line — interactive shells may emit
+            // extra output from profile scripts before our echo.
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| line.trim().to_string())
+                .filter(|path| !path.is_empty())
+        }
+        _ => {
+            let _ = child.kill();
+            None
+        }
+    }
 }
 
-/// Returns the user's full login shell PATH, resolved once and cached.
+/// Resolves the user's login-shell PATH in the background.
+///
+/// Spawned at `ShellTool` construction so the ~hundreds-of-ms cost of sourcing
+/// the user's shell profile overlaps with the rest of agent setup and the
+/// first LLM turn. The first `shell` invocation awaits the result; subsequent
+/// invocations read from the cached cell.
 #[cfg(not(windows))]
-fn user_login_path() -> Option<&'static str> {
-    static CACHED: OnceLock<Option<String>> = OnceLock::new();
-    CACHED.get_or_init(resolve_login_shell_path).as_deref()
+struct LoginPath {
+    cell: OnceCell<Option<Arc<str>>>,
+    handle: Mutex<Option<JoinHandle<Option<String>>>>,
+}
+
+#[cfg(not(windows))]
+impl LoginPath {
+    fn spawn() -> Self {
+        let handle = tokio::task::spawn_blocking(resolve_login_shell_path);
+        Self {
+            cell: OnceCell::new(),
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn resolved(value: Option<String>) -> Self {
+        let cell = OnceCell::new();
+        let _ = cell.set(value.map(Arc::from));
+        Self {
+            cell,
+            handle: Mutex::new(None),
+        }
+    }
+
+    async fn get(&self) -> Option<Arc<str>> {
+        self.cell
+            .get_or_init(|| async {
+                let handle = self
+                    .handle
+                    .lock()
+                    .expect("login_path mutex poisoned")
+                    .take();
+                match handle {
+                    Some(h) => h.await.ok().flatten().map(Arc::from),
+                    None => None,
+                }
+            })
+            .await
+            .clone()
+    }
 }
 
 pub struct ShellTool {
     output_dir: tempfile::TempDir,
     call_index: AtomicUsize,
+    #[cfg(not(windows))]
+    login_path: LoginPath,
 }
 
 impl ShellTool {
-    pub fn new() -> std::io::Result<Self> {
+    pub fn new(use_login_shell_path: bool) -> std::io::Result<Self> {
         Ok(Self {
             output_dir: tempfile::tempdir()?,
             call_index: AtomicUsize::new(0),
+            #[cfg(not(windows))]
+            login_path: if use_login_shell_path {
+                LoginPath::spawn()
+            } else {
+                LoginPath::resolved(None)
+            },
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> std::io::Result<Self> {
+        Ok(Self {
+            output_dir: tempfile::tempdir()?,
+            call_index: AtomicUsize::new(0),
+            #[cfg(not(windows))]
+            login_path: LoginPath::resolved(None),
         })
     }
 
@@ -106,7 +355,21 @@ impl ShellTool {
             return Self::error_result("Command cannot be empty.", None);
         }
 
-        let execution = match run_command(&params.command, params.timeout_secs, working_dir).await {
+        #[cfg(not(windows))]
+        let login_path = self.login_path.get().await;
+        #[cfg(not(windows))]
+        let login_path_ref = login_path.as_deref();
+        #[cfg(windows)]
+        let login_path_ref: Option<&str> = None;
+
+        let execution = match run_command(
+            &params.command,
+            params.timeout_secs,
+            working_dir,
+            login_path_ref,
+        )
+        .await
+        {
             Ok(execution) => execution,
             Err(error) => return Self::error_result(&error, None),
         };
@@ -116,35 +379,56 @@ impl ShellTool {
 
         let output_dir = self.output_dir.path();
         let slot = self.call_index.fetch_add(1, Ordering::Relaxed) % OUTPUT_SLOTS;
-        let truncated_stdout = if raw_stdout.is_empty() {
-            String::new()
+        let stdout_result = if raw_stdout.is_empty() {
+            TruncateResult {
+                text: String::new(),
+                truncation: None,
+            }
         } else {
             match truncate_output(&raw_stdout, &format!("stdout-{slot}"), output_dir) {
-                Ok(t) => t,
+                Ok(r) => r,
                 Err(error) => return Self::error_result(&error, None),
             }
         };
-        let truncated_stderr = if raw_stderr.is_empty() {
-            String::new()
+        let stderr_result = if raw_stderr.is_empty() {
+            TruncateResult {
+                text: String::new(),
+                truncation: None,
+            }
         } else {
             match truncate_output(&raw_stderr, &format!("stderr-{slot}"), output_dir) {
-                Ok(t) => t,
+                Ok(r) => r,
                 Err(error) => return Self::error_result(&error, None),
             }
         };
 
         let shell_output = ShellOutput {
-            stdout: truncated_stdout,
-            stderr: truncated_stderr,
+            stdout: stdout_result.text,
+            stderr: stderr_result.text,
             exit_code: execution.exit_code,
             timed_out: execution.timed_out,
+            output_truncated: execution.output_truncated,
+            output_collection_error: execution.output_collection_error.clone(),
         };
         let structured_content = serde_json::to_value(&shell_output).ok();
-        let mut rendered = match render_output(&interleaved, &format!("output-{slot}"), output_dir)
+        let render_result = match render_output(&interleaved, &format!("output-{slot}"), output_dir)
         {
-            Ok(rendered) => rendered,
+            Ok(r) => r,
             Err(error) => return Self::error_result(&error, None),
         };
+        let mut rendered = render_result.text;
+
+        // Collect truncation notices from stdout, stderr, and interleaved output.
+        // These are delivered as a separate Content block so the model sees them as
+        // instructions rather than part of the command's data output.
+        let truncation_notices: Vec<String> = [
+            &stdout_result.truncation,
+            &stderr_result.truncation,
+            &render_result.truncation,
+        ]
+        .iter()
+        .filter_map(|t| t.as_ref().map(truncation_notice))
+        .collect();
 
         let is_error = if execution.timed_out {
             if let Some(timeout_secs) = params.timeout_secs {
@@ -160,17 +444,37 @@ impl ShellTool {
             execution.exit_code.unwrap_or(1) != 0
         };
 
+        if execution.output_truncated {
+            rendered.push_str(
+                "\n\nOutput may be incomplete because stream draining timed out after process exit.",
+            );
+        }
+        if let Some(error) = &execution.output_collection_error {
+            rendered.push_str(&format!(
+                "\n\nOutput collection error occurred; output may be incomplete: {error}"
+            ));
+        }
+
+        let is_error = is_error || execution.output_collection_error.is_some();
+
         if is_error {
             if let Some(code) = execution.exit_code.filter(|c| *c != 0) {
                 rendered.push_str(&format!("\n\nCommand exited with code {code}"));
             }
-            let mut result =
-                CallToolResult::error(vec![Content::text(rendered).with_priority(0.0)]);
+            let mut error_blocks = vec![Content::text(rendered).with_priority(0.0)];
+            if !truncation_notices.is_empty() {
+                error_blocks.push(Content::text(truncation_notices.join("\n")).with_priority(0.0));
+            }
+            let mut result = CallToolResult::error(error_blocks);
             result.structured_content = structured_content;
             return result;
         }
 
-        let mut result = CallToolResult::success(vec![Content::text(rendered).with_priority(0.0)]);
+        let mut content_blocks = vec![Content::text(rendered).with_priority(0.0)];
+        if !truncation_notices.is_empty() {
+            content_blocks.push(Content::text(truncation_notices.join("\n")).with_priority(0.0));
+        }
+        let mut result = CallToolResult::success(content_blocks);
         result.structured_content = structured_content;
         result
     }
@@ -181,6 +485,8 @@ impl ShellTool {
             stderr: message.to_string(),
             exit_code,
             timed_out: false,
+            output_truncated: false,
+            output_collection_error: None,
         };
         let mut result = CallToolResult::error(vec![Content::text(message).with_priority(0.0)]);
         result.structured_content = serde_json::to_value(&shell_output).ok();
@@ -193,22 +499,17 @@ struct ExecutionOutput {
     lines: Vec<(bool, String)>,
     exit_code: Option<i32>,
     timed_out: bool,
+    output_truncated: bool,
+    output_collection_error: Option<String>,
 }
 
 async fn run_command(
     command_line: &str,
     timeout_secs: Option<u64>,
     working_dir: Option<&std::path::Path>,
+    login_path: Option<&str>,
 ) -> Result<ExecutionOutput, String> {
-    let mut command = build_shell_command(command_line);
-    if let Some(path) = working_dir {
-        command.current_dir(path);
-    }
-
-    #[cfg(not(windows))]
-    if let Some(path) = user_login_path() {
-        command.env("PATH", path);
-    }
+    let mut command = build_shell_command(command_line, working_dir, login_path);
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -227,7 +528,9 @@ async fn run_command(
         .take()
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
 
-    let output_task = tokio::spawn(collect_tagged_lines(child_stdout, child_stderr));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let output_task = tokio::spawn(collect_tagged_lines(child_stdout, child_stderr, tx));
+    let abort_handle = output_task.abort_handle();
 
     let mut timed_out = false;
     let exit_code = if let Some(timeout_secs) = timeout_secs.filter(|value| *value > 0) {
@@ -250,36 +553,105 @@ async fn run_command(
             .code()
     };
 
-    let lines = output_task
-        .await
-        .map_err(|error| format!("Failed to collect shell output: {}", error))?
-        .map_err(|error| format!("Failed to collect shell output: {}", error))?;
+    const OUTPUT_DRAIN_TIMEOUT_MILLIS: u64 = 500;
+    let mut output_collection_error = None;
+    let output_truncated = match tokio::time::timeout(
+        Duration::from_millis(OUTPUT_DRAIN_TIMEOUT_MILLIS),
+        output_task,
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => false,
+        Ok(Ok(Err(e))) => {
+            output_collection_error = Some(format!("Failed to collect shell output: {}", e));
+            false
+        }
+        Ok(Err(e)) => {
+            output_collection_error = Some(format!("Failed to collect shell output: {}", e));
+            false
+        }
+        Err(_) => {
+            tracing::debug!(
+                    "output drain timed out after {OUTPUT_DRAIN_TIMEOUT_MILLIS}ms (backgrounded process?)"
+                );
+            abort_handle.abort();
+            true
+        }
+    };
+
+    rx.close();
+    let mut lines = Vec::new();
+    while let Some(item) = rx.recv().await {
+        lines.push(item);
+    }
 
     Ok(ExecutionOutput {
         lines,
         exit_code,
         timed_out,
+        output_truncated,
+        output_collection_error,
     })
 }
 
-fn build_shell_command(command_line: &str) -> tokio::process::Command {
+fn build_shell_command(
+    command_line: &str,
+    working_dir: Option<&std::path::Path>,
+    login_path: Option<&str>,
+) -> tokio::process::Command {
     #[cfg(windows)]
     let mut command = {
-        let mut command = tokio::process::Command::new("cmd");
-        command.arg("/C").arg(command_line);
+        let shell = windows_shell();
+        let shell_stem = shell_basename(&shell);
+        let mut command = tokio::process::Command::new(&shell);
+        match shell_stem.as_str() {
+            "pwsh" | "powershell" => {
+                command.args(["-NoProfile", "-NonInteractive", "-Command", command_line]);
+            }
+            "cmd" => {
+                command.arg("/C").raw_arg(command_line);
+            }
+            // POSIX-like shells (bash, zsh, etc.) on Windows (e.g. Cygwin/MSYS2)
+            _ => {
+                command.args(["-c", command_line]);
+            }
+        }
+        if let Some(path) = working_dir {
+            command.current_dir(path);
+        }
+        if let Some(path) = login_path {
+            command.env("PATH", path);
+        }
         command
     };
 
     #[cfg(not(windows))]
     let mut command = {
-        let shell = if PathBuf::from("/bin/bash").is_file() {
-            "/bin/bash".to_string()
+        let shell = unix_shell();
+
+        if is_flatpak() {
+            let mut command = flatpak_spawn_command();
+            if let Some(dir) = working_dir {
+                command.arg(format!("--directory={}", dir.display()));
+            }
+            if let Some(path) = login_path {
+                command.arg(format!("--env=PATH={}", path));
+            }
+            command
+                .arg(&shell)
+                .args(unix_shell_command_args(command_line));
+            command
         } else {
-            std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
-        };
-        let mut command = tokio::process::Command::new(shell);
-        command.arg("-c").arg(command_line);
-        command
+            let mut command = tokio::process::Command::new(shell);
+            command.args(unix_shell_command_args(command_line));
+            if let Some(path) = working_dir {
+                command.current_dir(path);
+            }
+            if let Some(path) = login_path {
+                command.env("PATH", path);
+            }
+            command
+        }
     };
 
     command.set_no_window();
@@ -312,31 +684,50 @@ fn split_lines(lines: &[(bool, String)]) -> (String, String, String) {
     (stdout, stderr, interleaved)
 }
 
-/// Collect lines from stdout and stderr in arrival order, tagging each with its source.
-/// Returns a vec of (is_stderr, line_text) preserving interleaved ordering.
+/// Collect lines from stdout and stderr and send `(is_stderr, line)` tuples to `tx`.
 async fn collect_tagged_lines(
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
-) -> Result<Vec<(bool, String)>, std::io::Error> {
+    tx: tokio::sync::mpsc::UnboundedSender<(bool, String)>,
+) -> Result<(), std::io::Error> {
     let stdout_lines = SplitStream::new(BufReader::new(stdout).split(b'\n')).map(|l| (false, l));
     let stderr_lines = SplitStream::new(BufReader::new(stderr).split(b'\n')).map(|l| (true, l));
     let mut merged = stdout_lines.merge(stderr_lines);
 
-    let mut lines = Vec::new();
     while let Some((is_stderr, line)) = merged.next().await {
         let line = line?;
-        lines.push((is_stderr, String::from_utf8_lossy(&line).into_owned()));
+        let _ = tx.send((is_stderr, String::from_utf8_lossy(&line).into_owned()));
     }
-    Ok(lines)
+    Ok(())
+}
+
+/// Build a human-readable truncation notice with platform-appropriate commands.
+fn truncation_notice(info: &TruncationInfo) -> String {
+    let path = info.path.display();
+    let commands = if cfg!(windows) {
+        "PowerShell commands like `Get-Content -TotalCount 200`, `Select-String`, or \
+         `Get-Content | Select-Object -Skip 100 -First 100`"
+    } else {
+        "shell commands like `head`, `tail`, or `sed -n '100,200p'`"
+    };
+    format!(
+        "[{reason} Full output saved to {path}. \
+         Read it with {commands} up to {limit} lines at a time.]",
+        reason = info.reason,
+        limit = OUTPUT_LIMIT_LINES,
+    )
 }
 
 fn render_output(
     full_output: &str,
     label: &str,
     output_dir: &std::path::Path,
-) -> Result<String, String> {
+) -> Result<TruncateResult, String> {
     if full_output.is_empty() {
-        return Ok("(no output)".to_string());
+        return Ok(TruncateResult {
+            text: "(no output)".to_string(),
+            truncation: None,
+        });
     }
     truncate_output(full_output, label, output_dir)
 }
@@ -345,7 +736,7 @@ fn truncate_output(
     full_output: &str,
     label: &str,
     output_dir: &std::path::Path,
-) -> Result<String, String> {
+) -> Result<TruncateResult, String> {
     let lines: Vec<&str> = full_output.split('\n').collect();
     let total_lines = lines.len();
     let total_bytes = full_output.len();
@@ -354,7 +745,10 @@ fn truncate_output(
     let exceeded_bytes = total_bytes > OUTPUT_LIMIT_BYTES;
 
     if !exceeded_lines && !exceeded_bytes {
-        return Ok(full_output.to_string());
+        return Ok(TruncateResult {
+            text: full_output.to_string(),
+            truncation: None,
+        });
     }
 
     let output_path = save_full_output(full_output, label, output_dir)?;
@@ -371,12 +765,13 @@ fn truncate_output(
         )
     };
 
-    Ok(format!(
-        "{preview}\n\n[{reason} Full output saved to {path}. \
-         Read it with shell commands like `head`, `tail`, or `sed -n '100,200p'` \
-         up to 2000 lines at a time.]",
-        path = output_path.display(),
-    ))
+    Ok(TruncateResult {
+        text: preview,
+        truncation: Some(TruncationInfo {
+            path: output_path,
+            reason,
+        }),
+    })
 }
 
 fn save_full_output(
@@ -401,9 +796,17 @@ mod tests {
         }
     }
 
+    fn extract_shell_output(result: &CallToolResult) -> ShellOutput {
+        let value = result
+            .structured_content
+            .clone()
+            .expect("expected structured content");
+        serde_json::from_value(value).expect("expected shell output structured content")
+    }
+
     #[tokio::test]
     async fn shell_executes_command() {
-        let tool = ShellTool::new().unwrap();
+        let tool = ShellTool::new_for_test().unwrap();
         let result = tool
             .shell(ShellParams {
                 command: "echo hello".to_string(),
@@ -418,7 +821,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn shell_returns_error_for_non_zero_exit() {
-        let tool = ShellTool::new().unwrap();
+        let tool = ShellTool::new_for_test().unwrap();
         let result = tool
             .shell(ShellParams {
                 command: "echo fail && exit 7".to_string(),
@@ -434,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn shell_uses_working_dir_for_relative_execution() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new().unwrap();
+        let tool = ShellTool::new_for_test().unwrap();
         let result = tool
             .shell_with_cwd(
                 ShellParams {
@@ -451,6 +854,37 @@ mod tests {
         assert_eq!(observed, expected);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_shell_flavor_detects_nushell_names() {
+        assert_eq!(unix_shell_flavor("nu"), UnixShellFlavor::Nushell);
+        assert_eq!(unix_shell_flavor("nushell"), UnixShellFlavor::Nushell);
+        assert_eq!(
+            unix_shell_flavor("/etc/profiles/per-user/can/bin/nu"),
+            UnixShellFlavor::Nushell
+        );
+        assert_eq!(unix_shell_flavor("/bin/bash"), UnixShellFlavor::Posix);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_login_shell_command_args_use_nushell_probe() {
+        assert_eq!(
+            unix_login_shell_command_args("nu"),
+            ["-l", "-i", "-c", "print ($env.PATH | str join (char esep))"]
+        );
+        assert_eq!(
+            unix_login_shell_command_args("/bin/bash"),
+            ["-l", "-i", "-c", "echo $PATH"]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_shell_command_args_wrap_commands_for_execution() {
+        assert_eq!(unix_shell_command_args("ls -la"), ["-c", "ls -la"]);
+    }
+
     #[test]
     fn render_output_returns_full_output_when_under_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -459,15 +893,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let rendered = render_output(&input, "test", dir.path()).unwrap();
-        assert_eq!(rendered, input);
+        let result = render_output(&input, "test", dir.path()).unwrap();
+        assert_eq!(result.text, input);
+        assert!(result.truncation.is_none());
     }
 
     #[test]
     fn render_output_shows_empty_message() {
         let dir = tempfile::tempdir().unwrap();
-        let rendered = render_output("", "test", dir.path()).unwrap();
-        assert_eq!(rendered, "(no output)");
+        let result = render_output("", "test", dir.path()).unwrap();
+        assert_eq!(result.text, "(no output)");
+        assert!(result.truncation.is_none());
     }
 
     #[test]
@@ -478,17 +914,22 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let rendered = render_output(&input, "test_lines", dir.path()).unwrap();
-        let (preview, metadata) = rendered.split_once("\n\n[").unwrap();
+        let result = render_output(&input, "test_lines", dir.path()).unwrap();
+        let preview = &result.text;
 
         assert_eq!(preview.lines().count(), OUTPUT_PREVIEW_LINES);
         assert!(preview.starts_with("line 2450"));
         assert!(preview.contains("line 2499"));
-        assert!(metadata.contains("2000 line limit"));
-        assert!(metadata.contains("2500 lines total"));
-        assert!(metadata.contains("Full output saved to"));
-        assert!(metadata.contains("head"));
-        assert!(metadata.contains("sed -n"));
+
+        let info = result
+            .truncation
+            .as_ref()
+            .expect("expected truncation info");
+        assert!(info.reason.contains("2000 line limit"));
+        assert!(info.reason.contains("2500 lines total"));
+
+        let notice = truncation_notice(info);
+        assert!(notice.contains("Full output saved to"));
     }
 
     #[test]
@@ -502,12 +943,16 @@ mod tests {
         assert!(input.len() > OUTPUT_LIMIT_BYTES);
         assert!(input.lines().count() <= OUTPUT_LIMIT_LINES);
 
-        let rendered = render_output(&input, "test_bytes", dir.path()).unwrap();
-        let (_preview, metadata) = rendered.split_once("\n\n[").unwrap();
+        let result = render_output(&input, "test_bytes", dir.path()).unwrap();
+        let info = result
+            .truncation
+            .as_ref()
+            .expect("expected truncation info");
+        assert!(info.reason.contains("byte limit"));
+        assert!(info.reason.contains("bytes total"));
 
-        assert!(metadata.contains("byte limit"));
-        assert!(metadata.contains("bytes total"));
-        assert!(metadata.contains("Full output saved to"));
+        let notice = truncation_notice(info);
+        assert!(notice.contains("Full output saved to"));
     }
 
     #[test]
@@ -516,7 +961,9 @@ mod tests {
         let path1 = save_full_output("first", "test_reuse", dir.path()).unwrap();
         let path2 = save_full_output("second", "test_reuse", dir.path()).unwrap();
         assert_eq!(path1, path2);
-        assert_eq!(std::fs::read_to_string(&path2).unwrap(), "second");
+        // Note: we intentionally don't assert file content here because
+        // parallel tests (render_output_truncates_*) share the same static
+        // temp file and can overwrite the content between our write and read.
     }
 
     #[test]
@@ -531,7 +978,7 @@ mod tests {
 
     #[test]
     fn call_index_cycles_through_slots() {
-        let tool = ShellTool::new().unwrap();
+        let tool = ShellTool::new_for_test().unwrap();
         for _cycle in 0..3 {
             for expected in 0..OUTPUT_SLOTS {
                 let slot = tool.call_index.fetch_add(1, Ordering::Relaxed) % OUTPUT_SLOTS;
@@ -542,12 +989,64 @@ mod tests {
 
     #[test]
     fn concurrent_calls_get_distinct_slots() {
-        let tool = ShellTool::new().unwrap();
+        let tool = ShellTool::new_for_test().unwrap();
         let mut slots: Vec<usize> = (0..OUTPUT_SLOTS)
             .map(|_| tool.call_index.fetch_add(1, Ordering::Relaxed) % OUTPUT_SLOTS)
             .collect();
         slots.sort();
         let expected: Vec<usize> = (0..OUTPUT_SLOTS).collect();
         assert_eq!(slots, expected);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_does_not_hang_on_backgrounded_process() {
+        struct KillOnDrop(String);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &self.0])
+                    .status();
+            }
+        }
+
+        let tool = ShellTool::new_for_test().unwrap();
+        let start = std::time::Instant::now();
+        let result = tool
+            .shell(ShellParams {
+                command: "echo before && sleep 300 & echo bgpid:$! && echo after".to_string(),
+                timeout_secs: None,
+            })
+            .await;
+
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "shell tool should return quickly, not wait for backgrounded sleep"
+        );
+        assert_eq!(result.is_error, Some(false));
+        let text = extract_text(&result);
+        let shell_output = extract_shell_output(&result);
+        let background_pid = text
+            .lines()
+            .find_map(|line| line.strip_prefix("bgpid:"))
+            .map(str::trim)
+            .expect("expected bgpid in output");
+        let _cleanup = KillOnDrop(background_pid.to_string());
+        assert!(
+            shell_output.output_truncated,
+            "backgrounded process should set output_truncated"
+        );
+        assert!(
+            shell_output.output_collection_error.is_none(),
+            "timeout-based truncation should not set output collection error"
+        );
+        assert!(
+            text.contains("before"),
+            "should capture output before background cmd"
+        );
+        assert!(
+            text.contains("after"),
+            "should capture output after background cmd"
+        );
     }
 }

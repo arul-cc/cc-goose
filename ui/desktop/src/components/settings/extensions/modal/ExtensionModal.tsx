@@ -17,6 +17,46 @@ import ExtensionInfoFields from './ExtensionInfoFields';
 import ExtensionTimeoutField from './ExtensionTimeoutField';
 import { upsertConfig } from '../../../../api';
 import { ConfirmationModal } from '../../../ui/ConfirmationModal';
+import { defineMessages, useIntl } from '../../../../i18n';
+
+const i18n = defineMessages({
+  deleteExtensionTitle: {
+    id: 'extensionModal.deleteExtensionTitle',
+    defaultMessage: 'Delete Extension "{name}"',
+  },
+  deleteDescription: {
+    id: 'extensionModal.deleteDescription',
+    defaultMessage: 'This will permanently remove this extension and all of its settings.',
+  },
+  installationNotes: {
+    id: 'extensionModal.installationNotes',
+    defaultMessage: 'Installation Notes',
+  },
+  cancel: {
+    id: 'extensionModal.cancel',
+    defaultMessage: 'Cancel',
+  },
+  confirmRemoval: {
+    id: 'extensionModal.confirmRemoval',
+    defaultMessage: 'Confirm removal',
+  },
+  removeExtension: {
+    id: 'extensionModal.removeExtension',
+    defaultMessage: 'Remove extension',
+  },
+  unsavedChangesTitle: {
+    id: 'extensionModal.unsavedChangesTitle',
+    defaultMessage: 'Unsaved Changes',
+  },
+  unsavedChangesMessage: {
+    id: 'extensionModal.unsavedChangesMessage',
+    defaultMessage: 'You have unsaved changes to the extension configuration. Are you sure you want to close without saving?',
+  },
+  closeWithoutSaving: {
+    id: 'extensionModal.closeWithoutSaving',
+    defaultMessage: 'Close Without Saving',
+  },
+});
 
 interface ExtensionModalProps {
   title: string;
@@ -37,11 +77,13 @@ export default function ExtensionModal({
   submitLabel,
   modalType,
 }: ExtensionModalProps) {
+  const intl = useIntl();
   const [formData, setFormData] = useState<ExtensionFormData>(initialData);
   const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [showCloseConfirmation, setShowCloseConfirmation] = useState(false);
   const [hasPendingEnvVars, setHasPendingEnvVars] = useState(false);
+  const [pendingEnvVar, setPendingEnvVar] = useState<{ key: string; value: string } | null>(null);
   const [hasPendingHeaders, setHasPendingHeaders] = useState(false);
   const [pendingHeader, setPendingHeader] = useState<{ key: string; value: string } | null>(null);
 
@@ -191,6 +233,14 @@ export default function ExtensionModal({
     []
   );
 
+  const handlePendingEnvVarChange = useCallback(
+    (hasPending: boolean, envVar: { key: string; value: string } | null) => {
+      setHasPendingEnvVars(hasPending);
+      setPendingEnvVar(envVar);
+    },
+    []
+  );
+
   // Function to store a secret value
   const storeSecret = async (key: string, value: string) => {
     try {
@@ -248,6 +298,19 @@ export default function ExtensionModal({
     return finalHeaders;
   };
 
+  const getFinalEnvVars = () => {
+    const finalEnvVars = [...formData.envVars];
+    if (
+      pendingEnvVar &&
+      pendingEnvVar.key.trim() !== '' &&
+      pendingEnvVar.value.trim() !== '' &&
+      !pendingEnvVar.key.includes(' ')
+    ) {
+      finalEnvVars.push({ ...pendingEnvVar, isEdited: true });
+    }
+    return finalEnvVars;
+  };
+
   const isHeadersValid = () => {
     return getFinalHeaders().every(
       ({ key, value }) => (key === '' && value === '') || (key !== '' && value !== '')
@@ -282,6 +345,7 @@ export default function ExtensionModal({
     if (isFormValid()) {
       const finalFormData = {
         ...formData,
+        envVars: getFinalEnvVars(),
         headers: getFinalHeaders(),
       };
 
@@ -311,13 +375,11 @@ export default function ExtensionModal({
       } catch (error) {
         console.error('Error during submission:', error);
       }
-    } else {
-      console.log('Form validation failed');
     }
   };
 
   // Update title based on current state
-  const modalTitle = showDeleteConfirmation ? `Delete Extension "${formData.name}"` : title;
+  const modalTitle = showDeleteConfirmation ? intl.formatMessage(i18n.deleteExtensionTitle, { name: formData.name }) : title;
 
   return (
     <>
@@ -330,7 +392,7 @@ export default function ExtensionModal({
             </DialogTitle>
             {showDeleteConfirmation && (
               <DialogDescription>
-                This will permanently remove this extension and all of its settings.
+                {intl.formatMessage(i18n.deleteDescription)}
               </DialogDescription>
             )}
           </DialogHeader>
@@ -338,7 +400,7 @@ export default function ExtensionModal({
           {showDeleteConfirmation ? (
             <div className="py-4">
               <p className="text-text-primary">
-                This will permanently remove this extension and all of its settings.
+                {intl.formatMessage(i18n.deleteDescription)}
               </p>
             </div>
           ) : (
@@ -349,7 +411,7 @@ export default function ExtensionModal({
                     <Info className="h-5 w-5 text-blue-400 shrink-0 mt-0.5" />
                     <div>
                       <h4 className="text-sm font-medium text-text-primary mb-1">
-                        Installation Notes
+                        {intl.formatMessage(i18n.installationNotes)}
                       </h4>
                       <p className="text-sm text-text-secondary">{formData.installation_notes}</p>
                     </div>
@@ -387,7 +449,7 @@ export default function ExtensionModal({
                 />
               </div>
 
-              {formData.type === 'stdio' && (
+              {(formData.type === 'stdio' || formData.type === 'streamable_http') && (
                 <>
                   <hr className="border-t border-border-primary" />
 
@@ -398,7 +460,7 @@ export default function ExtensionModal({
                       onRemove={handleRemoveEnvVar}
                       onChange={handleEnvVarChange}
                       submitAttempted={submitAttempted}
-                      onPendingInputChange={setHasPendingEnvVars}
+                      onPendingInputChange={handlePendingEnvVarChange}
                     />
                   </div>
                 </>
@@ -428,7 +490,7 @@ export default function ExtensionModal({
             {showDeleteConfirmation ? (
               <>
                 <Button variant="outline" onClick={() => setShowDeleteConfirmation(false)}>
-                  Cancel
+                  {intl.formatMessage(i18n.cancel)}
                 </Button>
                 <Button
                   onClick={() => {
@@ -440,7 +502,7 @@ export default function ExtensionModal({
                   variant="destructive"
                 >
                   <Trash2 className="h-4 w-4 mr-2" />
-                  Confirm removal
+                  {intl.formatMessage(i18n.confirmRemoval)}
                 </Button>
               </>
             ) : (
@@ -452,11 +514,11 @@ export default function ExtensionModal({
                     className="text-red-500 hover:text-red-600"
                   >
                     <Trash2 className="h-4 w-4 mr-2" />
-                    Remove extension
+                    {intl.formatMessage(i18n.removeExtension)}
                   </Button>
                 )}
                 <Button variant="outline" onClick={handleClose}>
-                  Cancel
+                  {intl.formatMessage(i18n.cancel)}
                 </Button>
                 <Button
                   data-testid="extension-submit-btn"
@@ -475,9 +537,9 @@ export default function ExtensionModal({
       {showCloseConfirmation && (
         <ConfirmationModal
           isOpen={showCloseConfirmation}
-          title="Unsaved Changes"
-          message="You have unsaved changes to the extension configuration. Are you sure you want to close without saving?"
-          confirmLabel="Close Without Saving"
+          title={intl.formatMessage(i18n.unsavedChangesTitle)}
+          message={intl.formatMessage(i18n.unsavedChangesMessage)}
+          confirmLabel={intl.formatMessage(i18n.closeWithoutSaving)}
           onConfirm={handleConfirmClose}
           onCancel={handleCancelClose}
         />

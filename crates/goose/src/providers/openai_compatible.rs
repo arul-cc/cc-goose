@@ -1,7 +1,11 @@
 use anyhow::Error;
 use async_stream::try_stream;
 use futures::TryStreamExt;
-use reqwest::{Response, StatusCode};
+use goose_providers::conversation::token_usage::ProviderUsage;
+use goose_providers::images::ImageFormat;
+use reqwest::Response;
+#[cfg(test)]
+use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::pin;
 use tokio_stream::StreamExt;
@@ -9,13 +13,17 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
 use super::api_client::ApiClient;
-use super::base::{MessageStream, Provider};
-use super::errors::ProviderError;
+use super::base::{stream_from_single_message, MessageStream, Provider};
 use super::retry::ProviderRetry;
-use super::utils::{ImageFormat, RequestLog};
+use super::utils::RequestLog;
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
-use crate::providers::formats::openai::{create_request, response_to_streaming_message};
+use crate::providers::formats::openai_responses::responses_api_to_streaming_message;
+use goose_providers::errors::ProviderError;
+use goose_providers::formats::openai::{
+    create_request, get_usage, response_to_message, response_to_streaming_message,
+    ModelConfigParams,
+};
 use rmcp::model::Tool;
 
 pub struct OpenAiCompatibleProvider {
@@ -25,6 +33,7 @@ pub struct OpenAiCompatibleProvider {
     model: ModelConfig,
     /// Path prefix prepended to `chat/completions` (e.g. `"deployments/{name}/"` for Azure).
     completions_prefix: String,
+    supports_streaming: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -39,7 +48,13 @@ impl OpenAiCompatibleProvider {
             api_client,
             model,
             completions_prefix,
+            supports_streaming: true,
         }
+    }
+
+    pub fn with_supports_streaming(mut self, supports_streaming: bool) -> Self {
+        self.supports_streaming = supports_streaming;
+        self
     }
 
     fn build_request(
@@ -51,7 +66,13 @@ impl OpenAiCompatibleProvider {
         for_streaming: bool,
     ) -> Result<Value, ProviderError> {
         create_request(
-            model_config,
+            ModelConfigParams {
+                model_name: model_config.model_name.as_str(),
+                thinking_effort: model_config.thinking_effort(),
+                temperature: model_config.temperature,
+                max_tokens: model_config.max_tokens,
+                request_params: model_config.request_params.as_ref(),
+            },
             system,
             messages,
             tools,
@@ -107,7 +128,13 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let payload = self.build_request(model_config, system, messages, tools, true)?;
+        let payload = self.build_request(
+            model_config,
+            system,
+            messages,
+            tools,
+            self.supports_streaming,
+        )?;
         let mut log = RequestLog::start(model_config, &payload)?;
 
         let completions_path = format!("{}chat/completions", self.completions_prefix);
@@ -117,121 +144,45 @@ impl Provider for OpenAiCompatibleProvider {
                     .api_client
                     .response_post(Some(session_id), &completions_path, &payload)
                     .await?;
-                handle_status_openai_compat(resp).await
+                handle_status(resp).await
             })
             .await
             .inspect_err(|e| {
                 let _ = log.error(e);
             })?;
 
-        stream_openai_compat(response, log)
+        if self.supports_streaming {
+            stream_openai_compat(response, log)
+        } else {
+            let json: serde_json::Value = response.json().await.map_err(|e| {
+                ProviderError::RequestFailed(format!("Failed to parse JSON: {}", e))
+            })?;
+
+            let message = response_to_message(&json).map_err(|e| {
+                ProviderError::RequestFailed(format!("Failed to parse message: {}", e))
+            })?;
+
+            let usage_data = get_usage(json.get("usage").unwrap_or(&serde_json::Value::Null));
+            let usage = ProviderUsage::new(model_config.model_name.clone(), usage_data);
+
+            log.write(
+                &serde_json::to_value(&message).unwrap_or_default(),
+                Some(&usage.usage),
+            )?;
+
+            Ok(stream_from_single_message(message, usage))
+        }
     }
 }
 
-fn check_context_length_exceeded(text: &str) -> bool {
-    let check_phrases = [
-        "too long",
-        "context length",
-        "context_length_exceeded",
-        "reduce the length",
-        "token count",
-        "exceeds",
-        "exceed context limit",
-        "input length",
-        "max_tokens",
-        "decrease input length",
-        "context limit",
-        "maximum prompt length",
-    ];
-    let text_lower = text.to_lowercase();
-    check_phrases
-        .iter()
-        .any(|phrase| text_lower.contains(phrase))
-}
+// Re-exported from the dedicated `http_status` module — these helpers are
+// format-agnostic and used across all provider families.
+pub use super::http_status::{
+    handle_response, handle_status, map_http_error_to_provider_error, sanitize_url,
+};
 
-pub fn map_http_error_to_provider_error(
-    status: StatusCode,
-    payload: Option<Value>,
-) -> ProviderError {
-    let extract_message = || -> String {
-        payload
-            .as_ref()
-            .and_then(|p| {
-                p.get("error")
-                    .and_then(|e| e.get("message"))
-                    .or_else(|| p.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
-            })
-            .unwrap_or_else(|| payload.as_ref().map(|p| p.to_string()).unwrap_or_default())
-    };
-
-    let error = match status {
-        StatusCode::OK => unreachable!("Should not call this function with OK status"),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderError::Authentication(format!(
-            "Authentication failed. Status: {}. Response: {}",
-            status,
-            extract_message()
-        )),
-        StatusCode::NOT_FOUND => {
-            ProviderError::RequestFailed(format!("Resource not found (404): {}", extract_message()))
-        }
-        StatusCode::PAYMENT_REQUIRED => ProviderError::CreditsExhausted {
-            details: extract_message(),
-            top_up_url: None,
-        },
-        StatusCode::PAYLOAD_TOO_LARGE => ProviderError::ContextLengthExceeded(extract_message()),
-        StatusCode::BAD_REQUEST => {
-            let payload_str = extract_message();
-            if check_context_length_exceeded(&payload_str) {
-                ProviderError::ContextLengthExceeded(payload_str)
-            } else {
-                ProviderError::RequestFailed(format!("Bad request (400): {}", payload_str))
-            }
-        }
-        StatusCode::TOO_MANY_REQUESTS => ProviderError::RateLimitExceeded {
-            details: extract_message(),
-            retry_delay: None,
-        },
-        _ if status.is_server_error() => {
-            ProviderError::ServerError(format!("Server error ({}): {}", status, extract_message()))
-        }
-        _ => ProviderError::RequestFailed(format!(
-            "Request failed with status {}: {}",
-            status,
-            extract_message()
-        )),
-    };
-
-    if !status.is_success() {
-        tracing::warn!(
-            "Provider request failed with status: {}. Payload: {:?}. Returning error: {:?}",
-            status,
-            payload,
-            error
-        );
-    }
-
-    error
-}
-
-pub async fn handle_status_openai_compat(response: Response) -> Result<Response, ProviderError> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let payload = serde_json::from_str::<Value>(&body).ok();
-        return Err(map_http_error_to_provider_error(status, payload));
-    }
-    Ok(response)
-}
-
-pub async fn handle_response_openai_compat(response: Response) -> Result<Value, ProviderError> {
-    let response = handle_status_openai_compat(response).await?;
-
-    response.json::<Value>().await.map_err(|e| {
-        ProviderError::RequestFailed(format!("Response body is not valid JSON: {}", e))
-    })
-}
+// Legacy alias kept for callers that haven't migrated their import path yet.
+pub use super::http_status::handle_response as handle_response_openai_compat;
 
 pub fn stream_openai_compat(
     response: Response,
@@ -248,7 +199,31 @@ pub fn stream_openai_compat(
         pin!(message_stream);
         while let Some(message) = message_stream.next().await {
             let (message, usage) = message.map_err(|e|
-                ProviderError::RequestFailed(format!("Stream decode error: {}", e))
+                e.downcast::<ProviderError>()
+                    .unwrap_or_else(|e| ProviderError::RequestFailed(format!("Stream decode error: {e}")))
+            )?;
+            log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
+            yield (message, usage);
+        }
+    }))
+}
+
+pub fn stream_responses_compat(
+    response: Response,
+    mut log: RequestLog,
+) -> Result<MessageStream, ProviderError> {
+    let stream = response.bytes_stream().map_err(std::io::Error::other);
+
+    Ok(Box::pin(try_stream! {
+        let stream_reader = StreamReader::new(stream);
+        let framed = FramedRead::new(stream_reader, LinesCodec::new())
+            .map_err(Error::from);
+
+        let message_stream = responses_api_to_streaming_message(framed);
+        pin!(message_stream);
+        while let Some(message) = message_stream.next().await {
+            let (message, usage) = message.map_err(|e|
+                ProviderError::RequestFailed(format!("Stream decode error: {e}"))
             )?;
             log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
             yield (message, usage);
@@ -259,6 +234,7 @@ pub fn stream_openai_compat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelConfig;
     use serde_json::json;
     use test_case::test_case;
 
@@ -298,12 +274,24 @@ mod tests {
         "ServerError"
         ; "500 server error"
     )]
+    #[test_case(
+        StatusCode::NOT_FOUND,
+        None,
+        "RequestFailed"
+        ; "404 not found"
+    )]
+    #[test_case(
+        StatusCode::NOT_FOUND,
+        Some(json!({"error": {"message": "model not available"}})),
+        "RequestFailed"
+        ; "404 with error payload"
+    )]
     fn http_status_maps_to_expected_error(
         status: StatusCode,
         payload: Option<Value>,
         expected_variant: &str,
     ) {
-        let err = map_http_error_to_provider_error(status, payload);
+        let err = map_http_error_to_provider_error(status, payload, "http://test/endpoint");
         let actual = err.telemetry_type();
         let expected_telemetry = match expected_variant {
             "CreditsExhausted" => "credits_exhausted",
@@ -311,11 +299,34 @@ mod tests {
             "Authentication" => "auth",
             "ContextLengthExceeded" => "context_length",
             "ServerError" => "server",
+            "RequestFailed" => "request",
             other => panic!("Unknown variant: {other}"),
         };
         assert_eq!(
             actual, expected_telemetry,
             "Expected {expected_variant}, got error: {err:?}"
         );
+    }
+
+    #[test]
+    fn build_request_respects_non_streaming_mode() {
+        let provider = OpenAiCompatibleProvider::new(
+            "test".to_string(),
+            ApiClient::new(
+                "http://localhost".to_string(),
+                super::super::api_client::AuthMethod::NoAuth,
+            )
+            .unwrap(),
+            ModelConfig::new_or_fail("test-model"),
+            String::new(),
+        )
+        .with_supports_streaming(false);
+
+        let payload = provider
+            .build_request(&provider.model, "", &[], &[], provider.supports_streaming)
+            .unwrap();
+
+        assert_eq!(payload.get("stream"), None);
+        assert_eq!(payload.get("stream_options"), None);
     }
 }

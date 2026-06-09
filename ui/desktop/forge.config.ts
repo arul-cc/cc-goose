@@ -2,9 +2,11 @@ const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const { resolve } = require('path');
 
+const isLinuxVulkanBuild = process.env.GOOSE_DESKTOP_LINUX_VARIANT === 'vulkan';
+
 let cfg = {
   asar: true,
-  extraResource: ['src/bin', 'src/images', 'src/sandbox'],
+  extraResource: ['src/bin', 'src/images'],
   icon: 'src/images/icon',
   // Windows specific configuration
   win32: {
@@ -33,10 +35,27 @@ let cfg = {
       },
     ],
     // Usage descriptions for macOS TCC (Transparency, Consent, and Control)
-    NSCalendarsUsageDescription: 'Goose needs access to your calendars to help manage and query calendar events.',
-    NSRemindersUsageDescription: 'Goose needs access to your reminders to help manage and query reminders.',
+    NSCalendarsUsageDescription:
+      'Goose needs access to your calendars to help manage and query calendar events.',
+    NSRemindersUsageDescription:
+      'Goose needs access to your reminders to help manage and query reminders.',
   },
 };
+
+// macOS code signing and notarization via Electron Forge
+// Activated when APPLE_TEAM_ID is set (CI signing builds)
+if (process.env.APPLE_TEAM_ID) {
+  cfg.osxSign = {
+    keychain: process.env.KEYCHAIN_PATH || undefined,
+    entitlements: 'entitlements.plist',
+    'entitlements-inherit': 'entitlements.plist',
+  };
+  cfg.osxNotarize = {
+    appleId: process.env.APPLE_ID,
+    appleIdPassword: process.env.APPLE_ID_PASSWORD,
+    teamId: process.env.APPLE_TEAM_ID,
+  };
+}
 
 module.exports = {
   packagerConfig: cfg,
@@ -46,7 +65,7 @@ module.exports = {
       name: '@electron-forge/publisher-github',
       config: {
         repository: {
-          owner: process.env.GITHUB_OWNER || 'block',
+          owner: process.env.GITHUB_OWNER || 'aaif-goose',
           name: process.env.GITHUB_REPO || 'goose',
         },
         prerelease: false,
@@ -70,13 +89,14 @@ module.exports = {
       config: {
         name: 'Goose',
         bin: 'Goose',
-        maintainer: 'Block, Inc.',
-        homepage: 'https://block.github.io/goose/',
+        maintainer: 'AAIF (Agentic AI Foundation)',
+        homepage: 'https://goose-docs.ai/',
         categories: ['Development'],
         desktopTemplate: './forge.deb.desktop',
         options: {
           icon: 'src/images/icon.png',
           prefix: '/opt',
+          ...(isLinuxVulkanBuild ? { depends: ['libvulkan1'] } : {}),
         },
       },
     },
@@ -85,13 +105,14 @@ module.exports = {
       config: {
         name: 'Goose',
         bin: 'Goose',
-        maintainer: 'Block, Inc.',
-        homepage: 'https://block.github.io/goose/',
+        maintainer: 'AAIF (Agentic AI Foundation)',
+        homepage: 'https://goose-docs.ai/',
         categories: ['Development'],
         desktopTemplate: './forge.rpm.desktop',
         options: {
           icon: 'src/images/icon.png',
           prefix: '/opt',
+          ...(isLinuxVulkanBuild ? { requires: ['vulkan-loader'] } : {}),
           fpm: ['--rpm-rpmbuild-define', '_build_id_links none'],
         },
       },
@@ -100,13 +121,13 @@ module.exports = {
       name: '@electron-forge/maker-flatpak',
       config: {
         options: {
-          id: 'io.github.block.Goose',
+          id: 'io.github.block.Goose', // NOTE: kept for backwards compat with existing installs
           categories: ['Development'],
           icon: {
-            'scalable': 'src/images/icon.svg',
+            scalable: 'src/images/icon.svg',
             '512x512': 'src/images/icon-512.png',
           },
-          homepage: 'https://block.github.io/goose/',
+          homepage: 'https://goose-docs.ai/',
           runtimeVersion: '25.08',
           baseVersion: '25.08',
           bin: 'Goose',
@@ -119,9 +140,9 @@ module.exports = {
                 'mkdir -p /app/lib',
                 // Point to the actual library in the 25.08 runtime
                 // We use a wildcard to handle multi-arch paths (x86_64-linux-gnu, etc)
-                'ln -s $(find /usr/lib -name "libbz2.so.1" | head -n 1) /app/lib/libbz2.so.1.0'
-              ]
-            }
+                'ln -s $(find /usr/lib -name "libbz2.so.1" | head -n 1) /app/lib/libbz2.so.1.0',
+              ],
+            },
           ],
           finishArgs: [
             '--share=ipc',
@@ -134,7 +155,7 @@ module.exports = {
             '--socket=session-bus',
             '--socket=system-bus',
             // This ensures the app looks in our shim folder first
-            '--env=LD_LIBRARY_PATH=/app/lib'
+            '--env=LD_LIBRARY_PATH=/app/lib',
           ],
         },
       },

@@ -1,5 +1,6 @@
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
+use crate::agents::tool_execution::ToolCallContext;
 use crate::config::get_extension_by_name;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -7,8 +8,7 @@ use indoc::indoc;
 use rmcp::model::{
     CallToolResult, Content, ErrorCode, ErrorData, GetPromptResult, Implementation,
     InitializeResult, JsonObject, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    ProtocolVersion, ReadResourceResult, ServerCapabilities, ServerNotification, Tool,
-    ToolAnnotations, ToolsCapability,
+    ReadResourceResult, ServerCapabilities, ServerNotification, Tool, ToolAnnotations,
 };
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -53,8 +53,7 @@ pub struct ManageExtensionsParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadResourceParams {
     pub uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension_name: Option<String>,
+    pub extension_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -77,46 +76,27 @@ pub struct ExtensionManagerClient {
 
 impl ExtensionManagerClient {
     pub fn new(context: PlatformExtensionContext) -> Result<Self> {
-        let info = InitializeResult {
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability {
-                    list_changed: Some(false),
-                }),
-                tasks: None,
-                resources: None,
-                extensions: None,
-                prompts: None,
-                completions: None,
-                experimental: None,
-                logging: None,
-            },
-            server_info: Implementation {
-                name: EXTENSION_NAME.to_string(),
-                description: None,
-                title: Some(EXTENSION_NAME.to_string()),
-                version: "1.0.0".to_string(),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(indoc! {r#"
-                Extension Management
+        let info = InitializeResult::new(
+            ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_server_info(Implementation::new(EXTENSION_NAME, "1.0.0").with_title(EXTENSION_NAME))
+        .with_instructions(indoc! {r#"
+            Extension Management
 
-                Use these tools to discover, enable, and disable extensions, as well as review resources.
+            Use these tools to discover, enable, and disable extensions, as well as review resources.
 
-                Available tools:
-                - search_available_extensions: Find extensions available to enable/disable
-                - manage_extensions: Enable or disable extensions
-                - list_resources: List resources from extensions
-                - read_resource: Read specific resources from extensions
+            Available tools:
+            - search_available_extensions: Find extensions available to enable/disable
+            - manage_extensions: Enable or disable extensions
+            - list_resources: List resources from extensions
+            - read_resource: Read specific resources from extensions
 
-                When you lack the tools needed to complete a task, use search_available_extensions first
-                to discover what extensions can help.
+            When you lack the tools needed to complete a task, use search_available_extensions first
+            to discover what extensions can help.
 
-                Use manage_extensions to enable or disable specific extensions by name.
-                Use list_resources and read_resource to work with extension data and resources.
-            "#}.to_string()),
-        };
+            Use manage_extensions to enable or disable specific extensions by name.
+            Use list_resources and read_resource to work with extension data and resources.
+        "#});
 
         Ok(Self { info, context })
     }
@@ -302,13 +282,13 @@ impl ExtensionManagerClient {
                     .expect("Schema must be an object")
                     .clone()
                 ),
-            ).annotate(ToolAnnotations {
-                title: Some("Discover extensions".to_string()),
-                read_only_hint: Some(true),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(false),
-                open_world_hint: Some(false),
-            }),
+            ).annotate(ToolAnnotations::from_raw(
+                Some("Discover extensions".to_string()),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+            )),
             Tool::new(
                 MANAGE_EXTENSIONS_TOOL_NAME.to_string(),
                 "Tool to manage extensions and tools in goose context.
@@ -322,13 +302,13 @@ impl ExtensionManagerClient {
                         .expect("Schema must be an object")
                         .clone()
                 ),
-            ).annotate(ToolAnnotations {
-                title: Some("Enable or disable an extension".to_string()),
-                read_only_hint: Some(false),
-                destructive_hint: Some(false),
-                idempotent_hint: Some(false),
-                open_world_hint: Some(false),
-            }),
+            ).annotate(ToolAnnotations::from_raw(
+                Some("Enable or disable an extension".to_string()),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            )),
         ];
 
         if let Some(weak_ref) = &self.context.extension_manager {
@@ -344,45 +324,50 @@ impl ExtensionManagerClient {
             files, database schemas, or application-specific information. This tool lists resources
             in the provided extension, and returns a list for the user to browse. If no extension
             is provided, the tool will search all extensions for the resource.
-        "#}.to_string(),
+        "#}
+                            .to_string(),
                             Arc::new(
                                 serde_json::to_value(schema_for!(ListResourcesParams))
                                     .expect("Failed to serialize schema")
                                     .as_object()
                                     .expect("Schema must be an object")
-                                    .clone()
+                                    .clone(),
                             ),
-                        ).annotate(ToolAnnotations {
-                            title: Some("List resources".to_string()),
-                            read_only_hint: Some(true),
-                            destructive_hint: Some(false),
-                            idempotent_hint: Some(false),
-                            open_world_hint: Some(false),
-                        }),
+                        )
+                        .annotate(ToolAnnotations::from_raw(
+                            Some("List resources".to_string()),
+                            Some(true),
+                            Some(false),
+                            Some(false),
+                            Some(false),
+                        )),
                         Tool::new(
                             READ_RESOURCE_TOOL_NAME.to_string(),
                             indoc! {r#"
-            Read a resource from an extension.
+            Read a resource from a specific extension.
 
             Resources allow extensions to share data that provide context to LLMs, such as
-            files, database schemas, or application-specific information. This tool searches for the
-            resource URI in the provided extension, and reads in the resource content. If no extension
-            is provided, the tool will search all extensions for the resource.
-        "#}.to_string(),
+            files, database schemas, or application-specific information. You must pass the
+            owning extension as `extension_name`; if you don't know which extension owns a
+            URI, call `list_resources` first — its output labels each resource with its
+            extension.
+        "#}
+                            .to_string(),
                             Arc::new(
                                 serde_json::to_value(schema_for!(ReadResourceParams))
                                     .expect("Failed to serialize schema")
                                     .as_object()
                                     .expect("Schema must be an object")
-                                    .clone()
+                                    .clone(),
                             ),
-                        ).annotate(ToolAnnotations {
-                            title: Some("Read a resource".to_string()),
-                            read_only_hint: Some(true),
-                            destructive_hint: Some(false),
-                            idempotent_hint: Some(false),
-                            open_world_hint: Some(false),
-                        }),
+                        )
+                        .annotate(ToolAnnotations::from_raw(
+                            Some("Read a resource".to_string()),
+                            Some(true),
+                            Some(false),
+                            Some(false),
+                            Some(false),
+                        )),
                     ]);
                 }
             }
@@ -428,12 +413,13 @@ impl McpClientTrait for ExtensionManagerClient {
 
     async fn call_tool(
         &self,
-        session_id: &str,
+        ctx: &ToolCallContext,
         name: &str,
         arguments: Option<JsonObject>,
-        _working_dir: Option<&str>,
         _cancellation_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
+        let session_id = &ctx.session_id;
         let result = match name {
             SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME => {
                 self.handle_search_available_extensions().await
@@ -448,12 +434,9 @@ impl McpClientTrait for ExtensionManagerClient {
 
         match result {
             Ok(content) => Ok(CallToolResult::success(content)),
-            Err(error) => Ok(CallToolResult {
-                content: vec![Content::text(error.to_string())],
-                is_error: Some(true),
-                structured_content: None,
-                meta: None,
-            }),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )])),
         }
     }
 

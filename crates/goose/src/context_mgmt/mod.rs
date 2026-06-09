@@ -2,12 +2,13 @@ use crate::conversation::message::{ActionRequiredData, MessageMetadata};
 use crate::conversation::message::{Message, MessageContent};
 use crate::conversation::{merge_consecutive_messages, Conversation};
 use crate::prompt_template::render_template;
+use crate::providers::base::Provider;
 #[cfg(test)]
 use crate::providers::base::{stream_from_single_message, MessageStream};
-use crate::providers::base::{Provider, ProviderUsage};
-use crate::providers::errors::ProviderError;
 use crate::{config::Config, token_counter::create_token_counter};
 use anyhow::Result;
+use goose_providers::conversation::token_usage::ProviderUsage;
+use goose_providers::errors::ProviderError;
 use indoc::indoc;
 use rmcp::model::Role;
 use serde::Serialize;
@@ -18,10 +19,13 @@ use tracing::log::warn;
 
 pub const DEFAULT_COMPACTION_THRESHOLD: f64 = 0.8;
 
-/// Feature flag to enable/disable tool pair summarization.
-/// Set to `false` to disable summarizing old tool call/response pairs.
-/// TODO: Re-enable once tool summarization stability issues are resolved.
-const ENABLE_TOOL_PAIR_SUMMARIZATION: bool = false;
+const TOOLCALL_SUMMARIZATION_BATCH_SIZE: usize = 10;
+
+fn tool_pair_summarization_enabled() -> bool {
+    Config::global()
+        .get_param::<bool>("GOOSE_TOOL_PAIR_SUMMARIZATION")
+        .unwrap_or(true)
+}
 
 const CONVERSATION_CONTINUATION_TEXT: &str =
     "Your context was compacted. The previous message contains a summary of the conversation so far.
@@ -140,7 +144,7 @@ pub async fn compact_messages(
             // This is the most recent message and we're preserving it by adding a fresh copy
             MessageMetadata::invisible()
         } else {
-            msg.metadata.with_agent_invisible()
+            msg.metadata.clone().with_agent_invisible()
         };
         let updated_msg = msg.clone().with_metadata(updated_metadata);
         final_messages.push(updated_msg);
@@ -185,6 +189,10 @@ pub async fn check_if_compaction_needed(
     threshold_override: Option<f64>,
     session: &crate::session::Session,
 ) -> Result<bool> {
+    if provider.manages_own_context() {
+        return Ok(false);
+    }
+
     let messages = conversation.messages();
     let config = Config::global();
     let threshold = threshold_override.unwrap_or_else(|| {
@@ -312,10 +320,15 @@ async fn do_compact(
             Ok((mut response, mut provider_usage)) => {
                 response.role = Role::User;
 
-                provider_usage
-                    .ensure_tokens(&system_prompt, &summarization_request, &response, &[])
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to ensure usage tokens: {}", e))?;
+                crate::providers::usage_estimator::ensure_usage_tokens(
+                    &mut provider_usage,
+                    &system_prompt,
+                    &summarization_request,
+                    &response,
+                    &[],
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to ensure usage tokens: {}", e))?;
 
                 return Ok((response, provider_usage));
             }
@@ -339,7 +352,7 @@ async fn do_compact(
     ))
 }
 
-fn format_message_for_compacting(msg: &Message) -> String {
+pub fn format_message_for_compacting(msg: &Message) -> String {
     let content_parts: Vec<String> = msg
         .content
         .iter()
@@ -403,7 +416,6 @@ fn format_message_for_compacting(msg: &Message) -> String {
             MessageContent::SystemNotification(notification) => {
                 Some(format!("system_notification: {}", notification.msg))
             }
-            MessageContent::Reasoning(_) => None,
         })
         .collect();
 
@@ -419,13 +431,24 @@ fn format_message_for_compacting(msg: &Message) -> String {
     }
 }
 
-/// Find the id of a tool call to summarize. We only do this if we have more than
-/// cutoff tool calls that aren't summarized yet
-pub fn tool_id_to_summarize(conversation: &Conversation, cutoff: usize) -> Option<String> {
+pub fn compute_tool_call_cutoff(context_limit: usize, compaction_threshold: f64) -> usize {
+    let threshold = if compaction_threshold > 0.0 && compaction_threshold <= 1.0 {
+        compaction_threshold
+    } else {
+        DEFAULT_COMPACTION_THRESHOLD
+    };
+    let effective_limit = (context_limit as f64 * threshold) as usize;
+    (3 * effective_limit / 20_000).clamp(10, 500)
+}
+
+pub fn tool_ids_to_summarize(
+    conversation: &Conversation,
+    cutoff: usize,
+    protect_last_n: usize,
+) -> Vec<String> {
     let messages = conversation.messages();
 
-    let mut tool_call_count = 0;
-    let mut first_tool_call_id = None;
+    let mut tool_call_ids: Vec<String> = Vec::new();
 
     for msg in messages.iter() {
         if !msg.is_agent_visible() {
@@ -434,17 +457,21 @@ pub fn tool_id_to_summarize(conversation: &Conversation, cutoff: usize) -> Optio
 
         for content in &msg.content {
             if let MessageContent::ToolRequest(req) = content {
-                if first_tool_call_id.is_none() {
-                    first_tool_call_id = Some(req.id.clone());
-                }
-                tool_call_count += 1;
-                if tool_call_count > cutoff {
-                    return first_tool_call_id;
-                }
+                tool_call_ids.push(req.id.clone());
             }
         }
     }
-    None
+
+    // Never summarize the last N tool calls (current turn)
+    let eligible = tool_call_ids.len().saturating_sub(protect_last_n);
+    if eligible <= cutoff + TOOLCALL_SUMMARIZATION_BATCH_SIZE {
+        return Vec::new();
+    }
+
+    tool_call_ids
+        .into_iter()
+        .take(TOOLCALL_SUMMARIZATION_BATCH_SIZE)
+        .collect()
 }
 
 pub async fn summarize_tool_call(
@@ -483,17 +510,16 @@ pub async fn summarize_tool_call(
     let summarization_request = vec![user_message];
 
     let system_prompt = indoc! {r#"
-                Your task is to summarize a tool call & response pair to save tokens
+                Your task is to summarize a tool call & response pair to save tokens.
 
-                reply with a single message that describe what happened. Typically a toolcall
-                is asks for something using a bunch of parameters and then the result is also some
+                Reply with a single message that describes what happened. Typically a tool call
+                asks for something using a bunch of parameters and then the result is also some
                 structured output. So the tool might ask to look up something on github and the
                 reply might be a json document. So you could reply with something like:
 
                 "A call to github was made to get the project status"
 
                 if that is what it was.
-
             "#};
 
     let (mut response, _) = provider
@@ -507,43 +533,69 @@ pub async fn summarize_tool_call(
     Ok(response.with_generated_id())
 }
 
-pub fn maybe_summarize_tool_pair(
+pub fn maybe_summarize_tool_pairs(
     provider: Arc<dyn Provider>,
     session_id: String,
     conversation: Conversation,
     cutoff: usize,
-) -> JoinHandle<Option<(Message, String)>> {
-    tokio::spawn(async move {
-        // Tool pair summarization is currently disabled via feature flag.
-        // See ENABLE_TOOL_PAIR_SUMMARIZATION constant above.
-        if !ENABLE_TOOL_PAIR_SUMMARIZATION {
-            return None;
-        }
+    protect_last_n: usize,
+) -> Option<JoinHandle<Vec<(Message, String)>>> {
+    if !tool_pair_summarization_enabled() || provider.manages_own_context() {
+        return None;
+    }
 
-        if let Some(tool_id) = tool_id_to_summarize(&conversation, cutoff) {
+    let tool_ids = tool_ids_to_summarize(&conversation, cutoff, protect_last_n);
+    if tool_ids.is_empty() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let mut results = Vec::new();
+        for tool_id in tool_ids {
             match summarize_tool_call(provider.as_ref(), &session_id, &conversation, &tool_id).await
             {
-                Ok(summary) => Some((summary, tool_id)),
+                Ok(summary) => results.push((summary, tool_id)),
                 Err(e) => {
                     warn!("Failed to summarize tool pair: {}", e);
-                    None
                 }
             }
-        } else {
-            None
         }
-    })
+        results
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        model::ModelConfig,
-        providers::{base::Usage, errors::ProviderError},
-    };
+    use crate::model::ModelConfig;
     use async_trait::async_trait;
+    use goose_providers::conversation::token_usage::Usage;
+    use goose_providers::errors::ProviderError;
     use rmcp::model::{AnnotateAble, CallToolRequestParams, RawContent, Tool};
+
+    fn create_tool_pair(
+        call_id: &str,
+        response_id: &str,
+        tool_name: &str,
+        response_text: &str,
+    ) -> Vec<Message> {
+        vec![
+            Message::assistant()
+                .with_tool_request(
+                    call_id,
+                    Ok(CallToolRequestParams::new(tool_name.to_string())),
+                )
+                .with_id(call_id),
+            Message::user()
+                .with_tool_response(
+                    call_id,
+                    Ok(rmcp::model::CallToolResult::success(vec![
+                        RawContent::text(response_text).no_annotation(),
+                    ])),
+                )
+                .with_id(response_id),
+        ]
+    }
 
     struct MockProvider {
         message: Message,
@@ -625,23 +677,13 @@ mod tests {
         let provider = MockProvider::new(response_message, 1);
         let basic_conversation = vec![
             Message::user().with_text("read hello.txt"),
-            Message::assistant().with_tool_request(
-                "tool_0",
-                Ok(CallToolRequestParams {
-                    meta: None,
-                    task: None,
-                    name: "read_file".into(),
-                    arguments: None,
-                }),
-            ),
+            Message::assistant()
+                .with_tool_request("tool_0", Ok(CallToolRequestParams::new("read_file"))),
             Message::user().with_tool_response(
                 "tool_0",
-                Ok(rmcp::model::CallToolResult {
-                    content: vec![RawContent::text("hello, world").no_annotation()],
-                    structured_content: None,
-                    is_error: Some(false),
-                    meta: None,
-                }),
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    RawContent::text("hello, world").no_annotation(),
+                ])),
             ),
         ];
 
@@ -668,21 +710,13 @@ mod tests {
         for i in 0..10 {
             messages.push(Message::assistant().with_tool_request(
                 format!("tool_{}", i),
-                Ok(CallToolRequestParams {
-                    meta: None,
-                    task: None,
-                    name: "read_file".into(),
-                    arguments: None,
-                }),
+                Ok(CallToolRequestParams::new("read_file")),
             ));
             messages.push(Message::user().with_tool_response(
                 format!("tool_{}", i),
-                Ok(rmcp::model::CallToolResult {
-                    content: vec![RawContent::text(format!("response{}", i)).no_annotation()],
-                    structured_content: None,
-                    is_error: Some(false),
-                    meta: None,
-                }),
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    RawContent::text(format!("response{}", i)).no_annotation(),
+                ])),
             ));
         }
 
@@ -696,133 +730,86 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_tool_pair_summarization_workflow() {
-        fn create_tool_pair(
-            call_id: &str,
-            response_id: &str,
-            tool_name: &str,
-            response_text: &str,
-        ) -> Vec<Message> {
-            vec![
-                Message::assistant()
-                    .with_tool_request(
-                        call_id,
-                        Ok(CallToolRequestParams {
-                            task: None,
-                            name: tool_name.to_string().into(),
-                            arguments: None,
-                            meta: None,
-                        }),
-                    )
-                    .with_id(call_id),
-                Message::user()
-                    .with_tool_response(
-                        call_id,
-                        Ok(rmcp::model::CallToolResult {
-                            content: vec![RawContent::text(response_text).no_annotation()],
-                            structured_content: None,
-                            is_error: Some(false),
-                            meta: None,
-                        }),
-                    )
-                    .with_id(response_id),
-            ]
+    #[test]
+    fn test_compute_tool_call_cutoff_scales_with_context() {
+        // Default threshold (0.8)
+        assert_eq!(compute_tool_call_cutoff(128_000, 0.8), 15); // 102K effective
+        assert_eq!(compute_tool_call_cutoff(200_000, 0.8), 24); // 160K effective
+        assert_eq!(compute_tool_call_cutoff(1_000_000, 0.8), 120); // 800K effective
+                                                                   // Clamp at minimum
+        assert_eq!(compute_tool_call_cutoff(50_000, 0.8), 10);
+        assert_eq!(compute_tool_call_cutoff(10_000, 0.8), 10);
+        // Clamp at maximum (500)
+        assert_eq!(compute_tool_call_cutoff(10_000_000, 0.8), 500);
+        // Lower compaction threshold means earlier summarization
+        assert_eq!(compute_tool_call_cutoff(200_000, 0.3), 10); // 60K effective
+        assert_eq!(compute_tool_call_cutoff(1_000_000, 0.5), 75); // 500K effective
+                                                                  // Invalid threshold falls back to default 0.8
+        assert_eq!(compute_tool_call_cutoff(200_000, 0.0), 24); // falls back to 0.8
+        assert_eq!(compute_tool_call_cutoff(200_000, -1.0), 24); // falls back to 0.8
+    }
+
+    #[test]
+    fn test_tool_ids_to_summarize_triggers_at_cutoff_plus_batch() {
+        // cutoff=5, so we need >5+10=15 to trigger. 15 exactly should NOT trigger.
+        let mut messages = vec![Message::user().with_text("hello")];
+        for i in 0..15 {
+            messages.extend(create_tool_pair(
+                &format!("call{}", i),
+                &format!("resp{}", i),
+                "read_file",
+                "content",
+            ));
         }
+        let conversation = Conversation::new_unvalidated(messages);
+        let result = tool_ids_to_summarize(&conversation, 5, 0);
+        assert!(result.is_empty(), "Exactly cutoff+batch should not trigger");
 
-        let summary_response = Message::assistant()
-            .with_text("Tool call to list files and response with file listing");
-        let provider = MockProvider::new(summary_response, 1000);
+        // 16 tool calls: now exceeds cutoff+10, should return a batch of 10
+        let mut messages = vec![Message::user().with_text("hello")];
+        for i in 0..16 {
+            messages.extend(create_tool_pair(
+                &format!("call{}", i),
+                &format!("resp{}", i),
+                "read_file",
+                "content",
+            ));
+        }
+        let conversation = Conversation::new_unvalidated(messages);
+        let result = tool_ids_to_summarize(&conversation, 5, 0);
+        assert_eq!(result.len(), TOOLCALL_SUMMARIZATION_BATCH_SIZE);
+        assert_eq!(result[0], "call0");
+        assert_eq!(result[9], "call9");
+    }
 
-        let mut messages = vec![Message::user().with_text("list files").with_id("msg_1")];
-        messages.extend(create_tool_pair(
-            "call1",
-            "response1",
-            "shell",
-            "file1.txt\nfile2.txt",
-        ));
-        messages.extend(create_tool_pair(
-            "call2",
-            "response2",
-            "read_file",
-            "content of file1",
-        ));
-        messages.extend(create_tool_pair(
-            "call3",
-            "response3",
-            "read_file",
-            "content of file2",
-        ));
-
+    #[test]
+    fn test_tool_ids_to_summarize_protects_current_turn() {
+        // 20 tool pairs, cutoff=2 → 20 > 12, would normally trigger
+        let mut messages = vec![Message::user().with_text("hello")];
+        for i in 0..20 {
+            messages.extend(create_tool_pair(
+                &format!("call{}", i),
+                &format!("resp{}", i),
+                "read_file",
+                "content",
+            ));
+        }
         let conversation = Conversation::new_unvalidated(messages);
 
-        let result = tool_id_to_summarize(&conversation, 2);
+        // No protection: 20 eligible, 20 > 12 → batch of 10
+        let result = tool_ids_to_summarize(&conversation, 2, 0);
+        assert_eq!(result.len(), TOOLCALL_SUMMARIZATION_BATCH_SIZE);
+
+        // Protect last 8: 12 eligible, 12 <= 12 → nothing
+        let result = tool_ids_to_summarize(&conversation, 2, 8);
         assert!(
-            result.is_some(),
-            "Should return a pair to summarize when tool calls exceed cutoff"
+            result.is_empty(),
+            "Should not summarize when protected count leaves eligible <= cutoff + batch"
         );
 
-        let tool_call_id = result.unwrap();
-        assert_eq!(tool_call_id, "call1");
-
-        let summary = summarize_tool_call(&provider, "test-session", &conversation, &tool_call_id)
-            .await
-            .unwrap();
-
-        assert_eq!(summary.role, Role::User);
-        assert!(summary.metadata.agent_visible);
-        assert!(!summary.metadata.user_visible);
-
-        let mut updated_messages = conversation.messages().clone();
-        for msg in updated_messages.iter_mut() {
-            let has_matching_content = msg.content.iter().any(|c| match c {
-                MessageContent::ToolRequest(req) => req.id == tool_call_id,
-                MessageContent::ToolResponse(resp) => resp.id == tool_call_id,
-                _ => false,
-            });
-
-            if has_matching_content {
-                msg.metadata = msg.metadata.with_agent_invisible();
-            }
-        }
-
-        updated_messages.push(summary);
-
-        let updated_conversation = Conversation::new_unvalidated(updated_messages);
-        let messages = updated_conversation.messages();
-
-        let call1_msg = messages
-            .iter()
-            .find(|m| m.id.as_deref() == Some("call1"))
-            .unwrap();
-        assert!(
-            !call1_msg.is_agent_visible(),
-            "Original call should not be agent visible"
-        );
-
-        let response1_msg = messages
-            .iter()
-            .find(|m| m.id.as_deref() == Some("response1"))
-            .unwrap();
-        assert!(
-            !response1_msg.is_agent_visible(),
-            "Original response should not be agent visible"
-        );
-
-        let summary_msg = messages
-            .iter()
-            .find(|m| {
-                m.metadata.agent_visible
-                    && !m.metadata.user_visible
-                    && m.as_concat_text().contains("Tool call")
-            })
-            .unwrap();
-        assert!(
-            !summary_msg.is_user_visible(),
-            "Summary should not be user visible"
-        );
-
-        let result = tool_id_to_summarize(&updated_conversation, 3);
-        assert!(result.is_none(), "Nothing left to summarize");
+        // Protect last 7: 13 eligible, 13 > 12 → batch of 10
+        let result = tool_ids_to_summarize(&conversation, 2, 7);
+        assert_eq!(result.len(), TOOLCALL_SUMMARIZATION_BATCH_SIZE);
+        assert_eq!(result[0], "call0");
     }
 }

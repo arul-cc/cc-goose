@@ -14,7 +14,8 @@
  * - Configurable batch size and delay
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { defineMessages, useIntl } from '../i18n';
 import { Message, SystemNotificationContent } from '../api';
 import GooseMessage from './GooseMessage';
 import UserMessage from './UserMessage';
@@ -30,6 +31,22 @@ import { NotificationEvent } from '../types/message';
 import LoadingGoose from './LoadingGoose';
 import { ChatType } from '../types/chat';
 import { identifyConsecutiveToolCalls, isInChain } from '../utils/toolCallChaining';
+import { getModelDisplayName } from './settings/models/predefinedModelsUtils';
+
+const i18n = defineMessages({
+  loadingMessages: {
+    id: 'progressiveMessageList.loadingMessages',
+    defaultMessage: 'Loading messages... ({renderedCount}/{totalCount})',
+  },
+  searchHint: {
+    id: 'progressiveMessageList.searchHint',
+    defaultMessage: 'Press Cmd/Ctrl+F to load all messages immediately for search',
+  },
+  modelChanged: {
+    id: 'progressiveMessageList.modelChanged',
+    defaultMessage: 'Model changed: {previousModel} → {currentModel}',
+  },
+});
 
 interface ProgressiveMessageListProps {
   messages: Message[];
@@ -66,6 +83,7 @@ export default function ProgressiveMessageList({
   onRenderingComplete,
   submitElicitationResponse,
 }: ProgressiveMessageListProps) {
+  const intl = useIntl();
   const [renderedCount, setRenderedCount] = useState(() => {
     // Initialize with either all messages (if small) or first batch (if large)
     return messages.length <= showLoadingThreshold
@@ -77,6 +95,37 @@ export default function ProgressiveMessageList({
   const mountedRef = useRef(true);
   const hasOnlyToolResponses = (message: Message) =>
     message.content.every((c) => c.type === 'toolResponse');
+
+  const getResolvedModel = useCallback((message: Message): string | null => {
+    if (message.role !== 'assistant' || !message.metadata.userVisible) return null;
+    return message.metadata.inference?.resolvedModel ?? null;
+  }, []);
+
+  const getPreviousResolvedModel = useCallback(
+    (index: number): string | null => {
+      for (let i = index - 1; i >= 0; i--) {
+        const model = getResolvedModel(messages[i]);
+        if (model) return model;
+      }
+      return null;
+    },
+    [getResolvedModel, messages]
+  );
+
+  const renderModelChangeDisclosure = useCallback(
+    (previousModel: string, currentModel: string) => (
+      <SystemNotificationInline
+        notification={{
+          msg: intl.formatMessage(i18n.modelChanged, {
+            previousModel: getModelDisplayName(previousModel),
+            currentModel: getModelDisplayName(currentModel),
+          }),
+          notificationType: 'inlineMessage',
+        }}
+      />
+    ),
+    [intl]
+  );
 
   const getSystemNotification = (message: Message): SystemNotificationContent | undefined => {
     return getCreditsExhaustedNotification(message) ?? getInlineSystemNotification(message);
@@ -218,34 +267,46 @@ export default function ProgressiveMessageList({
 
         const isUser = isUserMessage(message);
         const messageIsInChain = isInChain(index, toolCallChains);
+        const currentResolvedModel = getResolvedModel(message);
+        const previousResolvedModel = currentResolvedModel ? getPreviousResolvedModel(index) : null;
+        const showModelChangeDisclosure = Boolean(
+          currentResolvedModel &&
+            previousResolvedModel &&
+            currentResolvedModel !== previousResolvedModel
+        );
+
+        const messageKey = message.id ?? `msg-${index}-${message.created}`;
 
         return (
-          <div
-            key={message.id ?? `msg-${index}-${message.created}`}
-            className={`relative ${index === 0 ? 'mt-0' : 'mt-4'} ${isUser ? 'user' : 'assistant'} ${messageIsInChain ? 'in-chain' : ''}`}
-            data-testid="message-container"
-          >
-            {isUser ? (
-              !hasOnlyToolResponses(message) && (
-                <UserMessage message={message} onMessageUpdate={onMessageUpdate} />
-              )
-            ) : (
-              <GooseMessage
-                sessionId={chat.sessionId}
-                message={message}
-                messages={messages}
-                append={append}
-                toolCallNotifications={toolCallNotifications}
-                isStreaming={
-                  isStreamingMessage &&
-                  !isUser &&
-                  index === messagesToRender.length - 1 &&
-                  message.role === 'assistant'
-                }
-                submitElicitationResponse={submitElicitationResponse}
-              />
-            )}
-          </div>
+          <Fragment key={messageKey}>
+            {showModelChangeDisclosure && currentResolvedModel && previousResolvedModel &&
+              renderModelChangeDisclosure(previousResolvedModel, currentResolvedModel)}
+            <div
+              className={`relative ${index === 0 ? 'mt-0' : 'mt-4'} ${isUser ? 'user' : 'assistant'} ${messageIsInChain ? 'in-chain' : ''}`}
+              data-testid="message-container"
+            >
+              {isUser ? (
+                !hasOnlyToolResponses(message) && (
+                  <UserMessage message={message} onMessageUpdate={onMessageUpdate} />
+                )
+              ) : (
+                <GooseMessage
+                  sessionId={chat.sessionId}
+                  message={message}
+                  messages={messages}
+                  append={append}
+                  toolCallNotifications={toolCallNotifications}
+                  isStreaming={
+                    isStreamingMessage &&
+                    !isUser &&
+                    index === messagesToRender.length - 1 &&
+                    message.role === 'assistant'
+                  }
+                  submitElicitationResponse={submitElicitationResponse}
+                />
+              )}
+            </div>
+          </Fragment>
         );
       })
       .filter(Boolean);
@@ -261,6 +322,9 @@ export default function ProgressiveMessageList({
     onMessageUpdate,
     toolCallChains,
     submitElicitationResponse,
+    getPreviousResolvedModel,
+    getResolvedModel,
+    renderModelChangeDisclosure,
   ]);
 
   return (
@@ -270,9 +334,14 @@ export default function ProgressiveMessageList({
       {/* Loading indicator when progressively rendering */}
       {isLoading && (
         <div className="flex flex-col items-center justify-center py-8">
-          <LoadingGoose message={`Loading messages... (${renderedCount}/${messages.length})`} />
+          <LoadingGoose
+            message={intl.formatMessage(i18n.loadingMessages, {
+              renderedCount,
+              totalCount: messages.length,
+            })}
+          />
           <div className="text-xs text-text-secondary mt-2">
-            Press Cmd/Ctrl+F to load all messages immediately for search
+            {intl.formatMessage(i18n.searchHint)}
           </div>
         </div>
       )}

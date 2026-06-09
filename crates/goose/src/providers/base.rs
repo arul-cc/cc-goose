@@ -2,13 +2,21 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::Stream;
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::errors::ProviderError;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+/// Default HTTP timeout for all provider API calls.
+/// Long-running model inference can take several minutes, so we allow up to 10 minutes
+/// before giving up. Individual providers may override this via their own config key.
+pub const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 600;
+
 use super::canonical::{map_to_canonical_model, CanonicalModelRegistry};
-use super::errors::ProviderError;
+use super::inventory::{default_inventory_identity, InventoryIdentityInput};
 use super::retry::RetryConfig;
 use crate::config::base::ConfigValue;
-use crate::config::ExtensionConfig;
+use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent};
 use crate::conversation::Conversation;
 use crate::model::ModelConfig;
@@ -18,11 +26,12 @@ use rmcp::model::Tool;
 use utoipa::ToSchema;
 
 use once_cell::sync::Lazy;
-use regex::Regex;
-use std::ops::{Add, AddAssign};
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+
+/// A global store for the current model being used, we use this as when a provider returns, it tells us the real model, not an alias
+pub static CURRENT_MODEL: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 fn strip_xml_tags(text: &str) -> String {
     static BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -86,21 +95,6 @@ fn extract_short_title(text: &str) -> String {
     text.to_string()
 }
 
-/// A global store for the current model being used, we use this as when a provider returns, it tells us the real model, not an alias
-pub static CURRENT_MODEL: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
-
-/// Set the current model in the global store
-pub fn set_current_model(model: &str) {
-    if let Ok(mut current_model) = CURRENT_MODEL.lock() {
-        *current_model = Some(model.to_string());
-    }
-}
-
-/// Get the current model from the global store, the real model, not an alias
-pub fn get_current_model() -> Option<String> {
-    CURRENT_MODEL.lock().ok().and_then(|model| model.clone())
-}
-
 pub static MSG_COUNT_FOR_SESSION_NAME_GENERATION: usize = 3;
 
 /// Information about a model's capabilities
@@ -108,6 +102,9 @@ pub static MSG_COUNT_FOR_SESSION_NAME_GENERATION: usize = 3;
 pub struct ModelInfo {
     /// The name of the model
     pub name: String,
+    /// The underlying model resolved from provider metadata, when the configured model is an alias or endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
     /// The maximum context length this model supports
     pub context_limit: usize,
     /// Cost per token for input in USD (optional)
@@ -118,6 +115,9 @@ pub struct ModelInfo {
     pub currency: Option<String>,
     /// Whether this model supports cache control
     pub supports_cache_control: Option<bool>,
+    /// Whether this model supports reasoning/thinking controls
+    #[serde(default)]
+    pub reasoning: bool,
 }
 
 impl ModelInfo {
@@ -125,11 +125,13 @@ impl ModelInfo {
     pub fn new(name: impl Into<String>, context_limit: usize) -> Self {
         Self {
             name: name.into(),
+            resolved_model: None,
             context_limit,
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            reasoning: false,
         }
     }
 
@@ -142,12 +144,41 @@ impl ModelInfo {
     ) -> Self {
         Self {
             name: name.into(),
+            resolved_model: None,
             context_limit,
             input_token_cost: Some(input_cost),
             output_token_cost: Some(output_cost),
             currency: Some("$".to_string()),
             supports_cache_control: None,
+            reasoning: false,
         }
+    }
+}
+
+fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> ModelInfo {
+    let registry = CanonicalModelRegistry::bundled().ok();
+    let canonical = registry.as_ref().and_then(|registry| {
+        let canonical_id = map_to_canonical_model(provider_name, model_name, registry)?;
+        let (provider, model) = canonical_id.split_once('/')?;
+        registry.get(provider, model)
+    });
+
+    let reasoning = canonical
+        .as_ref()
+        .and_then(|model| model.reasoning)
+        .unwrap_or_else(|| ModelConfig::new_or_fail(model_name).is_reasoning_model());
+
+    ModelInfo {
+        name: model_name.to_string(),
+        resolved_model: None,
+        context_limit: ModelConfig::new_or_fail(model_name)
+            .with_canonical_limits(provider_name)
+            .context_limit(),
+        input_token_cost: None,
+        output_token_cost: None,
+        currency: None,
+        supports_cache_control: None,
+        reasoning,
     }
 }
 
@@ -176,6 +207,12 @@ pub struct ProviderMetadata {
     pub model_doc_link: String,
     /// Required configuration keys
     pub config_keys: Vec<ConfigKey>,
+    /// step-by-step instructions for set up providers eg: api key
+    #[serde(default)]
+    pub setup_steps: Vec<String>,
+    /// Hint shown in the model picker when this provider manages its own model selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection_hint: Option<String>,
 }
 
 impl ProviderMetadata {
@@ -195,19 +232,12 @@ impl ProviderMetadata {
             default_model: default_model.to_string(),
             known_models: model_names
                 .iter()
-                .map(|&model_name| ModelInfo {
-                    name: model_name.to_string(),
-                    context_limit: ModelConfig::new_or_fail(model_name)
-                        .with_canonical_limits(name)
-                        .context_limit(),
-                    input_token_cost: None,
-                    output_token_cost: None,
-                    currency: None,
-                    supports_cache_control: None,
-                })
+                .map(|&model_name| model_info_for_provider_model(name, model_name))
                 .collect(),
             model_doc_link: model_doc_link.to_string(),
             config_keys,
+            setup_steps: vec![],
+            model_selection_hint: None,
         }
     }
 
@@ -228,6 +258,8 @@ impl ProviderMetadata {
             known_models: models,
             model_doc_link: model_doc_link.to_string(),
             config_keys,
+            setup_steps: vec![],
+            model_selection_hint: None,
         }
     }
 
@@ -240,7 +272,19 @@ impl ProviderMetadata {
             known_models: vec![],
             model_doc_link: "".to_string(),
             config_keys: vec![],
+            setup_steps: vec![],
+            model_selection_hint: None,
         }
+    }
+
+    pub fn with_setup_steps(mut self, steps: Vec<&str>) -> Self {
+        self.setup_steps = steps.into_iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_model_selection_hint(mut self, hint: &str) -> Self {
+        self.model_selection_hint = Some(hint.to_string());
+        self
     }
 }
 
@@ -255,9 +299,13 @@ pub struct ConfigKey {
     pub secret: bool,
     /// Optional default value for the key
     pub default: Option<String>,
-    /// Whether this key should be configured using OAuth device code flow
+    /// Whether this key should be configured using an OAuth flow
     /// When true, the provider's configure_oauth() method will be called instead of prompting for manual input
     pub oauth_flow: bool,
+    /// Whether this OAuth flow uses the device code grant (RFC 8628)
+    /// When true, the user must enter a verification code in the browser
+    #[serde(default)]
+    pub device_code_flow: bool,
     /// Whether this key should be shown prominently during provider setup
     /// (onboarding, settings modal, CLI configure)
     #[serde(default)]
@@ -279,6 +327,7 @@ impl ConfigKey {
             secret,
             default: default.map(|s| s.to_string()),
             oauth_flow: false,
+            device_code_flow: false,
             primary,
         }
     }
@@ -290,11 +339,12 @@ impl ConfigKey {
             secret,
             default: Some(T::DEFAULT.to_string()),
             oauth_flow: false,
+            device_code_flow: false,
             primary,
         }
     }
 
-    /// Create a new ConfigKey that uses OAuth device code flow for configuration
+    /// Create a new ConfigKey that uses an OAuth flow for configuration
     ///
     /// This is used for providers that support OAuth authentication instead of manual API key entry.
     /// When oauth_flow is true, the configuration system will call the provider's configure_oauth() method.
@@ -311,111 +361,36 @@ impl ConfigKey {
             secret,
             default: default.map(|s| s.to_string()),
             oauth_flow: true,
+            device_code_flow: false,
+            primary,
+        }
+    }
+
+    /// Create a new ConfigKey that uses OAuth device code flow (RFC 8628) for configuration
+    ///
+    /// Similar to new_oauth, but indicates the provider uses the device code grant where the user
+    /// must enter a verification code in the browser.
+    pub fn new_oauth_device_code(
+        name: &str,
+        required: bool,
+        secret: bool,
+        default: Option<&str>,
+        primary: bool,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            required,
+            secret,
+            default: default.map(|s| s.to_string()),
+            oauth_flow: true,
+            device_code_flow: true,
             primary,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderUsage {
-    pub model: String,
-    pub usage: Usage,
-}
-
-impl ProviderUsage {
-    pub fn new(model: String, usage: Usage) -> Self {
-        Self { model, usage }
-    }
-
-    /// Ensures this ProviderUsage has token counts, estimating them if necessary
-    pub async fn ensure_tokens(
-        &mut self,
-        system_prompt: &str,
-        request_messages: &[Message],
-        response: &Message,
-        tools: &[Tool],
-    ) -> Result<(), ProviderError> {
-        crate::providers::usage_estimator::ensure_usage_tokens(
-            self,
-            system_prompt,
-            request_messages,
-            response,
-            tools,
-        )
-        .await
-        .map_err(|e| ProviderError::ExecutionError(format!("Failed to ensure usage tokens: {}", e)))
-    }
-
-    /// Combine this ProviderUsage with another, adding their token counts
-    /// Uses the model from this ProviderUsage
-    pub fn combine_with(&self, other: &ProviderUsage) -> ProviderUsage {
-        ProviderUsage {
-            model: self.model.clone(),
-            usage: self.usage + other.usage,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Copy)]
-pub struct Usage {
-    pub input_tokens: Option<i32>,
-    pub output_tokens: Option<i32>,
-    pub total_tokens: Option<i32>,
-}
-
-fn sum_optionals<T>(a: Option<T>, b: Option<T>) -> Option<T>
-where
-    T: Add<Output = T> + Default,
-{
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x + y),
-        (Some(x), None) => Some(x + T::default()),
-        (None, Some(y)) => Some(T::default() + y),
-        (None, None) => None,
-    }
-}
-
-impl Add for Usage {
-    type Output = Self;
-
-    fn add(self, other: Self) -> Self {
-        Self::new(
-            sum_optionals(self.input_tokens, other.input_tokens),
-            sum_optionals(self.output_tokens, other.output_tokens),
-            sum_optionals(self.total_tokens, other.total_tokens),
-        )
-    }
-}
-
-impl AddAssign for Usage {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
-}
-
-impl Usage {
-    pub fn new(
-        input_tokens: Option<i32>,
-        output_tokens: Option<i32>,
-        total_tokens: Option<i32>,
-    ) -> Self {
-        let calculated_total = if total_tokens.is_none() {
-            match (input_tokens, output_tokens) {
-                (Some(input), Some(output)) => Some(input + output),
-                (Some(input), None) => Some(input),
-                (None, Some(output)) => Some(output),
-                (None, None) => None,
-            }
-        } else {
-            total_tokens
-        };
-
-        Self {
-            input_tokens,
-            output_tokens,
-            total_tokens: calculated_total,
-        }
-    }
+pub(crate) fn current_working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 pub trait ProviderDef: Send + Sync {
@@ -431,24 +406,53 @@ pub trait ProviderDef: Send + Sync {
     ) -> BoxFuture<'static, Result<Self::Provider>>
     where
         Self: Sized;
+
+    fn from_env_with_working_dir(
+        model: ModelConfig,
+        extensions: Vec<ExtensionConfig>,
+        _working_dir: PathBuf,
+    ) -> BoxFuture<'static, Result<Self::Provider>>
+    where
+        Self: Sized,
+    {
+        // ACP subprocess providers must override this so session cwd is preserved.
+        // Non-subprocess providers can rely on the default because cwd is irrelevant.
+        Self::from_env(model, extensions)
+    }
+
+    fn supports_inventory_refresh() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    fn inventory_identity() -> Result<InventoryIdentityInput>
+    where
+        Self: Sized,
+    {
+        let metadata = Self::metadata();
+        Ok(default_inventory_identity(
+            &metadata.name,
+            &metadata.name,
+            &metadata.config_keys,
+            Config::global(),
+        ))
+    }
+
+    fn inventory_configured() -> bool
+    where
+        Self: Sized,
+    {
+        let metadata = Self::metadata();
+        super::inventory::default_inventory_configured(&metadata.config_keys, Config::global())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionRouting {
     ActionRequired,
     Noop,
-}
-
-/// Trait for LeadWorkerProvider-specific functionality
-pub trait LeadWorkerProviderTrait {
-    /// Get information about the lead and worker models for logging
-    fn get_model_info(&self) -> (String, String);
-
-    /// Get the currently active model name
-    fn get_active_model(&self) -> String;
-
-    /// Get (lead_turns, failure_threshold, fallback_turns)
-    fn get_settings(&self) -> (usize, usize, usize);
 }
 
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
@@ -458,6 +462,10 @@ pub trait Provider: Send + Sync {
     fn get_name(&self) -> &str;
 
     /// Primary streaming method that all providers must implement.
+    ///
+    /// Note: Do not add `#[instrument]` here — the call sites (`complete` and
+    /// `stream_response_from_provider`) create the telemetry span so that
+    /// `session.id` is set once rather than in every provider.
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -468,6 +476,10 @@ pub trait Provider: Send + Sync {
     ) -> Result<MessageStream, ProviderError>;
 
     /// Complete with a specific model config.
+    #[tracing::instrument(
+        skip(self, model_config, session_id, system, messages, tools),
+        fields(session.id = %session_id, gen_ai.request.model = %model_config.model_name)
+    )]
     async fn complete(
         &self,
         model_config: &ModelConfig,
@@ -527,9 +539,30 @@ pub trait Provider: Send + Sync {
         Ok(vec![])
     }
 
-    /// Fetch models filtered by canonical registry and usability
+    async fn fetch_supported_model_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(self
+            .fetch_supported_models()
+            .await?
+            .iter()
+            .map(|model_name| model_info_for_provider_model(self.get_name(), model_name))
+            .collect())
+    }
+
+    async fn fetch_model_info(&self, model_name: &str) -> Result<ModelInfo, ProviderError> {
+        Ok(model_info_for_provider_model(self.get_name(), model_name))
+    }
+
+    fn skip_canonical_filtering(&self) -> bool {
+        false
+    }
+
+    /// Fetch inventory models filtered by canonical registry and usability.
     async fn fetch_recommended_models(&self) -> Result<Vec<String>, ProviderError> {
         let all_models = self.fetch_supported_models().await?;
+
+        if self.skip_canonical_filtering() {
+            return Ok(all_models);
+        }
 
         let registry = CanonicalModelRegistry::bundled().map_err(|e| {
             ProviderError::ExecutionError(format!("Failed to load canonical registry: {}", e))
@@ -572,16 +605,25 @@ pub trait Provider: Send + Sync {
             (None, None) => a.0.cmp(&b.0),
         });
 
-        let recommended_models: Vec<String> = models_with_dates
+        let inventory_models: Vec<String> = models_with_dates
             .into_iter()
             .map(|(name, _)| name)
             .collect();
 
-        if recommended_models.is_empty() {
+        if inventory_models.is_empty() {
             Ok(all_models)
         } else {
-            Ok(recommended_models)
+            Ok(inventory_models)
         }
+    }
+
+    async fn fetch_recommended_model_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(self
+            .fetch_recommended_models()
+            .await?
+            .iter()
+            .map(|model_name| model_info_for_provider_model(self.get_name(), model_name))
+            .collect())
     }
 
     async fn map_to_canonical_model(
@@ -603,6 +645,14 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether the provider manages its own conversation context (e.g. CLI
+    /// wrappers like Claude Code or Gemini CLI). When true, goose-side
+    /// context management such as tool-pair summarization is skipped because
+    /// the provider's internal state is the source of truth.
+    fn manages_own_context(&self) -> bool {
+        false
+    }
+
     async fn supports_cache_control(&self) -> bool {
         false
     }
@@ -618,31 +668,42 @@ pub trait Provider: Send + Sync {
         ))
     }
 
-    /// Check if this provider is a LeadWorkerProvider
-    /// This is used for logging model information at startup
-    fn as_lead_worker(&self) -> Option<&dyn LeadWorkerProviderTrait> {
-        None
-    }
-
-    /// Get the currently active model name
-    /// For regular providers, this returns the configured model
-    /// For LeadWorkerProvider, this returns the currently active model (lead or worker)
-    fn get_active_model_name(&self) -> String {
-        if let Some(lead_worker) = self.as_lead_worker() {
-            lead_worker.get_active_model()
-        } else {
-            self.get_model_config().model_name
-        }
-    }
-
-    /// Returns the first 3 user messages as strings for session naming
+    /// Returns the first 3 user messages as strings for session naming,
+    /// filtering out assistant-only content (e.g. preprompt blocks).
     fn get_initial_user_messages(&self, messages: &Conversation) -> Vec<String> {
         messages
             .iter()
             .filter(|m| m.role == rmcp::model::Role::User)
             .take(MSG_COUNT_FOR_SESSION_NAME_GENERATION)
-            .map(|m| m.as_concat_text())
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|c| c.filter_for_audience(rmcp::model::Role::User))
+                    .filter_map(|c| c.as_text().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .collect()
+    }
+
+    /// Extracts preprompt context (assistant-audience blocks) from the first user message.
+    /// These are content blocks visible to the assistant but not the user.
+    fn get_preprompt_context(&self, messages: &Conversation) -> String {
+        messages
+            .iter()
+            .filter(|m| m.role == rmcp::model::Role::User)
+            .take(1)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| {
+                // If this block is NOT visible to the user, it's preprompt/assistant-only content
+                if c.filter_for_audience(rmcp::model::Role::User).is_none() {
+                    c.as_text().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Generate a session name/description based on the conversation history
@@ -653,15 +714,33 @@ pub trait Provider: Send + Sync {
         messages: &Conversation,
     ) -> Result<String, ProviderError> {
         let context = self.get_initial_user_messages(messages);
+        let preprompt_context = self.get_preprompt_context(messages);
         let system = crate::prompt_template::render_template(
             "session_name.md",
             &std::collections::HashMap::<String, String>::new(),
         )
         .map_err(|e| ProviderError::ContextLengthExceeded(e.to_string()))?;
 
+        use super::cli_common::{
+            SESSION_NAME_BEGIN_MARKER, SESSION_NAME_END_MARKER, SESSION_NAME_SUFFIX,
+        };
+
+        let preprompt_section = if preprompt_context.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "---BEGIN BACKGROUND CONTEXT (for understanding only, do NOT base the title on this)---\n{}\n---END BACKGROUND CONTEXT---\n\n",
+                preprompt_context
+            )
+        };
+
         let user_text = format!(
-            "---BEGIN USER MESSAGES---\n{}\n---END USER MESSAGES---\n\nGenerate a short title for the above messages.",
-            context.join("\n")
+            "{}{}\n{}\n{}\n\n{}",
+            preprompt_section,
+            SESSION_NAME_BEGIN_MARKER,
+            context.join("\n"),
+            SESSION_NAME_END_MARKER,
+            SESSION_NAME_SUFFIX,
         );
         let message = Message::user().with_text(&user_text);
         let result = self
@@ -697,6 +776,16 @@ pub trait Provider: Send + Sync {
         Err(ProviderError::ExecutionError(
             "OAuth configuration not supported by this provider".to_string(),
         ))
+    }
+
+    async fn refresh_credentials(&self) -> Result<(), ProviderError> {
+        Err(ProviderError::NotImplemented(
+            "credential refresh not supported by this provider".to_string(),
+        ))
+    }
+
+    async fn update_mode(&self, _session_id: &str, _mode: GooseMode) -> Result<(), ProviderError> {
+        Ok(())
     }
 
     fn permission_routing(&self) -> PermissionRouting {
@@ -781,8 +870,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use test_case::test_case;
-
-    use serde_json::json;
 
     #[test]
     fn test_strip_xml_tags() {
@@ -877,12 +964,10 @@ mod tests {
         if let Some(img_data) = s.strip_prefix("*img:") {
             MessageContent::image(format!("http://example.com/{}", img_data), "image/png")
         } else if let Some(tool_name) = s.strip_prefix("*tool:") {
-            let tool_call = Ok(rmcp::model::CallToolRequestParams {
-                meta: None,
-                task: None,
-                name: tool_name.to_string().into(),
-                arguments: Some(serde_json::Map::new()),
-            });
+            let tool_call = Ok(
+                rmcp::model::CallToolRequestParams::new(tool_name.to_string())
+                    .with_arguments(serde_json::Map::new()),
+            );
             MessageContent::tool_request(format!("tool_{}", tool_name), tool_call)
         } else {
             MessageContent::text(s)
@@ -959,42 +1044,6 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_serialization() -> Result<()> {
-        let usage = Usage::new(Some(10), Some(20), Some(30));
-        let serialized = serde_json::to_string(&usage)?;
-        let deserialized: Usage = serde_json::from_str(&serialized)?;
-
-        assert_eq!(usage.input_tokens, deserialized.input_tokens);
-        assert_eq!(usage.output_tokens, deserialized.output_tokens);
-        assert_eq!(usage.total_tokens, deserialized.total_tokens);
-
-        // Test JSON structure
-        let json_value: serde_json::Value = serde_json::from_str(&serialized)?;
-        assert_eq!(json_value["input_tokens"], json!(10));
-        assert_eq!(json_value["output_tokens"], json!(20));
-        assert_eq!(json_value["total_tokens"], json!(30));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_set_and_get_current_model() {
-        // Set the model
-        set_current_model("gpt-4o");
-
-        // Get the model and verify
-        let model = get_current_model();
-        assert_eq!(model, Some("gpt-4o".to_string()));
-
-        // Change the model
-        set_current_model("claude-sonnet-4-20250514");
-
-        // Get the updated model and verify
-        let model = get_current_model();
-        assert_eq!(model, Some("claude-sonnet-4-20250514".to_string()));
-    }
-
-    #[test]
     fn test_provider_metadata_context_limits() {
         // Test that ProviderMetadata::new correctly sets context limits
         let test_models = vec!["gpt-4o", "claude-sonnet-4-20250514", "unknown-model"];
@@ -1032,33 +1081,39 @@ mod tests {
         // Test direct ModelInfo creation
         let info = ModelInfo {
             name: "test-model".to_string(),
+            resolved_model: None,
             context_limit: 1000,
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            reasoning: false,
         };
         assert_eq!(info.context_limit, 1000);
 
         // Test equality
         let info2 = ModelInfo {
             name: "test-model".to_string(),
+            resolved_model: None,
             context_limit: 1000,
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            reasoning: false,
         };
         assert_eq!(info, info2);
 
         // Test inequality
         let info3 = ModelInfo {
             name: "test-model".to_string(),
+            resolved_model: None,
             context_limit: 2000,
             input_token_cost: None,
             output_token_cost: None,
             currency: None,
             supports_cache_control: None,
+            reasoning: false,
         };
         assert_ne!(info, info3);
     }

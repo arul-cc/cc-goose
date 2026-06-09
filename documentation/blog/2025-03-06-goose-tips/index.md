@@ -50,11 +50,11 @@ Beyond projects, global .goosehints files (`~/.config/goose/.goosehints`) apply 
 
 ## 4. Choose the Right Mode for Your Workflow
 
-goose offers [different modes](/docs/guides/goose-permissions) that determine how much autonomy it has when modifying files, using extensions, and performing automated actions. 
+goose offers [different modes](/docs/guides/managing-tools/goose-permissions) that determine how much autonomy it has when modifying files, using extensions, and performing automated actions. 
 
 * ⚡️ **Auto Mode (Default):** goose can modify, create, and delete files, as well as use extensions, without requiring approval. Best for users who want seamless automation.
 
-* ✅ **Approve Mode:** goose asks for confirmation before making changes. With [Smart Approve](/docs/guides/goose-permissions#permission-modes) enabled, it evaluates risk levels and prompts for high-risk actions while executing safe ones automatically.
+* ✅ **Approve Mode:** goose asks for confirmation before making changes. With [Smart Approve](/docs/guides/managing-tools/goose-permissions#permission-modes) enabled, it evaluates risk levels and prompts for high-risk actions while executing safe ones automatically.
 
 * 💬 **Chat Mode:** goose operates in chat-only mode, without modifying files or using extensions. Ideal for users who want AI assistance without automation.
 
@@ -86,12 +86,12 @@ By following these tips, you'll be able to work more effectively with goose, get
 <head>
   <meta property="og:title" content="6 Essential Tips for Working with goose" />
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://block.github.io/goose/blog/2025/03/06/goose-tips" />
+  <meta property="og:url" content="https://goose-docs.ai/blog/2025/03/06/goose-tips" />
   <meta property="og:description" content="Practical tips to help you use goose more effectively and efficiently." />
-  <meta property="og:image" content="https://block.github.io/goose/assets/images/goose-tips-4add28cc7201737dfb468ad11980f070.png" />
+  <meta property="og:image" content="https://goose-docs.ai/assets/images/goose-tips-4add28cc7201737dfb468ad11980f070.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta property="twitter:domain" content="block.github.io/goose" />
+  <meta property="twitter:domain" content="goose-docs.ai" />
   <meta name="twitter:title" content="6 Essential Tips for Working with goose" />
   <meta name="twitter:description" content="Practical tips to help you use goose more effectively and efficiently." />
-  <meta name="twitter:image" content="https://block.github.io/goose/assets/images/goose-tips-4add28cc7201737dfb468ad11980f070.png" />
+  <meta name="twitter:image" content="https://goose-docs.ai/assets/images/goose-tips-4add28cc7201737dfb468ad11980f070.png" />
 </head>

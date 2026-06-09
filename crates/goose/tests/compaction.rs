@@ -2,16 +2,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use goose::agents::{Agent, AgentEvent, SessionConfig};
+use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageContent};
 use goose::conversation::Conversation;
 use goose::model::ModelConfig;
 use goose::providers::base::{
     stream_from_single_message, MessageStream, Provider, ProviderDef, ProviderMetadata,
-    ProviderUsage, Usage,
 };
-use goose::providers::errors::ProviderError;
 use goose::session::session_manager::SessionType;
 use goose::session::Session;
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::errors::ProviderError;
 use rmcp::model::Tool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -190,6 +191,8 @@ impl ProviderDef for MockCompactionProvider {
             known_models: vec![],
             model_doc_link: "".to_string(),
             config_keys: vec![],
+            setup_steps: vec![],
+            model_selection_hint: None,
         }
     }
 
@@ -215,6 +218,7 @@ async fn setup_test_session(
             temp_dir.path().to_path_buf(),
             session_name.to_string(),
             SessionType::Hidden,
+            GooseMode::default(),
         )
         .await?;
 

@@ -1,5 +1,5 @@
 ---
-sidebar_position: 85
+sidebar_position: 10
 title: Configuration Files
 sidebar_label: Configuration Files
 ---
@@ -19,7 +19,7 @@ The configuration files allow you to set default behaviors, configure language m
 - **permission.yaml** - Tool permission levels configured via `goose configure`
 - **secrets.yaml** - API keys and secrets (when goose is using [file-based secret storage](#security-considerations))
 - **permissions/tool_permissions.json** - Runtime permission decisions (auto-managed)
-- **prompts/** - Customized [prompt templates](/docs/guides/prompt-templates)
+- **prompts/** - Customized [prompt templates](/docs/guides/context-engineering/prompt-templates)
 
 In addition to editing configuration files directly, many settings can be managed from goose Desktop and goose CLI:
 - **goose Desktop**: From the `Settings` page and the bottom toolbar
@@ -35,14 +35,13 @@ The following settings can be configured at the root level of your config.yaml f
 | `GOOSE_MODEL` | Default model to use | Model name (e.g., "claude-3.5-sonnet", "gpt-4") | None | Yes |
 | `GOOSE_TEMPERATURE` | Model response randomness | Float between 0.0 and 1.0 | Model-specific | No |
 | `GOOSE_MAX_TOKENS` | Maximum number of tokens for each model response (truncates longer responses) | Positive integer | Model-specific | No |
-| `GOOSE_MODE` | [Tool execution behavior](/docs/guides/goose-permissions) | "auto", "approve", "chat", "smart_approve" | "auto" | No |
+| `GOOSE_MODE` | [Tool execution behavior](/docs/guides/managing-tools/goose-permissions) | "auto", "approve", "chat", "smart_approve" | "auto" | No |
 | `GOOSE_MAX_TURNS` | [Maximum number of turns](/docs/guides/sessions/smart-context-management#maximum-turns) allowed without user input | Integer (e.g., 10, 50, 100) | 1000 | No |
-| `GOOSE_LEAD_PROVIDER` | Provider for lead model in [lead/worker mode](/docs/guides/environment-variables#leadworker-model-configuration) | Same as `GOOSE_PROVIDER` options | Falls back to `GOOSE_PROVIDER` | No |
-| `GOOSE_LEAD_MODEL` | Lead model for lead/worker mode | Model name | None | No |
-| `GOOSE_PLANNER_PROVIDER` | Provider for [planning mode](/docs/guides/creating-plans) | Same as `GOOSE_PROVIDER` options | Falls back to `GOOSE_PROVIDER` | No |
+| `GOOSE_PLANNER_PROVIDER` | Provider for [planning mode](/docs/guides/context-engineering/creating-plans) | Same as `GOOSE_PROVIDER` options | Falls back to `GOOSE_PROVIDER` | No |
 | `GOOSE_PLANNER_MODEL` | Model for planning mode | Model name | Falls back to `GOOSE_MODEL` | No |
 | `GOOSE_TOOLSHIM` | Enable tool interpretation | true/false | false | No |
 | `GOOSE_TOOLSHIM_OLLAMA_MODEL` | Model for tool interpretation | Model name (e.g., "llama3.2") | System default | No |
+| `GOOSE_INPUT_LIMIT` | Override input token limit for Ollama (maps to `num_ctx`) | Positive integer | Model default | No |
 | `GOOSE_CLI_MIN_PRIORITY` | Tool output verbosity | Float between 0.0 and 1.0 | 0.0 | No |
 | `GOOSE_CLI_THEME` | [Theme](/docs/guides/goose-cli-commands#themes) for CLI response  markdown | "light", "dark", "ansi" | "dark" | No |
 | `GOOSE_CLI_LIGHT_THEME` | Custom syntax highlighting theme for light mode | [bat theme name](https://github.com/sharkdp/bat#adding-new-themes) | "GitHub" | No |
@@ -80,7 +79,7 @@ GOOSE_TOOLSHIM: true
 GOOSE_CLI_MIN_PRIORITY: 0.2
 
 # Recipe Configuration
-GOOSE_RECIPE_GITHUB_REPO: "block/goose-recipes"
+GOOSE_RECIPE_GITHUB_REPO: "aaif-goose/goose-recipes"
 
 # Search Path Configuration
 GOOSE_SEARCH_PATHS:
@@ -121,6 +120,7 @@ extensions:
     name: "extension_name"    # Internal name
     timeout: 300              # Operation timeout in seconds
     type: "builtin"/"stdio"   # Extension type
+    available_tools: []       # Filter to specific tools (empty = all)
     
     # Additional settings for stdio extensions:
     cmd: "command"            # Command to execute
@@ -129,6 +129,10 @@ extensions:
     env_keys: []              # Required environment variables
     envs: {}                  # Environment values
 ```
+
+### Tool Filtering
+
+Use the `available_tools` field to limit which tools are loaded from an extension. List the tool names you want — only those will be available to goose. Leave it empty (the default) to load all tools. This can help reduce token overhead in sessions where you only need a subset of an extension's capabilities.
 
 ## Search Path Configuration
 
@@ -145,7 +149,7 @@ These paths are prepended to the system PATH when running extension commands, en
 
 ## Observability Configuration
 
-Configure goose to export telemetry to [OpenTelemetry](https://opentelemetry.io/docs/) compatible platforms. Environment variables override these settings and support additional options like per-signal configuration. See the [environment variables guide](/docs/guides/environment-variables#opentelemetry-protocol-otlp) for details.
+Configure goose to export telemetry to [OpenTelemetry](https://opentelemetry.io/docs/) compatible platforms. Environment variables override these settings and support additional options like per-signal configuration. See the [environment variables guide](/docs/guides/environment-variables#observability-configuration) for details.
 
 | Setting | Purpose | Values | Default |
 |---------|---------|--------|---------|
@@ -190,7 +194,7 @@ Settings are applied in the following order of precedence:
 
 ## Updating Configuration
 
-Changes to config files require restarting goose to take effect. You can verify your current configuration using:
+Direct edits to config files usually require restarting goose to take effect for existing sessions. Goose2 provider credential/config saves made through Settings use ACP/core to update storage and refresh provider inventory without restarting the app, but currently active chat sessions continue using the provider instance they started with. You can verify your current configuration using:
 
 ```bash
 goose info -v

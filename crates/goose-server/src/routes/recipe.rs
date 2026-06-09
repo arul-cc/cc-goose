@@ -9,7 +9,7 @@ use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use goose::recipe::local_recipes;
 use goose::recipe::validate_recipe::validate_recipe_template_from_content;
 use goose::recipe::{strip_error_location, Recipe};
-use goose::{recipe_deeplink, slash_commands};
+use goose::{recipe_deeplink, slash_commands::recipe_slash_command};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,6 +103,8 @@ pub struct SaveRecipeRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SaveRecipeResponse {
     id: String,
+    file_name: String,
+    file_path: String,
 }
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ParseRecipeRequest {
@@ -211,6 +213,7 @@ async fn create_recipe(
         }
         Err(e) => {
             tracing::error!("Error details: {:?}", e);
+            #[cfg(feature = "telemetry")]
             goose::posthog::emit_error("recipe_create_failed", &e.to_string());
             let error_response = CreateRecipeResponse {
                 recipe: None,
@@ -238,6 +241,7 @@ async fn encode_recipe(
         Ok(encoded) => Ok(Json(EncodeRecipeResponse { deeplink: encoded })),
         Err(err) => {
             tracing::error!("Failed to encode recipe: {}", err);
+            #[cfg(feature = "telemetry")]
             goose::posthog::emit_error("recipe_encode_failed", &err.to_string());
             Err(StatusCode::BAD_REQUEST)
         }
@@ -264,6 +268,7 @@ async fn decode_recipe(
         },
         Err(err) => {
             tracing::error!("Failed to decode deeplink: {}", err);
+            #[cfg(feature = "telemetry")]
             goose::posthog::emit_error("recipe_decode_failed", &err.to_string());
             Err(StatusCode::BAD_REQUEST)
         }
@@ -316,7 +321,7 @@ async fn list_recipes(
         .map(|j| (PathBuf::from(j.source), j.cron))
         .collect();
 
-    let all_commands = slash_commands::list_commands();
+    let all_commands = recipe_slash_command::list_commands();
     let slash_map: HashMap<_, _> = all_commands
         .into_iter()
         .map(|sc| (PathBuf::from(sc.recipe_path), sc.command))
@@ -390,6 +395,7 @@ async fn schedule_recipe(
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             tracing::error!("Failed to schedule recipe: {}", e);
+            #[cfg(feature = "telemetry")]
             goose::posthog::emit_error("recipe_schedule_failed", &e.to_string());
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
@@ -416,7 +422,7 @@ async fn set_recipe_slash_command(
         Err(err) => return Err(err.status),
     };
 
-    match slash_commands::set_recipe_slash_command(file_path, request.slash_command) {
+    match recipe_slash_command::set_recipe_slash_command(file_path, request.slash_command) {
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             tracing::error!("Failed to set slash command: {}", e);
@@ -459,9 +465,18 @@ async fn save_recipe(
     };
 
     match local_recipes::save_recipe_to_file(request.recipe, file_path.clone()) {
-        Ok(save_file_path) => Ok(Json(SaveRecipeResponse {
-            id: short_id_from_path(&save_file_path.display().to_string()),
-        })),
+        Ok(save_file_path) => {
+            let file_name = save_file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let file_path_str = save_file_path.display().to_string();
+            Ok(Json(SaveRecipeResponse {
+                id: short_id_from_path(&file_path_str),
+                file_name,
+                file_path: file_path_str,
+            }))
+        }
         Err(e) => Err(ErrorResponse {
             message: e.to_string(),
             status: StatusCode::INTERNAL_SERVER_ERROR,

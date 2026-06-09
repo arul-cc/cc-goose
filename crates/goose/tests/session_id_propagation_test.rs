@@ -48,12 +48,13 @@ fn create_test_provider(mock_server_url: &str) -> Box<dyn Provider> {
 async fn setup_mock_server() -> (MockServer, HeaderCapture, Box<dyn Provider>) {
     let mock_server = MockServer::start().await;
     let capture = HeaderCapture::new();
-    let capture_clone = capture.clone();
+    let chat_capture = capture.clone();
+    let responses_capture = capture.clone();
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(move |req: &Request| {
-            capture_clone.capture_session_header(req);
+            chat_capture.capture_session_header(req);
             // Return SSE streaming format
             let sse_response = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
@@ -85,6 +86,57 @@ async fn setup_mock_server() -> (MockServer, HeaderCapture, Box<dyn Provider>) {
         .mount(&mock_server)
         .await;
 
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |req: &Request| {
+            responses_capture.capture_session_header(req);
+            let sse_response = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "type": "response.created",
+                    "sequence_number": 1,
+                    "response": {
+                        "id": "resp_test",
+                        "object": "response",
+                        "created_at": 1755133833,
+                        "status": "in_progress",
+                        "model": "gpt-5-nano",
+                        "output": []
+                    }
+                }),
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "item_id": "msg_test",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Hi there! How can I help you today?"
+                }),
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 3,
+                    "response": {
+                        "id": "resp_test",
+                        "object": "response",
+                        "created_at": 1755133833,
+                        "status": "completed",
+                        "model": "gpt-5-nano",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 8,
+                            "output_tokens": 10,
+                            "total_tokens": 18
+                        }
+                    }
+                })
+            );
+            ResponseTemplate::new(200)
+                .set_body_string(sse_response)
+                .insert_header("content-type", "text/event-stream")
+        })
+        .mount(&mock_server)
+        .await;
+
     let provider = create_test_provider(&mock_server.uri());
     (mock_server, capture, provider)
 }
@@ -102,6 +154,46 @@ async fn make_request(provider: &dyn Provider, session_id: &str) {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "otel")]
+async fn test_session_id_propagates_to_log_records() {
+    use opentelemetry::logs::AnyValue;
+    use opentelemetry::Key;
+    use opentelemetry_appender_tracing::layer::{
+        OpenTelemetryTracingBridge, TracingSpanAttributes,
+    };
+    use opentelemetry_sdk::logs::{InMemoryLogExporterBuilder, SdkLoggerProvider};
+    use tracing_subscriber::prelude::*;
+
+    let exporter = InMemoryLogExporterBuilder::default().build();
+    let provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+
+    let layer = OpenTelemetryTracingBridge::builder(&provider)
+        .with_tracing_span_attributes(TracingSpanAttributes::allowlist(["session.id"]))
+        .build();
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let span = tracing::info_span!("test", session.id = "test-session-42");
+    let _enter = span.enter();
+    tracing::info!("hello from test");
+    drop(_enter);
+    drop(_guard);
+
+    provider.force_flush().unwrap();
+    let logs = exporter.get_emitted_logs().unwrap();
+    assert_eq!(logs.len(), 1);
+    let log = &logs[0];
+
+    let has_session_id = log.record.attributes_iter().any(|(k, v)| {
+        k == &Key::new("session.id")
+            && matches!(v, AnyValue::String(s) if s.as_str() == "test-session-42")
+    });
+    assert!(has_session_id);
 }
 
 #[tokio::test]

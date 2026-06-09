@@ -1,7 +1,7 @@
 import React, { memo, useMemo, useCallback, useState } from 'react';
 import { ProviderCard } from './subcomponents/ProviderCard';
 import CardContainer from './subcomponents/CardContainer';
-import ProviderConfigurationModal from './modal/ProviderConfiguationModal';
+import ProviderConfigurationModal from './modal/ProviderConfigurationModal';
 import {
   DeclarativeProviderConfig,
   ProviderDetails,
@@ -13,6 +13,34 @@ import CustomProviderForm from './modal/subcomponents/forms/CustomProviderForm';
 import { SwitchModelModal } from '../models/subcomponents/SwitchModelModal';
 import { useModelAndProvider } from '../../ModelAndProviderContext';
 import type { View } from '../../../utils/navigationUtils';
+import { defineMessages, useIntl } from '../../../i18n';
+
+const i18n = defineMessages({
+  addProvider: {
+    id: 'providerGrid.addProvider',
+    defaultMessage: 'Add Provider',
+  },
+  fromTemplateOrManual: {
+    id: 'providerGrid.fromTemplateOrManual',
+    defaultMessage: 'From template or manual setup',
+  },
+  editProvider: {
+    id: 'providerGrid.editProvider',
+    defaultMessage: 'Edit  Provider',
+  },
+  configureProvider: {
+    id: 'providerGrid.configureProvider',
+    defaultMessage: 'Configure  Provider',
+  },
+  addProviderTitle: {
+    id: 'providerGrid.addProviderTitle',
+    defaultMessage: 'Add  Provider',
+  },
+  chooseModel: {
+    id: 'providerGrid.chooseModel',
+    defaultMessage: 'Choose Model',
+  },
+});
 
 const GridLayout = memo(function GridLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -29,6 +57,7 @@ const GridLayout = memo(function GridLayout({ children }: { children: React.Reac
 });
 
 const CustomProviderCard = memo(function CustomProviderCard({ onClick }: { onClick: () => void }) {
+  const intl = useIntl();
   return (
     <CardContainer
       testId="add-custom-provider-card"
@@ -38,8 +67,10 @@ const CustomProviderCard = memo(function CustomProviderCard({ onClick }: { onCli
         <div className="flex flex-col items-center justify-center min-h-[200px]">
           <Plus className="w-8 h-8 text-gray-400 mb-2" />
           <div className="text-sm text-gray-600 dark:text-gray-400 text-center">
-            <div className="font-medium">Add Provider</div>
-            <div className="text-xs text-gray-500 mt-1">From template or manual setup</div>
+            <div className="font-medium">{intl.formatMessage(i18n.addProvider)}</div>
+            <div className="text-xs text-gray-500 mt-1">
+              {intl.formatMessage(i18n.fromTemplateOrManual)}
+            </div>
           </div>
         </div>
       }
@@ -62,6 +93,7 @@ function ProviderCards({
   setView?: (view: View) => void;
   onModelSelected?: (model?: string) => void;
 }) {
+  const intl = useIntl();
   const [configuringProvider, setConfiguringProvider] = useState<ProviderDetails | null>(null);
   const [showCustomProviderModal, setShowCustomProviderModal] = useState(false);
   const [showSwitchModelModal, setShowSwitchModelModal] = useState(false);
@@ -87,7 +119,7 @@ function ProviderCards({
 
   const configureProviderViaModal = useCallback(
     async (provider: ProviderDetails) => {
-      if (provider.provider_type === 'Custom' || provider.provider_type === 'Declarative') {
+      if (provider.provider_type === 'Custom') {
         const { getCustomProvider } = await import('../../../api');
         const result = await getCustomProvider({ path: { id: provider.name }, throwOnError: true });
 
@@ -168,10 +200,10 @@ function ProviderCards({
   }, [refreshProviders]);
 
   const onProviderConfigured = useCallback(
-    (provider: ProviderDetails) => {
+    async (provider: ProviderDetails) => {
       setConfiguringProvider(null);
       if (refreshProviders) {
-        refreshProviders();
+        await refreshProviders();
       }
       setSwitchModelProvider(provider.name);
       setShowSwitchModelModal(true);
@@ -197,7 +229,7 @@ function ProviderCards({
     async (data: UpdateCustomProviderRequest) => {
       const { createCustomProvider } = await import('../../../api');
       const result = await createCustomProvider({ body: data, throwOnError: true });
-      const providerId = result.data?.replace('Custom provider added - ID: ', '') || null;
+      const providerId = result.data?.provider_name;
       setShowCustomProviderModal(false);
       if (refreshProviders) {
         await refreshProviders();
@@ -236,6 +268,7 @@ function ProviderCards({
     engine: editingProvider.config.engine,
     display_name: editingProvider.config.display_name,
     api_url: editingProvider.config.base_url,
+    base_path: editingProvider.config.base_path ?? undefined,
     api_key: '',
     models: editingProvider.config.models.map((m) => m.name),
     supports_streaming: editingProvider.config.supports_streaming ?? true,
@@ -245,7 +278,11 @@ function ProviderCards({
   };
 
   const editable = editingProvider ? editingProvider.isEditable : true;
-  const title = (editingProvider ? (editable ? 'Edit' : 'Configure') : 'Add') + '  Provider';
+  const title = editingProvider
+    ? editable
+      ? intl.formatMessage(i18n.editProvider)
+      : intl.formatMessage(i18n.configureProvider)
+    : intl.formatMessage(i18n.addProviderTitle);
   return (
     <>
       {providerCards}
@@ -280,7 +317,7 @@ function ProviderCards({
           setView={handleSetView}
           onModelSelected={onModelSelected}
           initialProvider={switchModelProvider}
-          titleOverride="Choose Model"
+          titleOverride={intl.formatMessage(i18n.chooseModel)}
         />
       )}
     </>

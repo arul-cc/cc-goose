@@ -1,12 +1,6 @@
 export const NAV_DIMENSIONS = {
-  /** Width of condensed navigation in icon-only mode */
-  CONDENSED_ICON_ONLY_WIDTH: 44,
-  /** Width of condensed navigation with labels */
-  CONDENSED_WIDTH: 200,
-  /** Height of expanded navigation (horizontal mode) */
-  EXPANDED_HEIGHT: 180,
-  /** Height of condensed navigation (horizontal mode) */
-  CONDENSED_HEIGHT: 46,
+  /** Width of the navigation sidebar */
+  NAV_WIDTH: 240,
 } as const;
 
 export const Z_INDEX = {

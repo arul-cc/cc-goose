@@ -1,11 +1,13 @@
 use super::api_client::{ApiClient, AuthMethod};
-use super::base::{ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata};
-use super::errors::ProviderError;
-use super::openai_compatible::handle_status_openai_compat;
-use super::retry::ProviderRetry;
-use super::utils::{ImageFormat, RequestLog};
+use super::base::{
+    ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata,
+    DEFAULT_PROVIDER_TIMEOUT_SECS,
+};
+use super::inventory::InventoryIdentityInput;
+use super::openai_compatible::handle_status;
+use super::retry::{ProviderRetry, RetryConfig};
+use super::utils::RequestLog;
 use crate::config::declarative_providers::DeclarativeProviderConfig;
-use crate::config::GooseMode;
 use crate::conversation::message::Message;
 use crate::model::ModelConfig;
 use crate::providers::formats::ollama::{create_request, response_to_streaming_message_ollama};
@@ -14,6 +16,9 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
+use goose_providers::errors::ProviderError;
+use goose_providers::formats::openai::ModelConfigParams;
+use goose_providers::images::ImageFormat;
 use reqwest::Response;
 use rmcp::model::Tool;
 use serde_json::{json, Value};
@@ -26,7 +31,7 @@ use url::Url;
 
 const OLLAMA_PROVIDER_NAME: &str = "ollama";
 pub const OLLAMA_HOST: &str = "localhost";
-pub const OLLAMA_TIMEOUT: u64 = 600;
+pub const OLLAMA_TIMEOUT: u64 = DEFAULT_PROVIDER_TIMEOUT_SECS;
 pub const OLLAMA_DEFAULT_PORT: u16 = 11434;
 pub const OLLAMA_DEFAULT_MODEL: &str = "qwen3";
 pub const OLLAMA_KNOWN_MODELS: &[&str] = &[
@@ -37,6 +42,14 @@ pub const OLLAMA_KNOWN_MODELS: &[&str] = &[
 ];
 pub const OLLAMA_DOC_URL: &str = "https://ollama.com/library";
 
+// Ollama-specific retry config: large models can take 30-120s to load into memory,
+// during which Ollama returns 500 errors. Use more retries with gradual backoff
+// to wait for the model to become ready.
+const OLLAMA_MAX_RETRIES: usize = 10;
+const OLLAMA_INITIAL_RETRY_INTERVAL_MS: u64 = 2000;
+const OLLAMA_BACKOFF_MULTIPLIER: f64 = 1.5;
+const OLLAMA_MAX_RETRY_INTERVAL_MS: u64 = 15_000;
+
 #[derive(serde::Serialize)]
 pub struct OllamaProvider {
     #[serde(skip)]
@@ -44,6 +57,7 @@ pub struct OllamaProvider {
     model: ModelConfig,
     supports_streaming: bool,
     name: String,
+    skip_canonical_filtering: bool,
 }
 fn resolve_ollama_num_ctx(model_config: &ModelConfig) -> Option<usize> {
     let config = crate::config::Config::global();
@@ -60,17 +74,61 @@ fn resolve_ollama_num_ctx(model_config: &ModelConfig) -> Option<usize> {
     input_limit.or(model_config.context_limit)
 }
 
-fn apply_ollama_options(payload: &mut Value, model_config: &ModelConfig) {
-    let Some(limit) = resolve_ollama_num_ctx(model_config) else {
-        return;
-    };
-
-    if let Some(obj) = payload.as_object_mut() {
-        let options = obj.entry("options").or_insert_with(|| json!({}));
-        if let Some(options_obj) = options.as_object_mut() {
-            options_obj.insert("num_ctx".to_string(), json!(limit));
+fn resolve_ollama_stream_usage() -> bool {
+    let config = crate::config::Config::global();
+    match config.get_param::<bool>("OLLAMA_STREAM_USAGE") {
+        Ok(val) => val,
+        // Key not set: default to true. Ollama supports stream_options since
+        // mid-2025 and most installs benefit from token usage tracking.
+        Err(crate::config::ConfigError::NotFound(_)) => true,
+        // Invalid value (e.g. "0", "yes", typo): warn and disable stream_options
+        // so users who intended to opt out aren't silently left hanging.
+        Err(e) => {
+            tracing::warn!(
+                "Invalid OLLAMA_STREAM_USAGE value ({}); disabling stream_options. \
+                 Use true or false.",
+                e
+            );
+            false
         }
     }
+}
+
+fn apply_ollama_options(payload: &mut Value, model_config: &ModelConfig) {
+    if let Some(obj) = payload.as_object_mut() {
+        // Gate stream_options behind OLLAMA_STREAM_USAGE (default: true).
+        // Older Ollama builds that don't support stream_options may stall before
+        // emitting any SSE data, blocking until the client timeout (600s).
+        // with_line_timeout() only protects after the first line arrives, so
+        // users on older builds should set OLLAMA_STREAM_USAGE=false.
+        if !resolve_ollama_stream_usage() {
+            obj.remove("stream_options");
+        }
+
+        // Convert max_completion_tokens / max_tokens to Ollama's options.num_predict.
+        // Reasoning models emit max_completion_tokens; non-reasoning models emit max_tokens.
+        let max_tokens = obj
+            .remove("max_completion_tokens")
+            .or_else(|| obj.remove("max_tokens"));
+        if let Some(max_tokens) = max_tokens {
+            let options = obj.entry("options").or_insert_with(|| json!({}));
+            if let Some(options_obj) = options.as_object_mut() {
+                options_obj.entry("num_predict").or_insert(max_tokens);
+            }
+        }
+
+        // Apply num_ctx from context limit settings.
+        if let Some(limit) = resolve_ollama_num_ctx(model_config) {
+            let options = obj.entry("options").or_insert_with(|| json!({}));
+            if let Some(options_obj) = options.as_object_mut() {
+                options_obj.insert("num_ctx".to_string(), json!(limit));
+            }
+        }
+    }
+}
+
+fn ollama_host_configured(config: &crate::config::Config) -> bool {
+    config.get_param::<String>("OLLAMA_HOST").is_ok()
 }
 
 impl OllamaProvider {
@@ -110,6 +168,7 @@ impl OllamaProvider {
             model,
             supports_streaming: true,
             name: OLLAMA_PROVIDER_NAME.to_string(),
+            skip_canonical_filtering: false,
         })
     }
 
@@ -161,11 +220,18 @@ impl OllamaProvider {
             ));
         }
 
+        let model = if let Some(ref fast_model_name) = config.fast_model {
+            model.with_fast(fast_model_name, &config.name)?
+        } else {
+            model
+        };
+
         Ok(Self {
             api_client,
             model,
             supports_streaming,
             name: config.name.clone(),
+            skip_canonical_filtering: config.skip_canonical_filtering,
         })
     }
 }
@@ -200,6 +266,26 @@ impl ProviderDef for OllamaProvider {
     ) -> BoxFuture<'static, Result<Self::Provider>> {
         Box::pin(Self::from_env(model))
     }
+
+    fn supports_inventory_refresh() -> bool {
+        true
+    }
+
+    fn inventory_configured() -> bool {
+        ollama_host_configured(crate::config::Config::global())
+    }
+
+    fn inventory_identity() -> Result<InventoryIdentityInput> {
+        let config = crate::config::Config::global();
+        Ok(
+            InventoryIdentityInput::new(OLLAMA_PROVIDER_NAME, OLLAMA_PROVIDER_NAME).with_public(
+                "host",
+                config
+                    .get_param::<String>("OLLAMA_HOST")
+                    .unwrap_or_else(|_| OLLAMA_HOST.to_string()),
+            ),
+        )
+    }
 }
 
 #[async_trait]
@@ -208,8 +294,22 @@ impl Provider for OllamaProvider {
         &self.name
     }
 
+    fn skip_canonical_filtering(&self) -> bool {
+        self.skip_canonical_filtering
+    }
+
     fn get_model_config(&self) -> ModelConfig {
         self.model.clone()
+    }
+
+    fn retry_config(&self) -> RetryConfig {
+        RetryConfig::new(
+            OLLAMA_MAX_RETRIES,
+            OLLAMA_INITIAL_RETRY_INTERVAL_MS,
+            OLLAMA_BACKOFF_MULTIPLIER,
+            OLLAMA_MAX_RETRY_INTERVAL_MS,
+        )
+        .transient_only()
     }
 
     async fn stream(
@@ -220,19 +320,17 @@ impl Provider for OllamaProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let config = crate::config::Config::global();
-        let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
-        let filtered_tools = if goose_mode == GooseMode::Chat {
-            &[]
-        } else {
-            tools
-        };
-
         let mut payload = create_request(
-            model_config,
+            ModelConfigParams {
+                model_name: model_config.model_name.as_str(),
+                thinking_effort: model_config.thinking_effort(),
+                temperature: model_config.temperature,
+                max_tokens: model_config.max_tokens,
+                request_params: model_config.request_params.as_ref(),
+            },
             system,
             messages,
-            filtered_tools,
+            tools,
             &ImageFormat::OpenAi,
             true,
         )?;
@@ -245,7 +343,7 @@ impl Provider for OllamaProvider {
                     .api_client
                     .response_post(Some(session_id), "v1/chat/completions", &payload)
                     .await?;
-                handle_status_openai_compat(resp).await
+                handle_status(resp).await
             })
             .await
             .inspect_err(|e| {
@@ -291,9 +389,76 @@ impl Provider for OllamaProvider {
     }
 }
 
+/// Default per-chunk timeout for Ollama streaming responses (seconds).
+/// Configurable via OLLAMA_STREAM_TIMEOUT, GOOSE_STREAM_TIMEOUT, or falls back
+/// to OLLAMA_TIMEOUT. Set high to accommodate slower models (CPU inference,
+/// large parameter counts, complex reasoning).
+const OLLAMA_DEFAULT_CHUNK_TIMEOUT_SECS: u64 = 120;
+
+/// Resolve the per-chunk stream timeout from config.
+/// Priority: OLLAMA_STREAM_TIMEOUT > GOOSE_STREAM_TIMEOUT > OLLAMA_TIMEOUT > default (120s).
+/// Zero values are treated as invalid and skipped, since a zero timeout would
+/// cause every chunk after the first to be treated as a stall.
+fn resolve_ollama_chunk_timeout() -> u64 {
+    let config = crate::config::Config::global();
+
+    if let Ok(val) = config.get_param::<u64>("OLLAMA_STREAM_TIMEOUT") {
+        if val > 0 {
+            return val;
+        }
+    }
+    if let Ok(val) = config.get_param::<u64>("GOOSE_STREAM_TIMEOUT") {
+        if val > 0 {
+            return val;
+        }
+    }
+    match config.get_param::<u64>("OLLAMA_TIMEOUT") {
+        Ok(val) if val > 0 => val,
+        _ => OLLAMA_DEFAULT_CHUNK_TIMEOUT_SECS,
+    }
+}
+
+/// Wraps a line stream with a per-item timeout at the raw SSE level.
+/// This detects dead connections without false-positive stalls during long
+/// tool-call generations where response_to_streaming_message_ollama buffers.
+fn with_line_timeout(
+    stream: impl futures::Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+    timeout_secs: u64,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<String>> + Send>> {
+    let timeout = Duration::from_secs(timeout_secs);
+    Box::pin(try_stream! {
+        let mut stream = stream;
+
+        // Allow time-to-first-token to be governed by the request timeout.
+        // Only enforce per-chunk timeout after first SSE line arrives.
+        match stream.next().await {
+            Some(first_item) => yield first_item?,
+            None => return,
+        }
+        loop {
+            match tokio::time::timeout(timeout, stream.next()).await {
+                Ok(Some(item)) => yield item?,
+                Ok(None) => break,
+                Err(_) => {
+                    Err::<(), anyhow::Error>(anyhow::anyhow!(
+                        "Ollama stream stalled: no data received for {}s. \
+                         This may indicate the model is overwhelmed by the request payload. \
+                         Try a smaller model, reduce the number of tools, or increase the \
+                         timeout via OLLAMA_STREAM_TIMEOUT, GOOSE_STREAM_TIMEOUT, or \
+                         OLLAMA_TIMEOUT in your config.",
+                        timeout_secs
+                    ))?;
+                }
+            }
+        }
+    })
+}
+
 /// Ollama-specific streaming handler with XML tool call fallback.
 /// Uses the Ollama format module which buffers text when XML tool calls are detected,
 /// preventing duplicate content from being emitted to the UI.
+/// Timeout is applied at the raw SSE line level via with_line_timeout so that
+/// buffering inside response_to_streaming_message_ollama does not cause false stalls.
 fn stream_ollama(response: Response, mut log: RequestLog) -> Result<MessageStream, ProviderError> {
     let stream = response.bytes_stream().map_err(std::io::Error::other);
 
@@ -302,8 +467,11 @@ fn stream_ollama(response: Response, mut log: RequestLog) -> Result<MessageStrea
         let framed = FramedRead::new(stream_reader, LinesCodec::new())
             .map_err(Error::from);
 
-        let message_stream = response_to_streaming_message_ollama(framed);
+        let chunk_timeout = resolve_ollama_chunk_timeout();
+        let timed_lines = with_line_timeout(framed, chunk_timeout);
+        let message_stream = response_to_streaming_message_ollama(timed_lines);
         pin!(message_stream);
+
         while let Some(message) = message_stream.next().await {
             let (message, usage) = message.map_err(|e|
                 ProviderError::RequestFailed(format!("Stream decode error: {}", e))
@@ -317,6 +485,51 @@ fn stream_ollama(response: Response, mut log: RequestLog) -> Result<MessageStrea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ollama_host_default_does_not_mark_inventory_configured() {
+        let _guard = env_lock::lock_env([("OLLAMA_HOST", None::<&str>)]);
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        let secrets_file = tempfile::NamedTempFile::new().unwrap();
+        let config = crate::config::Config::new_with_config_paths(
+            vec![config_file.path().to_path_buf()],
+            secrets_file.path(),
+        )
+        .unwrap();
+
+        assert!(!ollama_host_configured(&config));
+    }
+
+    #[test]
+    fn test_ollama_host_env_marks_inventory_configured() {
+        let _guard = env_lock::lock_env([("OLLAMA_HOST", Some("http://127.0.0.1:11435"))]);
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        let secrets_file = tempfile::NamedTempFile::new().unwrap();
+        let config = crate::config::Config::new_with_config_paths(
+            vec![config_file.path().to_path_buf()],
+            secrets_file.path(),
+        )
+        .unwrap();
+
+        assert!(ollama_host_configured(&config));
+    }
+
+    #[test]
+    fn test_ollama_host_config_marks_inventory_configured() {
+        let _guard = env_lock::lock_env([("OLLAMA_HOST", None::<&str>)]);
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        let secrets_file = tempfile::NamedTempFile::new().unwrap();
+        let config = crate::config::Config::new_with_config_paths(
+            vec![config_file.path().to_path_buf()],
+            secrets_file.path(),
+        )
+        .unwrap();
+        config
+            .set_param("OLLAMA_HOST", "http://127.0.0.1:11435")
+            .unwrap();
+
+        assert!(ollama_host_configured(&config));
+    }
 
     #[test]
     fn test_apply_ollama_options_uses_input_limit() {
@@ -348,5 +561,226 @@ mod tests {
         let mut payload = json!({});
         apply_ollama_options(&mut payload, &model_config);
         assert!(payload.get("options").is_none());
+    }
+
+    #[test]
+    fn test_raw_create_request_contains_unsupported_ollama_fields() {
+        use crate::providers::formats::ollama::create_request;
+
+        let model_config = ModelConfig::new("llama3.1")
+            .unwrap()
+            .with_max_tokens(Some(4096));
+        let messages = vec![crate::conversation::message::Message::user().with_text("hi")];
+
+        let payload = create_request(
+            ModelConfigParams {
+                model_name: model_config.model_name.as_str(),
+                thinking_effort: model_config.thinking_effort(),
+                temperature: model_config.temperature,
+                max_tokens: model_config.max_tokens,
+                request_params: model_config.request_params.as_ref(),
+            },
+            "You are a helpful assistant.",
+            &messages,
+            &[],
+            &ImageFormat::OpenAi,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            payload.get("stream_options").is_some(),
+            "create_request should produce stream_options for usage tracking"
+        );
+        assert!(
+            payload.get("max_tokens").is_some(),
+            "create_request should produce max_tokens (unsupported by Ollama)"
+        );
+    }
+
+    #[test]
+    fn test_apply_ollama_options_preserves_stream_options_by_default() {
+        use crate::providers::formats::ollama::create_request;
+
+        let _guard = env_lock::lock_env([
+            ("GOOSE_INPUT_LIMIT", None::<&str>),
+            ("OLLAMA_STREAM_USAGE", None::<&str>),
+        ]);
+        let model_config = ModelConfig::new("llama3.1")
+            .unwrap()
+            .with_max_tokens(Some(4096));
+        let messages = vec![crate::conversation::message::Message::user().with_text("hi")];
+
+        let mut payload = create_request(
+            ModelConfigParams {
+                model_name: model_config.model_name.as_str(),
+                thinking_effort: model_config.thinking_effort(),
+                temperature: model_config.temperature,
+                max_tokens: model_config.max_tokens,
+                request_params: model_config.request_params.as_ref(),
+            },
+            "You are a helpful assistant.",
+            &messages,
+            &[],
+            &ImageFormat::OpenAi,
+            true,
+        )
+        .unwrap();
+
+        apply_ollama_options(&mut payload, &model_config);
+
+        assert!(
+            payload.get("stream_options").is_some(),
+            "stream_options should be preserved by default for usage tracking"
+        );
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "max_tokens should be removed for Ollama"
+        );
+        assert!(
+            payload.get("max_completion_tokens").is_none(),
+            "max_completion_tokens should be removed for Ollama"
+        );
+        assert_eq!(
+            payload["options"]["num_predict"], 4096,
+            "max_tokens should be moved to options.num_predict"
+        );
+        assert_eq!(payload["stream"], true, "stream field should be preserved");
+    }
+
+    #[test]
+    fn test_apply_ollama_options_strips_stream_options_when_disabled() {
+        use crate::providers::formats::ollama::create_request;
+
+        let _guard = env_lock::lock_env([
+            ("GOOSE_INPUT_LIMIT", None::<&str>),
+            ("OLLAMA_STREAM_USAGE", Some("false")),
+        ]);
+        let model_config = ModelConfig::new("llama3.1")
+            .unwrap()
+            .with_max_tokens(Some(4096));
+        let messages = vec![crate::conversation::message::Message::user().with_text("hi")];
+
+        let mut payload = create_request(
+            ModelConfigParams {
+                model_name: model_config.model_name.as_str(),
+                thinking_effort: model_config.thinking_effort(),
+                temperature: model_config.temperature,
+                max_tokens: model_config.max_tokens,
+                request_params: model_config.request_params.as_ref(),
+            },
+            "You are a helpful assistant.",
+            &messages,
+            &[],
+            &ImageFormat::OpenAi,
+            true,
+        )
+        .unwrap();
+
+        apply_ollama_options(&mut payload, &model_config);
+
+        assert!(
+            payload.get("stream_options").is_none(),
+            "stream_options should be removed when OLLAMA_STREAM_USAGE=false"
+        );
+    }
+
+    #[test]
+    fn test_resolve_ollama_chunk_timeout_defaults_to_ollama_timeout() {
+        let _guard = env_lock::lock_env([
+            ("OLLAMA_STREAM_TIMEOUT", None::<&str>),
+            ("GOOSE_STREAM_TIMEOUT", None::<&str>),
+            ("OLLAMA_TIMEOUT", Some("300")),
+        ]);
+        assert_eq!(resolve_ollama_chunk_timeout(), 300);
+    }
+
+    #[test]
+    fn test_resolve_ollama_chunk_timeout_prefers_stream_override() {
+        let _guard = env_lock::lock_env([
+            ("OLLAMA_STREAM_TIMEOUT", Some("60")),
+            ("GOOSE_STREAM_TIMEOUT", Some("90")),
+            ("OLLAMA_TIMEOUT", Some("300")),
+        ]);
+        assert_eq!(resolve_ollama_chunk_timeout(), 60);
+    }
+
+    #[test]
+    fn test_resolve_ollama_chunk_timeout_uses_goose_stream_fallback() {
+        let _guard = env_lock::lock_env([
+            ("OLLAMA_STREAM_TIMEOUT", None::<&str>),
+            ("GOOSE_STREAM_TIMEOUT", Some("90")),
+            ("OLLAMA_TIMEOUT", Some("300")),
+        ]);
+        assert_eq!(resolve_ollama_chunk_timeout(), 90);
+    }
+
+    #[test]
+    fn test_resolve_ollama_chunk_timeout_uses_default_when_unset() {
+        let _guard = env_lock::lock_env([
+            ("OLLAMA_STREAM_TIMEOUT", None::<&str>),
+            ("GOOSE_STREAM_TIMEOUT", None::<&str>),
+            ("OLLAMA_TIMEOUT", None::<&str>),
+        ]);
+        assert_eq!(
+            resolve_ollama_chunk_timeout(),
+            OLLAMA_DEFAULT_CHUNK_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_resolve_ollama_chunk_timeout_skips_zero_values() {
+        let _guard = env_lock::lock_env([
+            ("OLLAMA_STREAM_TIMEOUT", Some("0")),
+            ("GOOSE_STREAM_TIMEOUT", Some("0")),
+            ("OLLAMA_TIMEOUT", Some("300")),
+        ]);
+        assert_eq!(resolve_ollama_chunk_timeout(), 300);
+    }
+
+    #[test]
+    fn test_resolve_ollama_chunk_timeout_skips_all_zero_to_default() {
+        let _guard = env_lock::lock_env([
+            ("OLLAMA_STREAM_TIMEOUT", Some("0")),
+            ("GOOSE_STREAM_TIMEOUT", Some("0")),
+            ("OLLAMA_TIMEOUT", Some("0")),
+        ]);
+        assert_eq!(
+            resolve_ollama_chunk_timeout(),
+            OLLAMA_DEFAULT_CHUNK_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_ollama_retry_config_is_transient_only() {
+        let config = RetryConfig::new(
+            OLLAMA_MAX_RETRIES,
+            OLLAMA_INITIAL_RETRY_INTERVAL_MS,
+            OLLAMA_BACKOFF_MULTIPLIER,
+            OLLAMA_MAX_RETRY_INTERVAL_MS,
+        )
+        .transient_only();
+
+        assert!(config.transient_only);
+
+        use super::super::retry::should_retry;
+        use goose_providers::errors::ProviderError;
+
+        assert!(!should_retry(
+            &ProviderError::RequestFailed("Resource not found (404)".into()),
+            &config
+        ));
+        assert!(!should_retry(
+            &ProviderError::RequestFailed("Bad request (400)".into()),
+            &config
+        ));
+        assert!(should_retry(
+            &ProviderError::ServerError("500 model loading".into()),
+            &config
+        ));
+        assert!(should_retry(
+            &ProviderError::NetworkError("connection refused".into()),
+            &config
+        ));
     }
 }

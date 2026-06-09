@@ -1,4 +1,3 @@
-import { AppEvents } from '../../constants/events';
 import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { Puzzle } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '../ui/dropdown-menu';
@@ -7,6 +6,7 @@ import { Switch } from '../ui/switch';
 import { FixedExtensionEntry, useConfig } from '../ConfigContext';
 import { toastService } from '../../toasts';
 import { formatExtensionName } from '../settings/extensions/subcomponents/ExtensionList';
+import { nameToKey } from '../settings/extensions/utils';
 import { ExtensionConfig, getSessionExtensions } from '../../api';
 import { addToAgent, removeFromAgent } from '../settings/extensions/agent-api';
 import {
@@ -14,12 +14,64 @@ import {
   getExtensionOverride,
   getExtensionOverrides,
 } from '../../store/extensionOverrides';
+import { defineMessages, useIntl } from '../../i18n';
+import { AppEvents } from '../../constants/events';
+
+const i18n = defineMessages({
+  manageExtensions: {
+    id: 'bottomMenuExtensionSelection.manageExtensions',
+    defaultMessage: 'manage extensions',
+  },
+  searchExtensions: {
+    id: 'bottomMenuExtensionSelection.searchExtensions',
+    defaultMessage: 'search extensions...',
+  },
+  extensionsForNewChats: {
+    id: 'bottomMenuExtensionSelection.extensionsForNewChats',
+    defaultMessage: 'Extensions for new chats',
+  },
+  extensionsForThisSession: {
+    id: 'bottomMenuExtensionSelection.extensionsForThisSession',
+    defaultMessage: 'Extensions for this chat session',
+  },
+  noExtensionsFound: {
+    id: 'bottomMenuExtensionSelection.noExtensionsFound',
+    defaultMessage: 'no extensions found',
+  },
+  noExtensionsAvailable: {
+    id: 'bottomMenuExtensionSelection.noExtensionsAvailable',
+    defaultMessage: 'no extensions available',
+  },
+  extensionUpdated: {
+    id: 'bottomMenuExtensionSelection.extensionUpdated',
+    defaultMessage: 'Extension Updated',
+  },
+  extensionWillBeEnabled: {
+    id: 'bottomMenuExtensionSelection.extensionWillBeEnabled',
+    defaultMessage: '{name} will be enabled in new chats',
+  },
+  extensionWillBeDisabled: {
+    id: 'bottomMenuExtensionSelection.extensionWillBeDisabled',
+    defaultMessage: '{name} will be disabled in new chats',
+  },
+  extensionToggleError: {
+    id: 'bottomMenuExtensionSelection.extensionToggleError',
+    defaultMessage: 'Extension Toggle Error',
+  },
+  noActiveSession: {
+    id: 'bottomMenuExtensionSelection.noActiveSession',
+    defaultMessage: 'No active session found. Please start a chat session first.',
+  },
+});
 
 interface BottomMenuExtensionSelectionProps {
   sessionId: string | null;
 }
 
+type GetSessionExtensionsSignal = Parameters<typeof getSessionExtensions>[0]['signal'];
+
 export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionSelectionProps) => {
+  const intl = useIntl();
   const [searchQuery, setSearchQuery] = useState('');
   const [isOpen, setIsOpen] = useState(false);
   const [sessionExtensions, setSessionExtensions] = useState<ExtensionConfig[]>([]);
@@ -27,28 +79,25 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
   const [isTransitioning, setIsTransitioning] = useState(false);
   const [pendingSort, setPendingSort] = useState(false);
   const [togglingExtension, setTogglingExtension] = useState<string | null>(null);
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [isSessionExtensionsLoaded, setIsSessionExtensionsLoaded] = useState(false);
   const sortTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestSessionIdRef = useRef(sessionId);
   const { extensionsList: allExtensions } = useConfig();
   const isHubView = !sessionId;
 
   useEffect(() => {
+    latestSessionIdRef.current = sessionId;
     setIsSessionExtensionsLoaded(false);
     setSessionExtensions([]);
+    setPendingSort(false);
+    setIsTransitioning(false);
+    setTogglingExtension(null);
+
+    if (sortTimeoutRef.current) {
+      clearTimeout(sortTimeoutRef.current);
+      sortTimeoutRef.current = null;
+    }
   }, [sessionId]);
-
-  useEffect(() => {
-    const handleExtensionsLoaded = () => {
-      setRefreshTrigger((prev) => prev + 1);
-    };
-
-    window.addEventListener(AppEvents.SESSION_EXTENSIONS_LOADED, handleExtensionsLoaded);
-
-    return () => {
-      window.removeEventListener(AppEvents.SESSION_EXTENSIONS_LOADED, handleExtensionsLoaded);
-    };
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -58,33 +107,71 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
     };
   }, []);
 
-  useEffect(() => {
-    if (refreshTrigger === 0 && !isOpen) {
-      return;
-    }
+  const loadSessionExtensions = useCallback(
+    async (targetSessionId: string, signal?: GetSessionExtensionsSignal) => {
+      const response = await getSessionExtensions({
+        path: { session_id: targetSessionId },
+        signal,
+        throwOnError: true,
+      });
 
-    const fetchExtensions = async () => {
-      if (!sessionId) {
+      if (signal?.aborted || latestSessionIdRef.current !== targetSessionId) {
         return;
       }
 
-      try {
-        const response = await getSessionExtensions({
-          path: { session_id: sessionId },
-        });
+      setSessionExtensions(response.data?.extensions ?? []);
+      setIsSessionExtensionsLoaded(true);
+    },
+    []
+  );
 
-        if (response.data?.extensions) {
-          setSessionExtensions(response.data.extensions);
-          setIsSessionExtensionsLoaded(true);
+  useEffect(() => {
+    if (!sessionId) {
+      setIsSessionExtensionsLoaded(true);
+      return;
+    }
+
+    let controller: AbortController | null = null;
+
+    const loadExtensionsForCurrentSession = (event: Event) => {
+      const targetSessionId = (event as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+
+      if (targetSessionId !== sessionId) {
+        return;
+      }
+
+      controller?.abort();
+      const currentController = new AbortController();
+      controller = currentController;
+
+      loadSessionExtensions(targetSessionId, currentController.signal).catch((error) => {
+        if (currentController.signal.aborted || latestSessionIdRef.current !== targetSessionId) {
+          return;
         }
-      } catch (error) {
+
         console.error('Failed to fetch session extensions:', error);
         setIsSessionExtensionsLoaded(true);
-      }
+      });
     };
 
-    fetchExtensions();
-  }, [sessionId, isOpen, refreshTrigger]);
+    window.addEventListener(AppEvents.SESSION_EXTENSIONS_LOADED, loadExtensionsForCurrentSession);
+
+    return () => {
+      controller?.abort();
+      window.removeEventListener(
+        AppEvents.SESSION_EXTENSIONS_LOADED,
+        loadExtensionsForCurrentSession
+      );
+    };
+  }, [sessionId, loadSessionExtensions]);
+
+  const finishSessionTransition = useCallback((targetSessionId: string) => {
+    if (latestSessionIdRef.current === targetSessionId) {
+      setPendingSort(false);
+      setIsTransitioning(false);
+      setTogglingExtension(null);
+    }
+  }, []);
 
   const handleToggle = useCallback(
     async (extensionConfig: FixedExtensionEntry) => {
@@ -110,11 +197,15 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
           setPendingSort(false);
           setIsTransitioning(false);
           setTogglingExtension(null);
+          sortTimeoutRef.current = null;
         }, 800);
 
         toastService.success({
-          title: 'Extension Updated',
-          msg: `${formatExtensionName(extensionConfig.name)} will be ${!currentState ? 'enabled' : 'disabled'} in new chats`,
+          title: intl.formatMessage(i18n.extensionUpdated),
+          msg: intl.formatMessage(
+            !currentState ? i18n.extensionWillBeEnabled : i18n.extensionWillBeDisabled,
+            { name: formatExtensionName(extensionConfig.name) }
+          ),
         });
         return;
       }
@@ -123,8 +214,8 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
         setIsTransitioning(false);
         setTogglingExtension(null);
         toastService.error({
-          title: 'Extension Toggle Error',
-          msg: 'No active session found. Please start a chat session first.',
+          title: intl.formatMessage(i18n.extensionToggleError),
+          msg: intl.formatMessage(i18n.noActiveSession),
           traceback: 'No session ID available',
         });
         return;
@@ -143,17 +234,17 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
           clearTimeout(sortTimeoutRef.current);
         }
 
-        sortTimeoutRef.current = setTimeout(async () => {
-          const response = await getSessionExtensions({
-            path: { session_id: sessionId },
-          });
-
-          if (response.data?.extensions) {
-            setSessionExtensions(response.data.extensions);
-          }
-          setPendingSort(false);
-          setIsTransitioning(false);
-          setTogglingExtension(null);
+        sortTimeoutRef.current = setTimeout(() => {
+          loadSessionExtensions(sessionId)
+            .catch((error) => {
+              if (latestSessionIdRef.current === sessionId) {
+                console.error('Failed to fetch session extensions:', error);
+              }
+            })
+            .finally(() => {
+              finishSessionTransition(sessionId);
+              sortTimeoutRef.current = null;
+            });
         }, 800);
       } catch {
         setIsTransitioning(false);
@@ -161,7 +252,7 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
         setTogglingExtension(null);
       }
     },
-    [sessionId, isHubView, togglingExtension]
+    [sessionId, isHubView, togglingExtension, intl, loadSessionExtensions, finishSessionTransition]
   );
 
   // Merge all available extensions with session-specific or hub override state
@@ -178,15 +269,29 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
       );
     }
 
-    const sessionExtensionNames = new Set(sessionExtensions.map((ext) => ext.name));
+    const sessionExtensionKeys = new Set(sessionExtensions.map((ext) => nameToKey(ext.name)));
+    const globalExtensionKeys = new Set(allExtensions.map((ext) => nameToKey(ext.name)));
 
-    return allExtensions.map(
+    const mergedExtensions = allExtensions.map(
       (ext) =>
         ({
           ...ext,
-          enabled: sessionExtensionNames.has(ext.name),
+          enabled: sessionExtensionKeys.has(nameToKey(ext.name)),
         }) as FixedExtensionEntry
     );
+
+    for (const sessionExtension of sessionExtensions) {
+      if (globalExtensionKeys.has(nameToKey(sessionExtension.name))) {
+        continue;
+      }
+
+      mergedExtensions.push({
+        ...sessionExtension,
+        enabled: true,
+      });
+    }
+
+    return mergedExtensions;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allExtensions, sessionExtensions, isHubView, hubUpdateTrigger]);
 
@@ -214,6 +319,9 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
     return extensionsList.filter((ext) => ext.enabled).length;
   }, [extensionsList]);
 
+  const shouldHideTrigger =
+    extensionsList.length === 0 || (!isHubView && !isSessionExtensionsLoaded);
+
   return (
     <DropdownMenu
       open={isOpen}
@@ -232,8 +340,8 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
     >
       <DropdownMenuTrigger asChild>
         <button
-          className={`flex items-center [&_svg]:size-4 text-text-primary/70 hover:text-text-primary hover:scale-100 hover:bg-transparent text-xs cursor-pointer ${allExtensions.length === 0 || (!isHubView && !isSessionExtensionsLoaded) ? 'invisible' : ''}`}
-          title="manage extensions"
+          className={`flex items-center [&_svg]:size-4 text-text-primary/70 hover:text-text-primary hover:scale-100 hover:bg-transparent text-xs cursor-pointer ${shouldHideTrigger ? 'invisible' : ''}`}
+          title={intl.formatMessage(i18n.manageExtensions)}
         >
           <Puzzle className="mr-1 h-4 w-4" />
           <span>{activeCount}</span>
@@ -250,14 +358,16 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
         <div className="p-2">
           <Input
             type="text"
-            placeholder="search extensions..."
+            placeholder={intl.formatMessage(i18n.searchExtensions)}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="h-8 text-sm"
             autoFocus
           />
           <p className="text-xs text-text-primary/60 mt-1.5">
-            {isHubView ? 'Extensions for new chats' : 'Extensions for this chat session'}
+            {intl.formatMessage(
+              isHubView ? i18n.extensionsForNewChats : i18n.extensionsForThisSession
+            )}
           </p>
         </div>
         <div
@@ -267,7 +377,9 @@ export const BottomMenuExtensionSelection = ({ sessionId }: BottomMenuExtensionS
         >
           {sortedExtensions.length === 0 ? (
             <div className="px-2 py-4 text-center text-sm text-text-primary/70">
-              {searchQuery ? 'no extensions found' : 'no extensions available'}
+              {intl.formatMessage(
+                searchQuery ? i18n.noExtensionsFound : i18n.noExtensionsAvailable
+              )}
             </div>
           ) : (
             sortedExtensions.map((ext) => {

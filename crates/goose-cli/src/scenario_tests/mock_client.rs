@@ -56,7 +56,7 @@ impl McpClientTrait for MockClient {
     }
 
     fn get_info(&self) -> std::option::Option<&rmcp::model::InitializeResult> {
-        todo!()
+        None
     }
 
     async fn read_resource(
@@ -95,20 +95,15 @@ impl McpClientTrait for MockClient {
 
     async fn call_tool(
         &self,
-        _session_id: &str,
+        _ctx: &goose::agents::ToolCallContext,
         name: &str,
         arguments: Option<serde_json::Map<String, Value>>,
-        _working_dir: Option<&str>,
         _cancel_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         if let Some(handler) = self.handlers.get(name) {
             match handler(&Value::Object(arguments.unwrap_or_default())) {
-                Ok(content) => Ok(CallToolResult {
-                    content,
-                    is_error: None,
-                    structured_content: None,
-                    meta: None,
-                }),
+                Ok(content) => Ok(CallToolResult::success(content)),
                 Err(_e) => Err(Error::UnexpectedResponse),
             }
         } else {

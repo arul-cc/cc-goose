@@ -4,13 +4,13 @@
     "title": "goose-server",
     "description": "An AI agent",
     "contact": {
-      "name": "Block",
+      "name": "AAIF",
       "email": "ai-oss-tools@block.xyz"
     },
     "license": {
       "name": "Apache-2.0"
     },
-    "version": "1.26.0"
+    "version": "1.37.0"
   },
   "paths": {
     "/action-required/tool-confirmation": {
@@ -116,14 +116,45 @@
           "401": {
             "description": "Unauthorized - invalid secret key"
           },
+          "403": {
+            "description": "Forbidden - tool is not app-visible",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "Resource not found"
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "424": {
-            "description": "Agent not initialized"
+            "description": "Frontend tool execution requires the frontend host",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Internal server error"
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -663,6 +694,35 @@
         }
       }
     },
+    "/agent/update_session": {
+      "post": {
+        "tags": [
+          "super::routes::agent"
+        ],
+        "operationId": "update_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session updated"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        }
+      }
+    },
     "/agent/update_working_dir": {
       "post": {
         "tags": [
@@ -714,29 +774,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/config/backup": {
-      "post": {
-        "tags": [
-          "super::routes::config_management"
-        ],
-        "operationId": "backup_config",
-        "responses": {
-          "200": {
-            "description": "Config file backed up",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error"
           }
         }
       }
@@ -810,9 +847,9 @@
           "200": {
             "description": "Custom provider created successfully",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/CreateCustomProviderResponse"
                 }
               }
             }
@@ -940,39 +977,6 @@
         }
       }
     },
-    "/config/detect-provider": {
-      "post": {
-        "tags": [
-          "super::routes::config_management"
-        ],
-        "operationId": "detect_provider",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DetectProviderRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Provider detected successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DetectProviderResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No matching provider found"
-          }
-        }
-      }
-    },
     "/config/extensions": {
       "get": {
         "tags": [
@@ -1062,29 +1066,6 @@
           },
           "404": {
             "description": "Extension not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        }
-      }
-    },
-    "/config/init": {
-      "post": {
-        "tags": [
-          "super::routes::config_management"
-        ],
-        "operationId": "init_config",
-        "responses": {
-          "200": {
-            "description": "Config initialization check completed",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
           },
           "500": {
             "description": "Internal server error"
@@ -1331,6 +1312,66 @@
         }
       }
     },
+    "/config/provider-secrets": {
+      "get": {
+        "tags": [
+          "super::routes::config_management"
+        ],
+        "operationId": "list_provider_secrets",
+        "responses": {
+          "200": {
+            "description": "Provider secrets retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderSecretsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/config/provider-secrets/{id}": {
+      "delete": {
+        "tags": [
+          "super::routes::config_management"
+        ],
+        "operationId": "delete_provider_secret",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Provider secret identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Provider secret deleted successfully",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid provider secret identifier"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
     "/config/providers": {
       "get": {
         "tags": [
@@ -1350,6 +1391,90 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/config/providers/{name}/cleanup": {
+      "post": {
+        "tags": [
+          "super::routes::config_management"
+        ],
+        "operationId": "cleanup_provider_cache",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Provider name (e.g., githubcopilot)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Provider cache cleaned up successfully",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/config/providers/{name}/model-info": {
+      "post": {
+        "tags": [
+          "super::routes::config_management"
+        ],
+        "operationId": "get_provider_model_info",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Provider name (e.g., openai)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderModelInfoQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Model metadata fetched successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown provider, provider not configured, or authentication error"
+          },
+          "429": {
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         }
       }
@@ -1379,7 +1504,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "type": "string"
+                    "$ref": "#/components/schemas/ModelInfo"
                   }
                 }
               }
@@ -1455,29 +1580,6 @@
         }
       }
     },
-    "/config/recover": {
-      "post": {
-        "tags": [
-          "super::routes::config_management"
-        ],
-        "operationId": "recover_config",
-        "responses": {
-          "200": {
-            "description": "Config recovery attempted",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        }
-      }
-    },
     "/config/remove": {
       "post": {
         "tags": [
@@ -1539,6 +1641,18 @@
           "super::routes::config_management"
         ],
         "operationId": "get_slash_commands",
+        "parameters": [
+          {
+            "name": "working_dir",
+            "in": "query",
+            "description": "Optional working directory to discover local skills from",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Slash commands retrieved successfully",
@@ -1859,6 +1973,46 @@
         }
       }
     },
+    "/features": {
+      "get": {
+        "tags": [
+          "super::routes::features"
+        ],
+        "operationId": "get_features",
+        "responses": {
+          "200": {
+            "description": "Compile-time feature flags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeaturesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/handle_nanogpt": {
+      "post": {
+        "tags": [
+          "super::routes::setup"
+        ],
+        "operationId": "start_nanogpt_setup",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/handle_openrouter": {
       "post": {
         "tags": [
@@ -1892,6 +2046,29 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SetupResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/local-inference/chat-templates/builtin": {
+      "get": {
+        "tags": [
+          "super::routes::local_inference"
+        ],
+        "operationId": "list_builtin_chat_templates",
+        "responses": {
+          "200": {
+            "description": "llama.cpp built-in chat template names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
                 }
               }
             }
@@ -2197,6 +2374,19 @@
           },
           "500": {
             "description": "Search failed"
+          }
+        }
+      }
+    },
+    "/local-inference/sync-featured": {
+      "post": {
+        "tags": [
+          "super::routes::local_inference"
+        ],
+        "operationId": "sync_featured_models",
+        "responses": {
+          "200": {
+            "description": "Featured models synced to registry"
           }
         }
       }
@@ -2723,7 +2913,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Scheduled job deleted successfully"
+            "description": "Scheduled job removed successfully"
           },
           "404": {
             "description": "Scheduled job not found"
@@ -3088,6 +3278,50 @@
         ]
       }
     },
+    "/sessions/import/nostr": {
+      "post": {
+        "tags": [
+          "Session Management"
+        ],
+        "operationId": "import_session_nostr",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportSessionNostrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Nostr shared session imported successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - Invalid Nostr share link"
+          },
+          "401": {
+            "description": "Unauthorized - Invalid or missing API key"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
     "/sessions/insights": {
       "get": {
         "tags": [
@@ -3196,6 +3430,127 @@
             "api_key": []
           }
         ]
+      }
+    },
+    "/sessions/{id}/cancel": {
+      "post": {
+        "tags": [
+          "super::routes::session_events"
+        ],
+        "operationId": "session_cancel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Cancellation accepted"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/events": {
+      "get": {
+        "tags": [
+          "super::routes::session_events"
+        ],
+        "operationId": "session_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE event stream",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageEvent"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found"
+          }
+        }
+      }
+    },
+    "/sessions/{id}/reply": {
+      "post": {
+        "tags": [
+          "super::routes::session_events"
+        ],
+        "operationId": "session_reply",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionReplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Request accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionReplyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Session not found"
+          },
+          "424": {
+            "description": "Agent not initialized"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
       }
     },
     "/sessions/{session_id}": {
@@ -3460,6 +3815,61 @@
           },
           "400": {
             "description": "Bad request - Name too long (max 200 characters)"
+          },
+          "401": {
+            "description": "Unauthorized - Invalid or missing API key"
+          },
+          "404": {
+            "description": "Session not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/sessions/{session_id}/share/nostr": {
+      "post": {
+        "tags": [
+          "Session Management"
+        ],
+        "operationId": "share_session_nostr",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Unique identifier for the session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareSessionNostrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session shared to Nostr successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShareSessionNostrResponse"
+                }
+              }
+            }
           },
           "401": {
             "description": "Unauthorized - Invalid or missing API key"
@@ -3871,7 +4281,7 @@
         "type": "object",
         "required": [
           "content",
-          "is_error"
+          "isError"
         ],
         "properties": {
           "_meta": {
@@ -3880,14 +4290,25 @@
           "content": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Content"
+              "$ref": "#/components/schemas/ContentBlock"
             }
           },
-          "is_error": {
+          "isError": {
             "type": "boolean"
           },
-          "structured_content": {
+          "structuredContent": {
             "nullable": true
+          }
+        }
+      },
+      "CancelRequest": {
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string"
           }
         }
       },
@@ -3922,6 +4343,63 @@
           }
         }
       },
+      "ChatTemplate": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "builtin"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "template",
+              "type"
+            ],
+            "properties": {
+              "template": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "custom_inline"
+                ]
+              }
+            }
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type"
+        }
+      },
       "CheckProviderRequest": {
         "type": "object",
         "required": [
@@ -3937,7 +4415,9 @@
         "type": "string",
         "enum": [
           "Builtin",
-          "Recipe"
+          "Recipe",
+          "Skill",
+          "Agent"
         ]
       },
       "ConfigKey": {
@@ -3955,13 +4435,17 @@
             "description": "Optional default value for the key",
             "nullable": true
           },
+          "device_code_flow": {
+            "type": "boolean",
+            "description": "Whether this OAuth flow uses the device code grant (RFC 8628)\nWhen true, the user must enter a verification code in the browser"
+          },
           "name": {
             "type": "string",
             "description": "The name of the configuration key (e.g., \"API_KEY\")"
           },
           "oauth_flow": {
             "type": "boolean",
-            "description": "Whether this key should be configured using OAuth device code flow\nWhen true, the provider's configure_oauth() method will be called instead of prompting for manual input"
+            "description": "Whether this key should be configured using an OAuth flow\nWhen true, the provider's configure_oauth() method will be called instead of prompting for manual input"
           },
           "primary": {
             "type": "boolean",
@@ -4031,12 +4515,40 @@
           {
             "allOf": [
               {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              },
+              {
                 "$ref": "#/components/schemas/RawTextContent"
               }
             ]
           },
           {
             "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "image"
+                    ]
+                  }
+                }
+              },
               {
                 "$ref": "#/components/schemas/RawImageContent"
               }
@@ -4045,6 +4557,20 @@
           {
             "allOf": [
               {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "resource"
+                    ]
+                  }
+                }
+              },
+              {
                 "$ref": "#/components/schemas/RawEmbeddedResource"
               }
             ]
@@ -4052,12 +4578,149 @@
           {
             "allOf": [
               {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "audio"
+                    ]
+                  }
+                }
+              },
+              {
                 "$ref": "#/components/schemas/RawAudioContent"
               }
             ]
           },
           {
             "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "resource_link"
+                    ]
+                  }
+                }
+              },
+              {
+                "$ref": "#/components/schemas/RawResource"
+              }
+            ]
+          }
+        ]
+      },
+      "ContentBlock": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              },
+              {
+                "$ref": "#/components/schemas/RawTextContent"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "image"
+                    ]
+                  }
+                }
+              },
+              {
+                "$ref": "#/components/schemas/RawImageContent"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "resource"
+                    ]
+                  }
+                }
+              },
+              {
+                "$ref": "#/components/schemas/RawEmbeddedResource"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "audio"
+                    ]
+                  }
+                }
+              },
+              {
+                "$ref": "#/components/schemas/RawAudioContent"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "resource_link"
+                    ]
+                  }
+                }
+              },
               {
                 "$ref": "#/components/schemas/RawResource"
               }
@@ -4069,6 +4732,17 @@
         "type": "array",
         "items": {
           "$ref": "#/components/schemas/Message"
+        }
+      },
+      "CreateCustomProviderResponse": {
+        "type": "object",
+        "required": [
+          "provider_name"
+        ],
+        "properties": {
+          "provider_name": {
+            "type": "string"
+          }
         }
       },
       "CreateRecipeRequest": {
@@ -4195,14 +4869,34 @@
           "display_name": {
             "type": "string"
           },
+          "dynamic_models": {
+            "type": "boolean",
+            "description": "Controls whether `fetch_supported_models` calls the provider's `/v1/models`\nendpoint or returns the static `models` list directly.\n\n- `Some(false)` + non-empty `models`: return the static list; no API call.\nConstruction fails if `models` is empty.\n- `Some(true)` or `None`: try the API; fall back to `models` on 404.",
+            "nullable": true
+          },
           "engine": {
             "$ref": "#/components/schemas/ProviderEngine"
+          },
+          "env_vars": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvVarConfig"
+            },
+            "nullable": true
+          },
+          "fast_model": {
+            "type": "string",
+            "nullable": true
           },
           "headers": {
             "type": "object",
             "additionalProperties": {
               "type": "string"
             },
+            "nullable": true
+          },
+          "model_doc_link": {
+            "type": "string",
             "nullable": true
           },
           "models": {
@@ -4214,7 +4908,19 @@
           "name": {
             "type": "string"
           },
+          "preserves_thinking": {
+            "type": "boolean"
+          },
           "requires_auth": {
+            "type": "boolean"
+          },
+          "setup_steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "skip_canonical_filtering": {
             "type": "boolean"
           },
           "supports_streaming": {
@@ -4258,35 +4964,6 @@
         ],
         "properties": {
           "id": {
-            "type": "string"
-          }
-        }
-      },
-      "DetectProviderRequest": {
-        "type": "object",
-        "required": [
-          "api_key"
-        ],
-        "properties": {
-          "api_key": {
-            "type": "string"
-          }
-        }
-      },
-      "DetectProviderResponse": {
-        "type": "object",
-        "required": [
-          "provider_name",
-          "models"
-        ],
-        "properties": {
-          "models": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "provider_name": {
             "type": "string"
           }
         }
@@ -4457,6 +5134,36 @@
         "properties": {
           "deeplink": {
             "type": "string"
+          }
+        }
+      },
+      "EnvVarConfig": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "default": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "primary": {
+            "type": "boolean",
+            "description": "When true, the field is shown prominently in the UI (not collapsed).\nDefaults to the value of `required` if not specified.",
+            "nullable": true
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "secret": {
+            "type": "boolean"
           }
         }
       },
@@ -4691,6 +5398,11 @@
                 "type": "string",
                 "description": "The name used to identify this extension"
               },
+              "socket": {
+                "type": "string",
+                "description": "Optional Unix domain socket path for HTTP-over-UDS transport.\nWhen set, the HTTP connection is routed through this socket while\n`uri` is used for the Host header and path.\nUse `@name` for Linux abstract sockets.",
+                "nullable": true
+              },
               "timeout": {
                 "type": "integer",
                 "format": "int64",
@@ -4892,6 +5604,21 @@
           }
         }
       },
+      "FeaturesResponse": {
+        "type": "object",
+        "required": [
+          "features"
+        ],
+        "properties": {
+          "features": {
+            "type": "object",
+            "description": "Map of feature name to enabled status",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
       "ForkRequest": {
         "type": "object",
         "required": [
@@ -4983,6 +5710,15 @@
           }
         ]
       },
+      "GooseMode": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "approve",
+          "smart_approve",
+          "chat"
+        ]
+      },
       "HfGgufFile": {
         "type": "object",
         "description": "A single downloadable GGUF file (used internally and for downloads).",
@@ -5070,6 +5806,9 @@
           "quantization": {
             "type": "string"
           },
+          "sharded": {
+            "type": "boolean"
+          },
           "size_bytes": {
             "type": "integer",
             "format": "int64",
@@ -5094,8 +5833,34 @@
           },
           "src": {
             "type": "string"
+          },
+          "theme": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IconTheme"
+              },
+              {
+                "type": "object"
+              }
+            ]
           }
         }
+      },
+      "IconTheme": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "light"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "dark"
+            ]
+          }
+        ]
       },
       "ImageContent": {
         "type": "object",
@@ -5152,6 +5917,17 @@
           }
         }
       },
+      "ImportSessionNostrRequest": {
+        "type": "object",
+        "required": [
+          "deeplink"
+        ],
+        "properties": {
+          "deeplink": {
+            "type": "string"
+          }
+        }
+      },
       "ImportSessionRequest": {
         "type": "object",
         "required": [
@@ -5160,6 +5936,25 @@
         "properties": {
           "json": {
             "type": "string"
+          }
+        }
+      },
+      "InferenceMetadata": {
+        "type": "object",
+        "required": [
+          "provider",
+          "requestedModel"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "requestedModel": {
+            "type": "string"
+          },
+          "resolvedModel": {
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -5272,7 +6067,8 @@
           "size_bytes",
           "status",
           "recommended",
-          "settings"
+          "settings",
+          "vision_capable"
         ],
         "properties": {
           "filename": {
@@ -5280,6 +6076,14 @@
           },
           "id": {
             "type": "string"
+          },
+          "mmproj_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ModelDownloadStatus"
+              }
+            ],
+            "nullable": true
           },
           "quantization": {
             "type": "string"
@@ -5300,6 +6104,9 @@
           },
           "status": {
             "$ref": "#/components/schemas/ModelDownloadStatus"
+          },
+          "vision_capable": {
+            "type": "boolean"
           }
         }
       },
@@ -5592,27 +6399,6 @@
                 }
               }
             ]
-          },
-          {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ReasoningContent"
-              },
-              {
-                "type": "object",
-                "required": [
-                  "type"
-                ],
-                "properties": {
-                  "type": {
-                    "type": "string",
-                    "enum": [
-                      "reasoning"
-                    ]
-                  }
-                }
-              }
-            ]
           }
         ],
         "description": "Content passed inside a message, which can be both simple content and tool content",
@@ -5687,28 +6473,6 @@
           {
             "type": "object",
             "required": [
-              "model",
-              "mode",
-              "type"
-            ],
-            "properties": {
-              "mode": {
-                "type": "string"
-              },
-              "model": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "ModelChange"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
               "request_id",
               "message",
               "type"
@@ -5748,6 +6512,28 @@
           },
           {
             "type": "object",
+            "description": "Sent at the start of an SSE stream to inform the client about\nin-flight requests it can reattach to.",
+            "required": [
+              "request_ids",
+              "type"
+            ],
+            "properties": {
+              "request_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ActiveRequests"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "type"
             ],
@@ -5767,7 +6553,7 @@
       },
       "MessageMetadata": {
         "type": "object",
-        "description": "Metadata for message visibility",
+        "description": "Metadata for message visibility and model inference details",
         "required": [
           "userVisible",
           "agentVisible"
@@ -5776,6 +6562,14 @@
           "agentVisible": {
             "type": "boolean",
             "description": "Whether the message should be included in the agent's context window"
+          },
+          "inference": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InferenceMetadata"
+              }
+            ],
+            "nullable": true
           },
           "userVisible": {
             "type": "boolean",
@@ -5956,6 +6750,15 @@
             "description": "Cost per token for output in USD (optional)",
             "nullable": true
           },
+          "reasoning": {
+            "type": "boolean",
+            "description": "Whether this model supports reasoning/thinking controls"
+          },
+          "resolved_model": {
+            "type": "string",
+            "description": "The underlying model resolved from provider metadata, when the configured model is an alias or endpoint.",
+            "nullable": true
+          },
           "supports_cache_control": {
             "type": "boolean",
             "description": "Whether this model supports cache control",
@@ -5969,6 +6772,7 @@
           "provider",
           "model",
           "context_limit",
+          "reasoning",
           "currency"
         ],
         "properties": {
@@ -6009,6 +6813,9 @@
           },
           "provider": {
             "type": "string"
+          },
+          "reasoning": {
+            "type": "boolean"
           }
         }
       },
@@ -6049,11 +6856,17 @@
       "ModelSettings": {
         "type": "object",
         "properties": {
+          "chat_template": {
+            "$ref": "#/components/schemas/ChatTemplate"
+          },
           "context_size": {
             "type": "integer",
             "format": "int32",
             "nullable": true,
             "minimum": 0
+          },
+          "enable_thinking": {
+            "type": "boolean"
           },
           "flash_attention": {
             "type": "boolean",
@@ -6063,9 +6876,20 @@
             "type": "number",
             "format": "float"
           },
+          "image_token_estimate": {
+            "type": "integer",
+            "description": "Estimated tokens per image for budget planning before mtmd tokenization.\nThe actual count is determined after tokenization via `chunks.total_tokens()`.",
+            "minimum": 0
+          },
           "max_output_tokens": {
             "type": "integer",
             "nullable": true,
+            "minimum": 0
+          },
+          "mmproj_size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size of the mmproj file in bytes, used for memory accounting.",
             "minimum": 0
           },
           "n_batch": {
@@ -6085,9 +6909,6 @@
             "format": "int32",
             "nullable": true
           },
-          "native_tool_calling": {
-            "type": "boolean"
-          },
           "presence_penalty": {
             "type": "number",
             "format": "float"
@@ -6103,11 +6924,15 @@
           "sampling": {
             "$ref": "#/components/schemas/SamplingConfig"
           },
-          "use_jinja": {
-            "type": "boolean"
+          "tool_calling": {
+            "$ref": "#/components/schemas/ToolCallingMode"
           },
           "use_mlock": {
             "type": "boolean"
+          },
+          "vision_capable": {
+            "type": "boolean",
+            "description": "Whether this model architecture supports vision input.\nDerived from associated mmproj metadata, not user-configurable."
           }
         }
       },
@@ -6302,6 +7127,10 @@
           },
           "provider_type": {
             "$ref": "#/components/schemas/ProviderType"
+          },
+          "saved_model": {
+            "type": "string",
+            "nullable": true
           }
         }
       },
@@ -6356,9 +7185,117 @@
             "type": "string",
             "description": "Link to the docs where models can be found"
           },
+          "model_selection_hint": {
+            "type": "string",
+            "description": "Hint shown in the model picker when this provider manages its own model selection.",
+            "nullable": true
+          },
           "name": {
             "type": "string",
             "description": "The unique identifier for this provider"
+          },
+          "setup_steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "step-by-step instructions for set up providers eg: api key"
+          }
+        }
+      },
+      "ProviderModelInfoQuery": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          }
+        }
+      },
+      "ProviderSecret": {
+        "type": "object",
+        "required": [
+          "id",
+          "provider",
+          "provider_display_name",
+          "name",
+          "storage",
+          "status",
+          "configured",
+          "has_secret",
+          "can_delete",
+          "can_configure"
+        ],
+        "properties": {
+          "can_configure": {
+            "type": "boolean"
+          },
+          "can_delete": {
+            "type": "boolean"
+          },
+          "configure_provider": {
+            "type": "string",
+            "nullable": true
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "has_secret": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "provider_display_name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProviderSecretStatus"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/ProviderSecretStorage"
+          }
+        }
+      },
+      "ProviderSecretStatus": {
+        "type": "string",
+        "enum": [
+          "valid",
+          "expired",
+          "unknown"
+        ]
+      },
+      "ProviderSecretStorage": {
+        "type": "string",
+        "enum": [
+          "secret_store",
+          "provider_cache"
+        ]
+      },
+      "ProviderSecretsResponse": {
+        "type": "object",
+        "required": [
+          "secrets"
+        ],
+        "properties": {
+          "secrets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderSecret"
+            }
           }
         }
       },
@@ -6568,17 +7505,6 @@
             "type": "string"
           },
           "uri": {
-            "type": "string"
-          }
-        }
-      },
-      "ReasoningContent": {
-        "type": "object",
-        "required": [
-          "text"
-        ],
-        "properties": {
-          "text": {
             "type": "string"
           }
         }
@@ -6804,9 +7730,22 @@
       "RepoVariantsResponse": {
         "type": "object",
         "required": [
-          "variants"
+          "variants",
+          "available_memory_bytes",
+          "downloaded_quants"
         ],
         "properties": {
+          "available_memory_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "downloaded_quants": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "recommended_index": {
             "type": "integer",
             "nullable": true,
@@ -6993,10 +7932,16 @@
       "Role": {
         "oneOf": [
           {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "user"
+            ]
           },
           {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "assistant"
+            ]
           }
         ]
       },
@@ -7131,9 +8076,17 @@
       "SaveRecipeResponse": {
         "type": "object",
         "required": [
-          "id"
+          "id",
+          "file_name",
+          "file_path"
         ],
         "properties": {
+          "file_name": {
+            "type": "string"
+          },
+          "file_path": {
+            "type": "string"
+          },
           "id": {
             "type": "string"
           }
@@ -7202,12 +8155,33 @@
             "format": "date-time",
             "nullable": true
           },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "allOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          },
           "paused": {
             "type": "boolean"
           },
           "process_start_time": {
             "type": "string",
             "format": "date-time",
+            "nullable": true
+          },
+          "recipe_base_dir": {
+            "type": "string",
+            "description": "Original directory of the recipe file before it was copied to scheduled_recipes/.\nPreserved so that relative paths (sub-recipes, template includes) resolve correctly\nagainst the source tree rather than the scheduler's internal storage directory.",
             "nullable": true
           },
           "source": {
@@ -7227,6 +8201,11 @@
           "message_count"
         ],
         "properties": {
+          "accumulated_cost": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
           "accumulated_input_tokens": {
             "type": "integer",
             "format": "int32",
@@ -7240,6 +8219,11 @@
           "accumulated_total_tokens": {
             "type": "integer",
             "format": "int32",
+            "nullable": true
+          },
+          "archived_at": {
+            "type": "string",
+            "format": "date-time",
             "nullable": true
           },
           "conversation": {
@@ -7256,6 +8240,9 @@
           },
           "extension_data": {
             "$ref": "#/components/schemas/ExtensionData"
+          },
+          "goose_mode": {
+            "$ref": "#/components/schemas/GooseMode"
           },
           "id": {
             "type": "string"
@@ -7283,6 +8270,10 @@
           "output_tokens": {
             "type": "integer",
             "format": "int32",
+            "nullable": true
+          },
+          "project_id": {
+            "type": "string",
             "nullable": true
           },
           "provider_name": {
@@ -7436,6 +8427,40 @@
           }
         }
       },
+      "SessionReplyRequest": {
+        "type": "object",
+        "required": [
+          "request_id",
+          "user_message"
+        ],
+        "properties": {
+          "override_conversation": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "nullable": true
+          },
+          "request_id": {
+            "type": "string",
+            "description": "Client-generated UUIDv7 identifying this request."
+          },
+          "user_message": {
+            "$ref": "#/components/schemas/Message"
+          }
+        }
+      },
+      "SessionReplyResponse": {
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string"
+          }
+        }
+      },
       "SessionType": {
         "type": "string",
         "enum": [
@@ -7444,7 +8469,8 @@
           "sub_agent",
           "hidden",
           "terminal",
-          "gateway"
+          "gateway",
+          "acp"
         ]
       },
       "SessionsQuery": {
@@ -7524,6 +8550,43 @@
           },
           "success": {
             "type": "boolean"
+          }
+        }
+      },
+      "ShareSessionNostrRequest": {
+        "type": "object",
+        "properties": {
+          "relays": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ShareSessionNostrResponse": {
+        "type": "object",
+        "required": [
+          "deeplink",
+          "nevent",
+          "eventId",
+          "relays"
+        ],
+        "properties": {
+          "deeplink": {
+            "type": "string"
+          },
+          "eventId": {
+            "type": "string"
+          },
+          "nevent": {
+            "type": "string"
+          },
+          "relays": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -7729,13 +8792,22 @@
       "TaskSupport": {
         "oneOf": [
           {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "forbidden"
+            ]
           },
           {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "optional"
+            ]
           },
           {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "required"
+            ]
           }
         ]
       },
@@ -7822,6 +8894,16 @@
           }
         }
       },
+      "ThinkingEffort": {
+        "type": "string",
+        "enum": [
+          "off",
+          "low",
+          "medium",
+          "high",
+          "max"
+        ]
+      },
       "TokenState": {
         "type": "object",
         "required": [
@@ -7833,6 +8915,11 @@
           "accumulatedTotalTokens"
         ],
         "properties": {
+          "accumulatedCost": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
           "accumulatedInputTokens": {
             "type": "integer",
             "format": "int32"
@@ -7935,6 +9022,14 @@
           }
         }
       },
+      "ToolCallingMode": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "force_native",
+          "force_emulated"
+        ]
+      },
       "ToolConfirmationRequest": {
         "type": "object",
         "required": [
@@ -7984,6 +9079,9 @@
         "properties": {
           "description": {
             "type": "string"
+          },
+          "input_schema": {
+            "type": "object"
           },
           "name": {
             "type": "string"
@@ -8194,6 +9292,10 @@
               "type": "string"
             }
           },
+          "preserves_thinking": {
+            "type": "boolean",
+            "nullable": true
+          },
           "requires_auth": {
             "type": "boolean"
           },
@@ -8263,6 +9365,21 @@
           "name": {
             "type": "string",
             "description": "Updated name for the session (max 200 characters)"
+          }
+        }
+      },
+      "UpdateSessionRequest": {
+        "type": "object",
+        "required": [
+          "session_id"
+        ],
+        "properties": {
+          "goose_mode": {
+            "type": "string",
+            "nullable": true
+          },
+          "session_id": {
+            "type": "string"
           }
         }
       },

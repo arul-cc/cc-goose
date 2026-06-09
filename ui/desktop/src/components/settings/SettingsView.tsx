@@ -9,21 +9,75 @@ import ConfigSettings from './config/ConfigSettings';
 import PromptsSettingsSection from './PromptsSettingsSection';
 import { ExtensionConfig } from '../../api';
 import { MainPanelLayout } from '../Layout/MainPanelLayout';
-import { Bot, Share2, Monitor, MessageSquare, FileText, Keyboard, HardDrive } from 'lucide-react';
+import {
+  Bot,
+  Share2,
+  Monitor,
+  MessageSquare,
+  FileText,
+  Keyboard,
+  HardDrive,
+  Network,
+  KeyRound,
+} from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import TunnelSection from './tunnel/TunnelSection';
 import GatewaySettingsSection from './gateways/GatewaySettingsSection';
 import { getTunnelStatus } from '../../api/sdk.gen';
 import ChatSettingsSection from './chat/ChatSettingsSection';
 import KeyboardShortcutsSection from './keyboard/KeyboardShortcutsSection';
+import AuthSettingsSection from './auth/AuthSettingsSection';
 import LocalInferenceSection from './localInference/LocalInferenceSection';
+import MeshSection from './mesh/MeshSection';
 import { CONFIGURATION_ENABLED } from '../../updates';
 import { trackSettingsTabViewed } from '../../utils/analytics';
+import { useFeatures } from '../../contexts/FeaturesContext';
+import { defineMessages, useIntl } from '../../i18n';
+
+const i18n = defineMessages({
+  title: {
+    id: 'settingsView.title',
+    defaultMessage: 'Settings',
+  },
+  tabModels: {
+    id: 'settingsView.tabModels',
+    defaultMessage: 'Models',
+  },
+  tabLocalInference: {
+    id: 'settingsView.tabLocalInference',
+    defaultMessage: 'Local Inference',
+  },
+  tabChat: {
+    id: 'settingsView.tabChat',
+    defaultMessage: 'Chat',
+  },
+  tabSession: {
+    id: 'settingsView.tabSession',
+    defaultMessage: 'Session',
+  },
+  tabPrompts: {
+    id: 'settingsView.tabPrompts',
+    defaultMessage: 'Prompts',
+  },
+  tabKeyboard: {
+    id: 'settingsView.tabKeyboard',
+    defaultMessage: 'Keyboard',
+  },
+  tabAuth: {
+    id: 'settingsView.tabAuth',
+    defaultMessage: 'Auth',
+  },
+  tabApp: {
+    id: 'settingsView.tabApp',
+    defaultMessage: 'App',
+  },
+});
 
 export type SettingsViewOptions = {
   deepLinkConfig?: ExtensionConfig;
   showEnvVars?: boolean;
   section?: string;
+  sessionId?: string;
 };
 
 export default function SettingsView({
@@ -38,6 +92,8 @@ export default function SettingsView({
   const [activeTab, setActiveTab] = useState('models');
   const [tunnelDisabled, setTunnelDisabled] = useState(false);
   const hasTrackedInitialTab = useRef(false);
+  const { localInference } = useFeatures();
+  const intl = useIntl();
 
   const handleTabChange = (tab: string) => {
     setActiveTab(tab);
@@ -59,16 +115,32 @@ export default function SettingsView({
         chat: 'chat',
         prompts: 'prompts',
         keyboard: 'keyboard',
+        auth: 'auth',
         gateway: 'sharing',
         'local-inference': 'local-inference',
+        mesh: 'mesh',
       };
 
       const targetTab = sectionToTab[viewOptions.section];
-      if (targetTab) {
+      if (
+        targetTab &&
+        (targetTab !== 'local-inference' || localInference) &&
+        (targetTab !== 'mesh' || !tunnelDisabled)
+      ) {
         setActiveTab(targetTab);
       }
     }
-  }, [viewOptions.section]);
+  }, [viewOptions.section, localInference, tunnelDisabled]);
+
+  // Reset active tab if local-inference or mesh becomes unavailable
+  useEffect(() => {
+    if (!localInference && activeTab === 'local-inference') {
+      setActiveTab('models');
+    }
+    if (tunnelDisabled && activeTab === 'mesh') {
+      setActiveTab('models');
+    }
+  }, [localInference, tunnelDisabled, activeTab]);
 
   useEffect(() => {
     if (!hasTrackedInitialTab.current) {
@@ -108,7 +180,7 @@ export default function SettingsView({
           <div className="bg-background-primary px-8 pb-8 pt-16">
             <div className="flex flex-col page-transition">
               <div className="flex justify-between items-center mb-1">
-                <h1 className="text-4xl font-light">Settings</h1>
+                <h1 className="text-4xl font-light">{intl.formatMessage(i18n.title)}</h1>
               </div>
             </div>
           </div>
@@ -127,19 +199,31 @@ export default function SettingsView({
                     data-testid="settings-models-tab"
                   >
                     <Bot className="h-4 w-4" />
-                    Models
+                    {intl.formatMessage(i18n.tabModels)}
                   </TabsTrigger>
-                  <TabsTrigger
-                    value="local-inference"
-                    className="flex gap-2"
-                    data-testid="settings-local-inference-tab"
-                  >
-                    <HardDrive className="h-4 w-4" />
-                    Local Inference
-                  </TabsTrigger>
+                  {localInference && (
+                    <TabsTrigger
+                      value="local-inference"
+                      className="flex gap-2"
+                      data-testid="settings-local-inference-tab"
+                    >
+                      <HardDrive className="h-4 w-4" />
+                      {intl.formatMessage(i18n.tabLocalInference)}
+                    </TabsTrigger>
+                  )}
+                  {!tunnelDisabled && (
+                    <TabsTrigger
+                      value="mesh"
+                      className="flex gap-2"
+                      data-testid="settings-mesh-tab"
+                    >
+                      <Network className="h-4 w-4" />
+                      Mesh
+                    </TabsTrigger>
+                  )}
                   <TabsTrigger value="chat" className="flex gap-2" data-testid="settings-chat-tab">
                     <MessageSquare className="h-4 w-4" />
-                    Chat
+                    {intl.formatMessage(i18n.tabChat)}
                   </TabsTrigger>
                   <TabsTrigger
                     value="sharing"
@@ -147,7 +231,7 @@ export default function SettingsView({
                     data-testid="settings-sharing-tab"
                   >
                     <Share2 className="h-4 w-4" />
-                    Session
+                    {intl.formatMessage(i18n.tabSession)}
                   </TabsTrigger>
                   <TabsTrigger
                     value="prompts"
@@ -155,7 +239,7 @@ export default function SettingsView({
                     data-testid="settings-prompts-tab"
                   >
                     <FileText className="h-4 w-4" />
-                    Prompts
+                    {intl.formatMessage(i18n.tabPrompts)}
                   </TabsTrigger>
                   <TabsTrigger
                     value="keyboard"
@@ -163,11 +247,15 @@ export default function SettingsView({
                     data-testid="settings-keyboard-tab"
                   >
                     <Keyboard className="h-4 w-4" />
-                    Keyboard
+                    {intl.formatMessage(i18n.tabKeyboard)}
+                  </TabsTrigger>
+                  <TabsTrigger value="auth" className="flex gap-2" data-testid="settings-auth-tab">
+                    <KeyRound className="h-4 w-4" />
+                    {intl.formatMessage(i18n.tabAuth)}
                   </TabsTrigger>
                   <TabsTrigger value="app" className="flex gap-2" data-testid="settings-app-tab">
                     <Monitor className="h-4 w-4" />
-                    App
+                    {intl.formatMessage(i18n.tabApp)}
                   </TabsTrigger>
                 </TabsList>
               </div>
@@ -180,18 +268,29 @@ export default function SettingsView({
                   <ModelsSection setView={setView} />
                 </TabsContent>
 
-                <TabsContent
-                  value="local-inference"
-                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
-                >
-                  <LocalInferenceSection />
-                </TabsContent>
+                {localInference && (
+                  <TabsContent
+                    value="local-inference"
+                    className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                  >
+                    <LocalInferenceSection />
+                  </TabsContent>
+                )}
+
+                {!tunnelDisabled && (
+                  <TabsContent
+                    value="mesh"
+                    className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                  >
+                    <MeshSection />
+                  </TabsContent>
+                )}
 
                 <TabsContent
                   value="chat"
                   className="mt-0 focus-visible:outline-none focus-visible:ring-0"
                 >
-                  <ChatSettingsSection />
+                  <ChatSettingsSection sessionId={viewOptions.sessionId} />
                 </TabsContent>
 
                 <TabsContent
@@ -222,6 +321,13 @@ export default function SettingsView({
                   className="mt-0 focus-visible:outline-none focus-visible:ring-0"
                 >
                   <KeyboardShortcutsSection />
+                </TabsContent>
+
+                <TabsContent
+                  value="auth"
+                  className="mt-0 focus-visible:outline-none focus-visible:ring-0"
+                >
+                  <AuthSettingsSection />
                 </TabsContent>
 
                 <TabsContent

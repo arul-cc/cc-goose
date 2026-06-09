@@ -94,19 +94,34 @@ export function getTextAndImageContent(message: Message): {
     }
   }
 
+  // Strip assistant-only markup that shouldn't appear in rendered text
+  if (message.role === 'assistant') {
+    textContent = stripToolCallMarkers(textContent);
+  }
+
   return { textContent, imagePaths };
 }
 
-export function getReasoningContent(message: Message): string | null {
-  const reasoningContents = message.content
-    .filter((content) => content.type === 'reasoning')
-    .map((content) => {
-      if ('text' in content) return content.text;
-      return '';
-    })
-    .filter((text) => text.length > 0);
+function stripToolCallMarkers(text: string): string {
+  // Remove all tool call XML markers and their content
+  return text
+    .replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g, '')
+    .replace(/<\|tool_call_begin\|>[\s\S]*?<\|tool_call_end\|>/g, '')
+    .replace(/<\|tool_call_argument_begin\|>[\s\S]*?<\|tool_call_argument_end\|>/g, '')
+    .trim();
+}
 
-  return reasoningContents.length > 0 ? reasoningContents.join('') : null;
+export function getThinkingContent(message: Message): string | null {
+  const parts: string[] = [];
+
+  // Structured thinking content blocks
+  for (const content of message.content) {
+    if (content.type === 'thinking' && 'thinking' in content && content.thinking) {
+      parts.push(content.thinking);
+    }
+  }
+
+  return parts.length > 0 ? parts.join('') : null;
 }
 
 export function getToolRequests(message: Message): (ToolRequest & { type: 'toolRequest' })[] {

@@ -1,5 +1,5 @@
 ---
-sidebar_position: 95
+sidebar_position: 11
 title: Environment Variables
 sidebar_label: Environment Variables
 ---
@@ -18,6 +18,7 @@ These are the minimum required variables to get started with goose.
 |----------|---------|---------|---------|
 | `GOOSE_PROVIDER` | Specifies the LLM provider to use | [See available providers](/docs/getting-started/providers#available-providers) | None (must be [configured](/docs/getting-started/providers#configure-provider-and-model)) |
 | `GOOSE_MODEL` | Specifies which model to use from the provider | Model name (e.g., "gpt-4", "claude-sonnet-4-20250514") | None (must be [configured](/docs/getting-started/providers#configure-provider-and-model)) |
+| `GOOSE_FAST_MODEL` | Overrides the provider's default fast model used for auxiliary calls (tool-selection, classification, session titles) | Model name (e.g., "gpt-4o-mini", "google/gemini-2.5-flash") | Provider-specific default |
 | `GOOSE_TEMPERATURE` | Sets the [temperature](https://medium.com/@kelseyywang/a-comprehensive-guide-to-llm-temperature-%EF%B8%8F-363a40bbc91f) for model responses | Float between 0.0 and 1.0 | Model-specific default |
 | `GOOSE_MAX_TOKENS` | Sets the maximum number of tokens for each model response (truncates longer responses) | Positive integer (e.g., 4096, 8192) | Model-specific default |
 
@@ -28,6 +29,9 @@ These are the minimum required variables to get started with goose.
 export GOOSE_PROVIDER="anthropic"
 export GOOSE_MODEL="claude-sonnet-4-5-20250929"
 export GOOSE_TEMPERATURE=0.7
+
+# Override the fast model used for auxiliary calls (tool-selection, classification, etc.)
+export GOOSE_FAST_MODEL="gpt-4o-mini"
 
 # Set a lower limit for shorter interactions
 export GOOSE_MAX_TOKENS=4096
@@ -130,62 +134,32 @@ export GOOSE_PREDEFINED_MODELS='[
 
 Custom context limits and request parameters are applied when the model is used. Custom context limits are displayed in goose CLI's [token usage indicator](/docs/guides/sessions/smart-context-management#token-usage).
 
-### Lead/Worker Model Configuration
+### Claude Thinking Configuration
 
-These variables configure a [lead/worker model pattern](/docs/tutorials/lead-worker) where a powerful lead model handles initial planning and complex reasoning, then switches to a faster/cheaper worker model for execution. The switch happens automatically based on your settings.
+These variables control Claude's reasoning behavior. Supported on Anthropic and Databricks providers.
 
 | Variable | Purpose | Values | Default |
 |----------|---------|---------|---------|
-| `GOOSE_LEAD_MODEL` | **Required to enable lead mode.** Name of the lead model | Model name (e.g., "gpt-4o", "claude-sonnet-4-20250514") | None |
-| `GOOSE_LEAD_PROVIDER` | Provider for the lead model | [See available providers](/docs/getting-started/providers#available-providers) | Falls back to `GOOSE_PROVIDER` |
-| `GOOSE_LEAD_TURNS` | Number of initial turns using the lead model before switching to the worker model | Integer | 3 |
-| `GOOSE_LEAD_FAILURE_THRESHOLD` | Consecutive failures before falling back to the lead model | Integer | 2 |
-| `GOOSE_LEAD_FALLBACK_TURNS` | Number of turns to use the lead model in fallback mode | Integer | 2 |
-
-A _turn_ is one complete prompt-response interaction. Here's how it works with the default settings:
-- Use the lead model for the first 3 turns
-- Use the worker model starting on the 4th turn
-- Fallback to the lead model if the worker model struggles for 2 consecutive turns
-- Use the lead model for 2 turns and then switch back to the worker model
-
-The lead model and worker model names are displayed at the start of the goose CLI session. If you don't export a `GOOSE_MODEL` for your session, the worker model defaults to the `GOOSE_MODEL` in your [configuration file](/docs/guides/config-files).
+| `CLAUDE_THINKING_TYPE` | Controls Claude reasoning mode | `adaptive`, `enabled`, `disabled` | `adaptive` for Claude 4.6+ models, otherwise `disabled` |
+| `CLAUDE_THINKING_BUDGET` | Maximum tokens allocated for Claude's internal reasoning process when `CLAUDE_THINKING_TYPE=enabled` | Positive integer (minimum 1024) | 16000 |
 
 **Examples**
 
 ```bash
-# Basic lead/worker setup
-export GOOSE_LEAD_MODEL="o4"
+# Claude 4.6 adaptive thinking
+export GOOSE_PROVIDER=anthropic
+export GOOSE_MODEL=claude-sonnet-4-6
+export CLAUDE_THINKING_TYPE=adaptive
 
-# Advanced lead/worker configuration
-export GOOSE_LEAD_MODEL="claude4-opus"
-export GOOSE_LEAD_PROVIDER="anthropic"
-export GOOSE_LEAD_TURNS=5
-export GOOSE_LEAD_FAILURE_THRESHOLD=3
-export GOOSE_LEAD_FALLBACK_TURNS=2
-```
+# Explicit extended thinking with the default budget
+export CLAUDE_THINKING_TYPE=enabled
 
-### Claude Extended Thinking
-
-These variables control Claude's [extended thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking) feature, which allows the model to reason through complex problems before generating a response. Supported on Anthropic and Databricks providers.
-
-| Variable | Purpose | Values | Default |
-|----------|---------|---------|---------|
-| `CLAUDE_THINKING_ENABLED` | Enables extended thinking for Claude models | Set to any value to enable | Disabled |
-| `CLAUDE_THINKING_BUDGET` | Maximum tokens allocated for Claude's internal reasoning process | Positive integer (minimum 1024) | 16000 |
-
-**Examples**
-
-```bash
-# Enable extended thinking with default budget (16000 tokens)
-export CLAUDE_THINKING_ENABLED=1
-
-# Enable with a larger budget for complex tasks
-export CLAUDE_THINKING_ENABLED=1
+# Explicit extended thinking with a larger budget for complex tasks
+export CLAUDE_THINKING_TYPE=enabled
 export CLAUDE_THINKING_BUDGET=32000
 
-# Enable with a smaller budget for faster responses
-export CLAUDE_THINKING_ENABLED=1
-export CLAUDE_THINKING_BUDGET=8000
+# Disable Claude thinking entirely
+export CLAUDE_THINKING_TYPE=disabled
 ```
 
 :::tip Viewing Thinking Output
@@ -194,7 +168,7 @@ To see Claude's thinking output in the **CLI**, you also need to set `GOOSE_CLI_
 
 ### Planning Mode Configuration
 
-These variables control goose's [planning functionality](/docs/guides/creating-plans).
+These variables control goose's [planning functionality](/docs/guides/context-engineering/creating-plans).
 
 | Variable | Purpose | Values | Default |
 |----------|---------|---------|---------|
@@ -258,9 +232,12 @@ These variables control how goose manages conversation sessions and context.
 |----------|---------|---------|---------|
 | `GOOSE_CONTEXT_STRATEGY` | Controls how goose handles context limit exceeded situations | "summarize", "truncate", "clear", "prompt" | "prompt" (interactive), "summarize" (headless) |
 | `GOOSE_MAX_TURNS` | [Maximum number of turns](/docs/guides/sessions/smart-context-management#maximum-turns) allowed without user input | Integer (e.g., 10, 50, 100) | 1000 |
-| `GOOSE_SUBAGENT_MAX_TURNS` | Sets the maximum turns allowed for a [subagent](/docs/guides/subagents) to complete before timeout. Can be overridden by [`settings.max_turns`](/docs/guides/recipes/recipe-reference#settings) in recipes or subagent tool calls. | Integer (e.g., 25) | 25 |
+| `GOOSE_GATEWAY_MAX_TURNS` | Maximum number of turns for gateway sessions (e.g., Telegram). Overrides `GOOSE_MAX_TURNS` for gateway traffic only, so chat platforms can keep a stricter cap than CLI/desktop sessions. | Integer (e.g., 5, 10, 25) | Falls back to `GOOSE_MAX_TURNS`, then 5 |
+| `GOOSE_SUBAGENT_MAX_TURNS` | Sets the maximum turns allowed for a [subagent](/docs/guides/context-engineering/subagents) to complete before timeout. Can be overridden by [`settings.max_turns`](/docs/guides/recipes/recipe-reference#settings) in recipes or subagent tool calls. | Integer (e.g., 25) | 25 |
+| `GOOSE_MAX_BACKGROUND_TASKS` | Sets the maximum number of concurrent background [subagent](/docs/guides/context-engineering/subagents) tasks goose can run at once | Integer (e.g., 1, 5, 10) | 5 |
 | `CONTEXT_FILE_NAMES` | Specifies custom filenames for [hint/context files](/docs/guides/context-engineering/using-goosehints#custom-context-files) | JSON array of strings (e.g., `["CLAUDE.md", ".goosehints"]`) | `[".goosehints"]` |
 | `GOOSE_DISABLE_SESSION_NAMING` | Disables automatic AI-generated session naming; avoids the background model call and keeps the default "CLI Session" (goose CLI) or "New Chat" (goose Desktop) | "1", "true" (case-insensitive) to enable | false |
+| `GOOSE_DISABLE_TOOL_CALL_SUMMARY` | Disables the per-tool-call AI-generated summary title, keeping the fallback title instead. Saves one provider call per tool invocation. | "1", "true" (case-insensitive) to enable | false |
 | `GOOSE_PROMPT_EDITOR` | [External editor](/docs/guides/goose-cli-commands#external-editor-mode) to use for composing prompts instead of CLI input | Editor command (e.g., "vim", "code --wait") | Unset (uses CLI input) |
 | `GOOSE_CLI_THEME` | [Theme](/docs/guides/goose-cli-commands#themes) for CLI response  markdown | "light", "dark", "ansi" | "dark" |
 | `GOOSE_CLI_LIGHT_THEME` | Custom [bat theme](https://github.com/sharkdp/bat#adding-new-themes) for syntax highlighting when using light mode | bat theme name (e.g., "Solarized (light)", "OneHalfLight") | "GitHub" |
@@ -269,10 +246,13 @@ These variables control how goose manages conversation sessions and context.
 | `GOOSE_CLI_SHOW_THINKING` | Shows model reasoning/thinking output in CLI responses. Some models (e.g., DeepSeek-R1, Kimi, Gemini) expose their internal reasoning process — this variable makes it visible in the CLI. | Set to any value to enable | Disabled |
 | `GOOSE_RANDOM_THINKING_MESSAGES` | Controls whether to show amusing random messages during processing | "true", "false" | "true" |
 | `GOOSE_CLI_SHOW_COST` | Toggles display of model cost estimates in CLI output | "1", "true" (case-insensitive) to enable | false |
+| `GOOSE_MAX_CODE_BLOCK_LINES` | Line count threshold before code blocks are truncated in CLI output. Full content is saved to a temp file. | Positive integer | 50 |
+| `GOOSE_TRUNCATED_SHOW_LINES` | Number of lines shown before the "... (N more lines)" message when a code block is truncated | Positive integer | 20 |
+| `GOOSE_NO_CODE_TRUNCATION` | Disable code block truncation entirely — all code blocks are shown in full | "1", "true" (case-insensitive) to enable | false |
 | `GOOSE_AUTO_COMPACT_THRESHOLD` | Set the percentage threshold at which goose [automatically summarizes your session](/docs/guides/sessions/smart-context-management#automatic-compaction). | Float between 0.0 and 1.0 (disabled at 0.0) | 0.8 |
 | `GOOSE_TOOL_CALL_CUTOFF` | Number of tool calls to keep in full detail before summarizing older tool outputs to help maintain efficient context usage  | Integer (e.g., 5, 10, 20) | 10 |
-| `GOOSE_MOIM_MESSAGE_TEXT` | Injects persistent text into goose's [working memory](/docs/guides/using-persistent-instructions) every turn. Useful for behavioral guardrails or persistent reminders. | Any text string | Not set |
-| `GOOSE_MOIM_MESSAGE_FILE` | Path to a file whose contents are injected into goose's [working memory](/docs/guides/using-persistent-instructions) every turn. Supports `~/`. Max 64 KB per file. | File path | Not set |
+| `GOOSE_MOIM_MESSAGE_TEXT` | Injects persistent text into goose's [working memory](/docs/guides/context-engineering/using-persistent-instructions) every turn. Useful for behavioral guardrails or persistent reminders. | Any text string | Not set |
+| `GOOSE_MOIM_MESSAGE_FILE` | Path to a file whose contents are injected into goose's [working memory](/docs/guides/context-engineering/using-persistent-instructions) every turn. Supports `~/`. Max 64 KB per file. | File path | Not set |
 
 **Examples**
 
@@ -291,6 +271,10 @@ export GOOSE_MAX_TURNS=25
 
 # Set a reasonable limit for production
 export GOOSE_MAX_TURNS=100
+
+# Raise the per-gateway cap without changing CLI/desktop limits
+# (applies to Telegram and other gateway sessions only)
+export GOOSE_GATEWAY_MAX_TURNS=15
 
 # Customize the default subagent turn limit
 # Note: This can be overridden per-recipe or per-subagent using the max_turns setting
@@ -324,6 +308,12 @@ export GOOSE_CLI_SHOW_THINKING=1
 # Enable model cost display in CLI
 export GOOSE_CLI_SHOW_COST=true
 
+# Show code blocks up to 100 lines before truncating
+export GOOSE_MAX_CODE_BLOCK_LINES=100
+
+# Disable code block truncation entirely (show all lines inline)
+export GOOSE_NO_CODE_TRUNCATION=true
+
 # Automatically compact sessions when 60% of available tokens are used
 export GOOSE_AUTO_COMPACT_THRESHOLD=0.6
 
@@ -345,9 +335,7 @@ These variables allow you to override the default context window size (token lim
 |----------|---------|---------|---------|
 | `GOOSE_CONTEXT_LIMIT` | Override context limit for the main model | Integer (number of tokens) | Model-specific default or 128,000 |
 | `GOOSE_INPUT_LIMIT` | Override input prompt limit for ollama requests (maps to `num_ctx`) | Integer (number of tokens) | Falls back to `GOOSE_CONTEXT_LIMIT` or model default |
-| `GOOSE_LEAD_CONTEXT_LIMIT` | Override context limit for the lead model in [lead/worker mode](/docs/tutorials/lead-worker) | Integer (number of tokens) | Falls back to `GOOSE_CONTEXT_LIMIT` or model default |
-| `GOOSE_WORKER_CONTEXT_LIMIT` | Override context limit for the worker model in lead/worker mode | Integer (number of tokens) | Falls back to `GOOSE_CONTEXT_LIMIT` or model default |
-| `GOOSE_PLANNER_CONTEXT_LIMIT` | Override context limit for the [planner model](/docs/guides/creating-plans) | Integer (number of tokens) | Falls back to `GOOSE_CONTEXT_LIMIT` or model default |
+| `GOOSE_PLANNER_CONTEXT_LIMIT` | Override context limit for the [planner model](/docs/guides/context-engineering/creating-plans) | Integer (number of tokens) | Falls back to `GOOSE_CONTEXT_LIMIT` or model default |
 
 **Examples**
 
@@ -357,10 +345,6 @@ export GOOSE_CONTEXT_LIMIT=200000
 # Override ollama input prompt limit
 export GOOSE_INPUT_LIMIT=32000
 
-# Set different context limits for lead/worker models
-export GOOSE_LEAD_CONTEXT_LIMIT=500000   # Large context for planning
-export GOOSE_WORKER_CONTEXT_LIMIT=128000 # Smaller context for execution
-
 # Set context limit for planner
 export GOOSE_PLANNER_CONTEXT_LIMIT=1000000
 ```
@@ -369,7 +353,7 @@ For more details and examples, see [Model Context Limit Overrides](/docs/guides/
 
 ## Tool Configuration
 
-These variables control how goose handles [tool execution](/docs/guides/goose-permissions) and [tool management](/docs/guides/managing-tools/).
+These variables control how goose handles [tool execution](/docs/guides/managing-tools/goose-permissions) and [tool management](/docs/guides/managing-tools/).
 
 | Variable | Purpose | Values | Default |
 |----------|---------|---------|---------|
@@ -379,7 +363,9 @@ These variables control how goose handles [tool execution](/docs/guides/goose-pe
 | `GOOSE_CLI_MIN_PRIORITY` | Controls verbosity of [tool output](/docs/guides/managing-tools/adjust-tool-output) | Float between 0.0 and 1.0 | 0.0 |
 | `GOOSE_CLI_TOOL_PARAMS_TRUNCATION_MAX_LENGTH` | Maximum length for tool parameter values before truncation in CLI output (not in debug mode) | Integer | 40 |
 | `GOOSE_DEBUG` | Enables debug mode to show full tool parameters without truncation. Can also be toggled during a session using the `/r` [slash command](/docs/guides/goose-cli-commands#slash-commands) | "1", "true" (case-insensitive) to enable | false |
-| `GOOSE_SEARCH_PATHS` | Additional directories to search for executables when running extensions | JSON array of paths (e.g., `["/usr/local/bin", "~/custom/bin"]`) | System PATH only | No |
+| `GOOSE_SEARCH_PATHS` | Prepends additional directories to PATH for extension commands | JSON array of paths (for example, `["/usr/local/bin", "~/custom/bin"]`) | System PATH only |
+| `GOOSE_MAX_TOOL_RESPONSE_SIZE` | Maximum character count for a single tool response before it is written to a temporary file instead of being included inline in the conversation | Positive integer (e.g., 100000, 200000) | 200000 |
+| `GOOSE_SHELL` | Overrides the shell used for Developer extension shell commands | Shell executable path or name (for example, `/bin/zsh`, `pwsh`, `C:\cygwin64\bin\bash.exe`) | Unix: `/bin/bash` if present, otherwise `$SHELL`, otherwise `sh`. Windows: `cmd` |
 
 **Examples**
 
@@ -393,9 +379,18 @@ export GOOSE_CLI_TOOL_PARAMS_MAX_LENGTH=100  # Show up to 100 characters for too
 
 # Add custom tool directories for extensions
 export GOOSE_SEARCH_PATHS='["/usr/local/bin", "~/custom/tools", "/opt/homebrew/bin"]'
+
+# Lower the tool response size limit for smaller-context models
+export GOOSE_MAX_TOOL_RESPONSE_SIZE=100000
+
+# Use zsh for Developer extension shell commands
+export GOOSE_SHELL=/bin/zsh
 ```
 
-These paths are prepended to the system PATH when extensions execute commands, ensuring your custom tools are found without modifying your global PATH.
+```bat
+REM Windows: use a POSIX-like shell instead of cmd.exe
+set GOOSE_SHELL=C:\cygwin64\bin\bash.exe
+```
 
 ### Enhanced Code Editing
 
@@ -483,6 +478,25 @@ Optional [macOS sandbox](/docs/guides/sandbox) for goose Desktop that restricts 
 
 These variables configure network proxy settings for goose.
 
+### OAuth Callback Port
+
+By default, goose starts a temporary local server on a random port to receive OAuth callbacks. Enterprise identity providers that require exact `redirect_uri` matching (and forbid wildcard ports) will reject the callback. Set this variable to use a fixed port instead.
+
+| Variable | Purpose | Values | Default |
+|----------|---------|---------|---------|
+| `GOOSE_OAUTH_CALLBACK_PORT` | Fixed port for the local OAuth callback server | Port number (e.g., 8080, 9999) | Random (OS-assigned) |
+
+**Examples**
+
+```bash
+# Use a fixed port so your IdP's redirect_uri whitelist can match exactly
+export GOOSE_OAUTH_CALLBACK_PORT=8080
+```
+
+Then register the appropriate redirect URI in your identity provider:
+- For MCP server OAuth: `http://127.0.0.1:8080/oauth_callback`
+- For Databricks OAuth: `http://localhost:8080`
+
 ### HTTP Proxy
 
 goose supports standard HTTP proxy environment variables for users behind corporate firewalls or proxy servers.
@@ -567,6 +581,30 @@ These variables configure the [Langfuse integration for observability](/docs/tut
 | `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` | Alternative public key for Langfuse | String | None |
 | `LANGFUSE_INIT_PROJECT_SECRET_KEY` | Alternative secret key for Langfuse | String | None |
 
+## goose Server
+
+These variables configure the `goosed` server process. They are most often used when [running `goosed` on a remote machine](/docs/guides/remote-goose-server) and connecting goose Desktop to it, but they apply to any `goosed` invocation.
+
+| Variable | Purpose | Values | Default |
+|----------|---------|---------|---------|
+| `GOOSE_HOST` | Interface the server binds to. Use `0.0.0.0` to accept connections from other machines; `localhost` or `127.0.0.1` restricts to the local machine. | Hostname or IP | `127.0.0.1` |
+| `GOOSE_PORT` | TCP port the server listens on | Port number | `3000` |
+| `GOOSE_TLS` | Enable TLS with a self-signed certificate. Required when connecting goose Desktop to a remote `goosed`. | `true`, `false` | `true` |
+| `GOOSE_SERVER__SECRET_KEY` | Shared secret required in the `X-Secret-Key` header on all client requests | Secret string | Random (auto-generated) |
+
+**Examples**
+
+```bash
+# Start a goosed server reachable on the local network over TLS
+export GOOSE_HOST=0.0.0.0
+export GOOSE_PORT=3000
+export GOOSE_TLS=true
+export GOOSE_SERVER__SECRET_KEY='a-long-random-secret'
+goosed agent
+```
+
+When TLS is enabled, `goosed` prints a `GOOSED_CERT_FINGERPRINT=...` line on startup. Clients (such as goose Desktop) need this fingerprint to verify the self-signed certificate. See [Running a Remote goose Server](/docs/guides/remote-goose-server) for the full setup.
+
 ## Recipe Configuration
 
 These variables control recipe discovery and management.
@@ -574,7 +612,7 @@ These variables control recipe discovery and management.
 | Variable | Purpose | Values | Default |
 |----------|---------|---------|---------|
 | `GOOSE_RECIPE_PATH` | Additional directories to search for recipes | Colon-separated paths on Unix, semicolon-separated on Windows | None |
-| `GOOSE_RECIPE_GITHUB_REPO` | GitHub repository to search for recipes | Format: "owner/repo" (e.g., "block/goose-recipes") | None |
+| `GOOSE_RECIPE_GITHUB_REPO` | GitHub repository to search for recipes | Format: "owner/repo" (e.g., "aaif-goose/goose-recipes") | None |
 | `GOOSE_RECIPE_RETRY_TIMEOUT_SECONDS` | Global timeout for recipe success check commands | Integer (seconds) | Recipe-specific default |
 | `GOOSE_RECIPE_ON_FAILURE_TIMEOUT_SECONDS` | Global timeout for recipe on_failure commands | Integer (seconds) | Recipe-specific default |
 
@@ -734,4 +772,3 @@ When deploying goose in enterprise environments, administrators might need to co
 - For security-sensitive variables (like API keys), consider using the system keyring instead of environment variables.
 - Some variables may require restarting goose to take effect.
 - When using the planning mode, if planner-specific variables are not set, goose will fall back to the main model configuration.
-

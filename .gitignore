@@ -5,6 +5,7 @@ run_cli.sh
 tokenizer_files/
 .DS_Store
 .idea
+.vscode
 *.log
 tmp/
 
@@ -23,7 +24,7 @@ target/
 *.pdb
 
 # UI
-./ui/desktop/node_modules
+node_modules
 ./ui/desktop/out
 
 # Generated goose DLLs (built at build time, not checked in)
@@ -34,13 +35,12 @@ ui/desktop/src/bin/goose_llm.dll
 .hermit/
 
 # Claude
-.claude
+.claude/settings.local.json
 
 debug_*.txt
 
 # Docs
 # Dependencies
-/node_modules
 
 # Production
 /build
@@ -63,6 +63,12 @@ do_not_version/
 /.env
 
 /working_dir
+
+# Local build scripts and generated snapshot artifacts
+/build.bat
+/build.ps1
+/build_check.ps1
+/crates/goose/src/agents/snapshots/*.snap.new
 
 # Error log artifacts from mcp replay tests
 crates/goose/tests/mcp_replays/*errors.txt

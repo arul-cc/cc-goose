@@ -1,7 +1,7 @@
 ---
-title: Using Skills
-sidebar_position: 2
-sidebar_label: Using Skills
+title: Agent Skills
+sidebar_position: 3
+sidebar_label: Agent Skills
 ---
 
 Skills are reusable sets of instructions and resources that teach goose how to perform specific tasks. A skill can range from a simple checklist to a detailed workflow with domain expertise, and can include supporting files like scripts or templates. Example use cases include deployment procedures, code review checklists, and API integration guides.
@@ -17,7 +17,7 @@ When a session starts, goose adds any skills that it discovers to its instructio
   - "Follow the new-service skill to set up the auth service"
   - "Apply the deployment skill"
 
-You can also ask goose what skills are available.
+You can also ask goose what skills are available, or use the CLI `/skills` command to list available skills and load one or more by name (e.g. `/skills code-review edge-case-finder`).
 
 :::info Claude Compatibility
 goose skills are compatible with Claude Desktop and other [agents that support Agent Skills](https://agentskills.io/home#adoption).
@@ -25,16 +25,18 @@ goose skills are compatible with Claude Desktop and other [agents that support A
 
 ## Skill Locations
 
-Skills can be stored globally and/or per-project. goose checks all of these directories in order and combines what it finds. If the same skill name exists in multiple directories, later directories take priority:
+Skills can be stored globally, per-project, or in installed plugins:
 
-1. `~/.claude/skills/` — Global, shared with Claude Desktop
-2. `~/.config/agents/skills/` — Global, portable across AI coding agents
-3. `~/.config/goose/skills/` — Global, goose-specific
-4. `./.claude/skills/` — Project-level, shared with Claude Desktop
-5. `./.goose/skills/` — Project-level, goose-specific
-6. `./.agents/skills/` — Project-level, portable across AI coding agents
+1. `~/.agents/skills/` — Global skills, available in all sessions
+2. `.agents/skills/` — Project-level skills, scoped to the current project
+3. `~/.agents/plugins/<plugin-name>/` — Skills provided by installed [plugins](/docs/guides/context-engineering/plugins)
 
-Use global skills for workflows you use across projects. Use project-level skills for procedures unique to a codebase.
+Place a `SKILL.md` file inside a named subdirectory. For example, a global skill called
+`code-review` goes in `~/.agents/skills/code-review/SKILL.md`.
+
+> **Backward compatibility:** goose also discovers skills from `.goose/skills/`,
+> `.claude/skills/`, `~/.claude/skills/`, and platform-specific config directories,
+> but `agents/skills/` is the recommended standard.
 
 ## Creating a Skill
 
@@ -45,7 +47,7 @@ Create a skill when you have a repeatable workflow that involves multiple steps,
 Each skill lives in its own directory with a `SKILL.md` file:
 
 ```
-~/.config/agents/skills/
+~/.agents/skills/
 └── code-review/
     └── SKILL.md
 ```
@@ -83,12 +85,16 @@ When reviewing code, check each of these areas:
 - [ ] SQL queries are parameterized
 ```
 
-### Supporting Files
+## Skills from Plugins
+
+Skills can also come from installed [plugins](/docs/guides/context-engineering/plugins). Plugin-provided skills are discovered at session startup and work like other skills. For Open Plugins, skill names are namespaced with the plugin name, such as `my-plugin:review`. Use that full name when explicitly loading a plugin-provided skill.
+
+## Supporting Files
 
 Skills can include supporting files like scripts, templates, or configuration files. Place them in the skill directory:
 
 ```
-~/.config/agents/skills/
+~/.agents/skills/
 └── api-setup/
     ├── SKILL.md
     ├── setup.sh
@@ -277,7 +283,7 @@ import skillsvsmcp from '@site/blog/2025-12-22-agent-skills-vs-mcp/skills-vs-mcp
       title: 'Did Skills Kill MCP?',
       description: 'An overview of Agent Skills vs MCP',
       thumbnailUrl: skillsvsmcp,
-      linkUrl: '/goose/blog/2025/12/22/agent-skills-vs-mcp',
+      linkUrl: '/blog/2025/12/22/agent-skills-vs-mcp',
       date: '2025-12-22',
       duration: '4 min read'
     }

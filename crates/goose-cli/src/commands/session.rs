@@ -3,11 +3,15 @@ use anyhow::{Context, Result};
 
 use cliclack::{confirm, multiselect, select};
 use etcetera::home_dir;
-use goose::session::{generate_diagnostics, Session, SessionManager};
+#[cfg(feature = "nostr")]
+use goose::config::Config;
+#[cfg(feature = "nostr")]
+use goose::session::nostr_share;
+use goose::session::{generate_diagnostics, Session, SessionManager, SessionType};
 use goose::utils::safe_truncate;
 use regex::Regex;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -89,25 +93,18 @@ pub async fn handle_session_remove(
     regex_string: Option<String>,
 ) -> Result<()> {
     let session_manager = SessionManager::instance();
-    let all_sessions = match session_manager.list_sessions().await {
-        Ok(sessions) => sessions,
-        Err(e) => {
-            tracing::error!("Failed to retrieve sessions: {:?}", e);
-            return Err(anyhow::anyhow!("Failed to retrieve sessions"));
-        }
-    };
 
     let matched_sessions: Vec<Session>;
 
     if let Some(id_val) = session_id {
-        if let Some(session) = all_sessions.iter().find(|s| s.id == id_val) {
-            matched_sessions = vec![session.clone()];
-        } else {
-            return Err(anyhow::anyhow!("Session ID '{}' not found.", id_val));
+        match session_manager.get_session(&id_val, false).await {
+            Ok(session) => matched_sessions = vec![session],
+            Err(_) => return Err(anyhow::anyhow!("Session ID '{}' not found.", id_val)),
         }
     } else if let Some(name_val) = name {
-        if let Some(session) = all_sessions.iter().find(|s| s.name == name_val) {
-            matched_sessions = vec![session.clone()];
+        let all_sessions = session_manager.list_all_sessions().await?;
+        if let Some(session) = all_sessions.into_iter().find(|s| s.name == name_val) {
+            matched_sessions = vec![session];
         } else {
             return Err(anyhow::anyhow!(
                 "Session with name '{}' not found.",
@@ -118,7 +115,8 @@ pub async fn handle_session_remove(
         let session_regex = Regex::new(&regex_val)
             .with_context(|| format!("Invalid regex pattern '{}'", regex_val))?;
 
-        matched_sessions = all_sessions
+        let visible_sessions = session_manager.list_sessions().await?;
+        matched_sessions = visible_sessions
             .into_iter()
             .filter(|session| session_regex.is_match(&session.id))
             .collect();
@@ -128,10 +126,11 @@ pub async fn handle_session_remove(
             return Ok(());
         }
     } else {
-        if all_sessions.is_empty() {
+        let visible_sessions = session_manager.list_sessions().await?;
+        if visible_sessions.is_empty() {
             return Err(anyhow::anyhow!("No sessions found."));
         }
-        matched_sessions = prompt_interactive_session_removal(&all_sessions)?;
+        matched_sessions = prompt_interactive_session_removal(&visible_sessions)?;
     }
 
     if matched_sessions.is_empty() {
@@ -139,6 +138,14 @@ pub async fn handle_session_remove(
     }
 
     remove_sessions(&session_manager, matched_sessions).await
+}
+
+fn write_line_or_broken_pipe_ok<W: Write>(out: &mut W, line: &str) -> Result<bool> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub async fn handle_session_list(
@@ -170,17 +177,28 @@ pub async fn handle_session_list(
         sessions.truncate(n);
     }
 
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
     match format.as_str() {
         "json" => {
-            println!("{}", serde_json::to_string(&sessions)?);
+            let payload = serde_json::to_string(&sessions)?;
+            if !write_line_or_broken_pipe_ok(&mut out, &payload)? {
+                return Ok(());
+            }
         }
         _ => {
             if sessions.is_empty() {
-                println!("No sessions found");
+                if !write_line_or_broken_pipe_ok(&mut out, "No sessions found")? {
+                    return Ok(());
+                }
                 return Ok(());
             }
 
-            println!("Available sessions:");
+            if !write_line_or_broken_pipe_ok(&mut out, "Available sessions:")? {
+                return Ok(());
+            }
+
             for session in sessions {
                 let output = format!(
                     "{} - {} - {} - {}",
@@ -189,7 +207,9 @@ pub async fn handle_session_list(
                     session.updated_at,
                     display_path_with_tilde(&session.working_dir)
                 );
-                println!("{}", output);
+                if !write_line_or_broken_pipe_ok(&mut out, &output)? {
+                    return Ok(());
+                }
             }
         }
     }
@@ -200,6 +220,8 @@ pub async fn handle_session_export(
     session_id: String,
     output_path: Option<PathBuf>,
     format: String,
+    nostr: bool,
+    #[cfg_attr(not(feature = "nostr"), allow(unused_variables))] relays: Vec<String>,
 ) -> Result<()> {
     let session_manager = SessionManager::instance();
     let session = match session_manager.get_session(&session_id, true).await {
@@ -225,6 +247,34 @@ pub async fn handle_session_export(
         _ => return Err(anyhow::anyhow!("Unsupported format: {}", format)),
     };
 
+    #[cfg(feature = "nostr")]
+    if nostr {
+        if format != "json" {
+            return Err(anyhow::anyhow!(
+                "Nostr session sharing only supports --format json"
+            ));
+        }
+        if output_path.is_some() {
+            return Err(anyhow::anyhow!(
+                "Nostr session sharing cannot be combined with --output"
+            ));
+        }
+
+        let relays = nostr_share::resolve_relays(relays, Config::global());
+        let share = nostr_share::publish_session_json(&output, relays).await?;
+        println!("Session published to Nostr relays:");
+        for relay in &share.relays {
+            println!("- {}", relay);
+        }
+        println!("\nShare link:");
+        println!("{}", share.deeplink);
+        return Ok(());
+    }
+    #[cfg(not(feature = "nostr"))]
+    if nostr {
+        return Err(anyhow::anyhow!("goose was not built with nostr support"));
+    }
+
     if let Some(output_path) = output_path {
         fs::write(&output_path, output).with_context(|| {
             format!("Failed to write to output file: {}", output_path.display())
@@ -233,6 +283,39 @@ pub async fn handle_session_export(
     } else {
         println!("{}", output);
     }
+
+    Ok(())
+}
+
+pub async fn handle_session_import(input: String, nostr: bool) -> Result<()> {
+    let json = if nostr || input.starts_with("goose://sessions/nostr") {
+        #[cfg(feature = "nostr")]
+        {
+            nostr_share::import_session_json_from_deeplink(&input).await?
+        }
+        #[cfg(not(feature = "nostr"))]
+        return Err(anyhow::anyhow!("goose was not built with nostr support"));
+    } else {
+        fs::read_to_string(&input)
+            .with_context(|| format!("Failed to read session import file: {input}"))?
+    };
+
+    let format = goose::session::import_formats::detect_format(&json);
+    let label = match format {
+        goose::session::import_formats::ImportFormat::Goose => "goose",
+        goose::session::import_formats::ImportFormat::ClaudeCode => "Claude Code",
+        goose::session::import_formats::ImportFormat::Codex => "Codex",
+        goose::session::import_formats::ImportFormat::Pi => "Pi",
+    };
+    println!("Detected format: {}", label);
+
+    let session_manager = SessionManager::instance();
+    let session = session_manager
+        .import_session(&json, Some(SessionType::User))
+        .await?;
+
+    println!("Session imported:");
+    println!("{} - {}", session.id, session.name);
 
     Ok(())
 }

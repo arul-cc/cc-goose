@@ -8,14 +8,14 @@ import {
   useLocation,
   useSearchParams,
 } from 'react-router-dom';
-import { openSharedSessionFromDeepLink } from './sessionLinks';
+import { openSharedSessionFromDeepLink, importNostrSessionFromDeepLink } from './sessionLinks';
 import { type SharedSessionDetails } from './sharedSessions';
 import { ErrorUI } from './components/ErrorBoundary';
 import { ExtensionInstallModal } from './components/ExtensionInstallModal';
-import { ToastContainer } from 'react-toastify';
+import { toast, ToastContainer } from 'react-toastify';
 import AnnouncementModal from './components/AnnouncementModal';
-import TelemetryOptOutModal from './components/TelemetryOptOutModal';
-import ProviderGuard from './components/ProviderGuard';
+import TelemetryConsentPrompt from './components/TelemetryConsentPrompt';
+import OnboardingGuard from './components/onboarding/OnboardingGuard';
 import { createSession } from './sessions';
 
 import { ChatType } from './types/chat';
@@ -39,10 +39,12 @@ import 'react-toastify/dist/ReactToastify.css';
 import { useConfig } from './components/ConfigContext';
 import { ModelAndProviderProvider } from './components/ModelAndProviderContext';
 import { ThemeProvider } from './contexts/ThemeContext';
+import { FeaturesProvider } from './contexts/FeaturesContext';
 import PermissionSettingsView from './components/settings/permission/PermissionSetting';
 
 import ExtensionsView, { ExtensionsViewOptions } from './components/extensions/ExtensionsView';
 import RecipesView from './components/recipes/RecipesView';
+import SkillsView from './components/skills/SkillsView';
 import AppsView from './components/apps/AppsView';
 import StandaloneAppView from './components/apps/StandaloneAppView';
 import { View, ViewOptions } from './utils/navigationUtils';
@@ -51,7 +53,7 @@ import { useNavigation } from './hooks/useNavigation';
 import { errorMessage } from './utils/conversionUtils';
 import { getInitialWorkingDir } from './utils/workingDir';
 import { usePageViewTracking } from './hooks/useAnalytics';
-import { trackOnboardingCompleted, trackErrorWithContext } from './utils/analytics';
+import { trackErrorWithContext } from './utils/analytics';
 import { AppEvents } from './constants/events';
 import { registerPlatformEventHandlers } from './utils/platform_events';
 
@@ -65,6 +67,16 @@ const HubRouteWrapper = () => {
   const setView = useNavigation();
   return <Hub setView={setView} />;
 };
+
+export function resolveSessionInitialMessage(
+  session: { recipe?: { prompt?: string | null } | null },
+  initialMessage?: UserInput
+): UserInput | undefined {
+  return (
+    initialMessage ??
+    (session.recipe?.prompt ? { msg: session.recipe.prompt, images: [] } : undefined)
+  );
+}
 
 const PairRouteWrapper = ({
   activeSessions,
@@ -103,12 +115,13 @@ const PairRouteWrapper = ({
             recipeId: recipeIdFromConfig,
             allExtensions: extensionsList,
           });
+          const sessionInitialMessage = resolveSessionInitialMessage(newSession, initialMessage);
 
           window.dispatchEvent(
             new CustomEvent(AppEvents.ADD_ACTIVE_SESSION, {
               detail: {
                 sessionId: newSession.id,
-                initialMessage,
+                initialMessage: sessionInitialMessage,
               },
             })
           );
@@ -158,7 +171,7 @@ const PairRouteWrapper = ({
   return null;
 };
 
-const SettingsRoute = () => {
+const SettingsRoute = ({ activeSessionId }: { activeSessionId?: string }) => {
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -174,7 +187,13 @@ const SettingsRoute = () => {
     viewOptions.section = sectionFromUrl;
   }
 
-  return <SettingsView onClose={() => navigate('/')} setView={setView} viewOptions={viewOptions} />;
+  return (
+    <SettingsView
+      onClose={() => navigate('/')}
+      setView={setView}
+      viewOptions={{ ...viewOptions, sessionId: activeSessionId }}
+    />
+  );
 };
 
 const SessionsRoute = () => {
@@ -188,6 +207,10 @@ const SchedulesRoute = () => {
 
 const RecipesRoute = () => {
   return <RecipesView />;
+};
+
+const SkillsRoute = () => {
+  return <SkillsView />;
 };
 
 const PermissionRoute = () => {
@@ -219,6 +242,9 @@ const PermissionRoute = () => {
           case 'recipes':
             navigate('/recipes');
             break;
+          case 'skills':
+            navigate('/skills');
+            break;
           default:
             navigate('/');
         }
@@ -235,30 +261,6 @@ const ConfigureProvidersRoute = () => {
       <ProviderSettings
         onClose={() => navigate('/settings', { state: { section: 'models' } })}
         isOnboarding={false}
-      />
-    </div>
-  );
-};
-
-interface WelcomeRouteProps {
-  onSelectProvider: () => void;
-}
-
-const WelcomeRoute = ({ onSelectProvider }: WelcomeRouteProps) => {
-  const navigate = useNavigate();
-
-  return (
-    <div className="w-screen h-screen bg-background-primary">
-      <ProviderSettings
-        onClose={() => {
-          navigate('/', { replace: true });
-        }}
-        isOnboarding={true}
-        onProviderLaunched={(model?: string) => {
-          trackOnboardingCompleted('other', model);
-          onSelectProvider();
-          navigate('/', { replace: true });
-        }}
       />
     </div>
   );
@@ -342,7 +344,6 @@ export function AppInner() {
   const [fatalError, setFatalError] = useState<string | null>(null);
   const [isLoadingSharedSession, setIsLoadingSharedSession] = useState(false);
   const [sharedSessionError, setSharedSessionError] = useState<string | null>(null);
-  const [didSelectProvider, setDidSelectProvider] = useState<boolean>(false);
 
   const navigate = useNavigate();
   const setView = useNavigation();
@@ -412,7 +413,6 @@ export function AppInner() {
   const { addExtension } = useConfig();
 
   useEffect(() => {
-    console.log('Sending reactReady signal to Electron');
     try {
       window.electron.reactReady();
     } catch (error) {
@@ -428,6 +428,11 @@ export function AppInner() {
       setIsLoadingSharedSession(true);
       setSharedSessionError(null);
       try {
+        if (link.startsWith('goose://sessions/nostr')) {
+          await importNostrSessionFromDeepLink(link);
+          navigate('/sessions');
+          return;
+        }
         await openSharedSessionFromDeepLink(link, (_view: View, options?: ViewOptions) => {
           navigate('/shared-session', { state: options });
         });
@@ -438,14 +443,18 @@ export function AppInner() {
           action: 'open_shared_session',
           recoverable: true,
         });
-        // Navigate to shared session view with error
-        const shareToken = link.replace('goose://sessions/', '');
-        const options = {
-          sessionDetails: null,
-          error: errorMessage(error, 'Unknown error'),
-          shareToken,
-        };
-        navigate('/shared-session', { state: options });
+        if (link.startsWith('goose://sessions/nostr')) {
+          toast.error(`Failed to import Nostr session: ${errorMessage(error, 'Unknown error')}`);
+          navigate('/sessions');
+        } else {
+          const shareToken = link.replace('goose://sessions/', '');
+          const options = {
+            sessionDetails: null,
+            error: errorMessage(error, 'Unknown error'),
+            shareToken,
+          };
+          navigate('/shared-session', { state: options });
+        }
       } finally {
         setIsLoadingSharedSession(false);
       }
@@ -457,7 +466,6 @@ export function AppInner() {
   }, [navigate]);
 
   useEffect(() => {
-    console.log('Setting up keyboard shortcuts');
     const handleKeyDown = (event: KeyboardEvent) => {
       const isMac = window.electron.platform === 'darwin';
       if ((isMac ? event.metaKey : event.ctrlKey) && event.key === 'n') {
@@ -473,6 +481,18 @@ export function AppInner() {
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
+  }, []);
+
+  // Show a toast if mesh is the configured provider but isn't running.
+  useEffect(() => {
+    const handler = () => {
+      toast.warn('Inference Mesh is set as your provider but isn\'t running. Open Settings → Mesh to start it. Keep goose running to stay connected.', {
+        autoClose: false,
+        toastId: 'mesh-not-running',
+      });
+    };
+    window.electron.on('mesh-not-running', handler);
+    return () => { window.electron.off('mesh-not-running', handler); };
   }, []);
 
   // Prevent default drag and drop behavior globally to avoid opening files in new windows
@@ -536,9 +556,6 @@ export function AppInner() {
     const handleSetView = (_event: IpcRendererEvent, ...args: unknown[]) => {
       const newView = args[0] as View;
       const section = args[1] as string | undefined;
-      console.log(
-        `Received view change request to: ${newView}${section ? `, section: ${section}` : ''}`
-      );
 
       if (section && newView === 'settings') {
         navigate(`/settings?section=${section}`);
@@ -553,7 +570,6 @@ export function AppInner() {
 
   useEffect(() => {
     const handleNewChat = (_event: IpcRendererEvent, ..._args: unknown[]) => {
-      console.log('Received new-chat event from keyboard shortcut');
       window.dispatchEvent(new CustomEvent(AppEvents.TRIGGER_NEW_CHAT));
     };
 
@@ -580,16 +596,9 @@ export function AppInner() {
   useEffect(() => {
     const handleSetInitialMessage = async (_event: IpcRendererEvent, ...args: unknown[]) => {
       const initialMessage = args[0] as string;
-      console.log(
-        '[App] Received set-initial-message event:',
-        initialMessage,
-        'isProcessing:',
-        isProcessingRef.current
-      );
 
       if (initialMessage && !isProcessingRef.current) {
         isProcessingRef.current = true;
-        console.log('[App] Processing initial message from launcher:', initialMessage);
         navigate('/pair', {
           state: {
             initialMessage: { msg: initialMessage, images: [] },
@@ -598,8 +607,6 @@ export function AppInner() {
         setTimeout(() => {
           isProcessingRef.current = false;
         }, 1000);
-      } else if (initialMessage) {
-        console.log('[App] Ignoring duplicate initial message (already processing)');
       }
     };
     window.electron.on('set-initial-message', handleSetInitialMessage);
@@ -641,20 +648,16 @@ export function AppInner() {
         <div style={{ position: 'relative', width: '100%', height: '100%' }}>
           <Routes>
             <Route path="launcher" element={<LauncherView />} />
-            <Route
-              path="welcome"
-              element={<WelcomeRoute onSelectProvider={() => setDidSelectProvider(true)} />}
-            />
             <Route path="configure-providers" element={<ConfigureProvidersRoute />} />
             <Route path="standalone-app" element={<StandaloneAppView />} />
             <Route
               path="/"
               element={
-                <ProviderGuard didSelectProvider={didSelectProvider}>
+                <OnboardingGuard>
                   <ChatProvider chat={chat} setChat={setChat} contextKey="hub">
                     <AppLayout activeSessions={activeSessions} />
                   </ChatProvider>
-                </ProviderGuard>
+                </OnboardingGuard>
               }
             >
               <Route index element={<HubRouteWrapper />} />
@@ -667,7 +670,14 @@ export function AppInner() {
                   />
                 }
               />
-              <Route path="settings" element={<SettingsRoute />} />
+              <Route
+                path="settings"
+                element={
+                  <SettingsRoute
+                    activeSessionId={activeSessions[activeSessions.length - 1]?.sessionId}
+                  />
+                }
+              />
               <Route
                 path="extensions"
                 element={
@@ -680,6 +690,7 @@ export function AppInner() {
               <Route path="sessions" element={<SessionsRoute />} />
               <Route path="schedules" element={<SchedulesRoute />} />
               <Route path="recipes" element={<RecipesRoute />} />
+              <Route path="skills" element={<SkillsRoute />} />
               <Route
                 path="shared-session"
                 element={
@@ -702,13 +713,15 @@ export function AppInner() {
 export default function App() {
   return (
     <ThemeProvider>
-      <ModelAndProviderProvider>
-        <HashRouter>
-          <AppInner />
-        </HashRouter>
-        <AnnouncementModal />
-        <TelemetryOptOutModal controlled={false} />
-      </ModelAndProviderProvider>
+      <FeaturesProvider>
+        <ModelAndProviderProvider>
+          <HashRouter>
+            <AppInner />
+          </HashRouter>
+          <AnnouncementModal />
+          <TelemetryConsentPrompt />
+        </ModelAndProviderProvider>
+      </FeaturesProvider>
     </ThemeProvider>
   );
 }

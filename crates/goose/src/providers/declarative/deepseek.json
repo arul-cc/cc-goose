@@ -21,9 +21,31 @@
       "output_token_cost": null,
       "currency": null,
       "supports_cache_control": null
+    },
+    {
+      "name": "deepseek-v4-flash",
+      "context_limit": 1000000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null
+    },
+    {
+      "name": "deepseek-v4-pro",
+      "context_limit": 1000000,
+      "input_token_cost": null,
+      "output_token_cost": null,
+      "currency": null,
+      "supports_cache_control": null
     }
   ],
   "headers": null,
   "timeout_seconds": null,
-  "supports_streaming": true
+  "preserves_thinking": true,
+  "supports_streaming": true,
+  "default_request_params": {
+    "thinking": {
+      "type": "disabled"
+    }
+  }
 }

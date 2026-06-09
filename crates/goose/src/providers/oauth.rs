@@ -1,4 +1,5 @@
 use crate::config::paths::Paths;
+use crate::utils::bytes_to_hex;
 use anyhow::Result;
 use axum::{extract::Query, response::Html, routing::get, Router};
 use base64::Engine;
@@ -41,13 +42,22 @@ fn get_base_path() -> PathBuf {
     Paths::in_config_dir("databricks/oauth")
 }
 
+pub fn cleanup_oauth_cache() -> Result<()> {
+    let base_path = get_base_path();
+    match fs::remove_dir_all(&base_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl TokenCache {
     fn new(host: &str, client_id: &str, scopes: &[String]) -> Self {
         let mut hasher = sha2::Sha256::new();
         hasher.update(host.as_bytes());
         hasher.update(client_id.as_bytes());
         hasher.update(scopes.join(",").as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = bytes_to_hex(hasher.finalize());
 
         fs::create_dir_all(get_base_path()).unwrap();
         let cache_path = get_base_path().join(format!("{}.json", hash));
@@ -332,7 +342,10 @@ impl OAuthFlow {
 
         // If no port is specified (or port is explicitly 0), let the OS assign one
         // Otherwise, use the requested port
-        let bind_port = requested_port.unwrap_or(0);
+        let env_port: Option<u16> = std::env::var("GOOSE_OAUTH_CALLBACK_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok());
+        let bind_port = requested_port.or(env_port).unwrap_or(0);
         let addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
 

@@ -1,31 +1,45 @@
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "aws-providers")]
+use super::bedrock::BedrockProvider;
+#[cfg(feature = "local-inference")]
+use super::local_inference::LocalInferenceProvider;
+#[cfg(feature = "aws-providers")]
+use super::sagemaker_tgi::SageMakerTgiProvider;
 use super::{
+    amp_acp::AmpAcpProvider,
     anthropic::AnthropicProvider,
+    avian::AvianProvider,
     azure::AzureProvider,
     base::{Provider, ProviderMetadata},
-    bedrock::BedrockProvider,
     chatgpt_codex::ChatGptCodexProvider,
+    claude_acp::ClaudeAcpProvider,
     claude_code::ClaudeCodeProvider,
     codex::CodexProvider,
+    codex_acp::CodexAcpProvider,
+    copilot_acp::CopilotAcpProvider,
     cursor_agent::CursorAgentProvider,
     databricks::DatabricksProvider,
+    databricks_v2::DatabricksV2Provider,
     gcpvertexai::GcpVertexAIProvider,
     gemini_cli::GeminiCliProvider,
+    gemini_oauth::GeminiOAuthProvider,
     githubcopilot::GithubCopilotProvider,
     google::GoogleProvider,
-    lead_worker::LeadWorkerProvider,
+    huggingface::HuggingFaceProvider,
+    kimicode::KimiCodeProvider,
     litellm::LiteLLMProvider,
-    local_inference::LocalInferenceProvider,
+    nanogpt::NanoGptProvider,
     ollama::OllamaProvider,
     openai::OpenAiProvider,
     openrouter::OpenRouterProvider,
+    pi_acp::PiAcpProvider,
     provider_registry::ProviderRegistry,
-    sagemaker_tgi::SageMakerTgiProvider,
     snowflake::SnowflakeProvider,
     tetrate::TetrateProvider,
-    venice::VeniceProvider,
     xai::XaiProvider,
+    xai_oauth::XaiOAuthProvider,
 };
 use crate::config::ExtensionConfig;
 use crate::model::ModelConfig;
@@ -37,37 +51,81 @@ use crate::{
 use anyhow::Result;
 use tokio::sync::OnceCell;
 
-const DEFAULT_LEAD_TURNS: usize = 3;
-const DEFAULT_FAILURE_THRESHOLD: usize = 2;
-const DEFAULT_FALLBACK_TURNS: usize = 2;
-
 static REGISTRY: OnceCell<RwLock<ProviderRegistry>> = OnceCell::const_new();
 
 async fn init_registry() -> RwLock<ProviderRegistry> {
     let mut registry = ProviderRegistry::new().with_providers(|registry| {
+        registry.register::<AmpAcpProvider>(false);
         registry.register::<AnthropicProvider>(true);
+        registry.register::<AvianProvider>(false);
         registry.register::<AzureProvider>(false);
+        #[cfg(feature = "aws-providers")]
         registry.register::<BedrockProvider>(false);
+        #[cfg(feature = "local-inference")]
         registry.register::<LocalInferenceProvider>(false);
         registry.register::<ChatGptCodexProvider>(true);
+        registry.register::<ClaudeAcpProvider>(false);
         registry.register::<ClaudeCodeProvider>(true);
+        registry.register::<CodexAcpProvider>(false);
+        registry.register::<CopilotAcpProvider>(false);
         registry.register::<CodexProvider>(true);
         registry.register::<CursorAgentProvider>(false);
         registry.register::<DatabricksProvider>(true);
+        registry.register::<DatabricksV2Provider>(false);
         registry.register::<GcpVertexAIProvider>(false);
         registry.register::<GeminiCliProvider>(false);
+        registry.register::<GeminiOAuthProvider>(true);
         registry.register::<GithubCopilotProvider>(false);
         registry.register::<GoogleProvider>(true);
+        registry.register::<HuggingFaceProvider>(true);
+        registry.register::<KimiCodeProvider>(true);
         registry.register::<LiteLLMProvider>(false);
+        registry.register::<NanoGptProvider>(true);
         registry.register::<OllamaProvider>(true);
         registry.register::<OpenAiProvider>(true);
         registry.register::<OpenRouterProvider>(true);
+        registry.register::<PiAcpProvider>(false);
+        #[cfg(feature = "aws-providers")]
         registry.register::<SageMakerTgiProvider>(false);
         registry.register::<SnowflakeProvider>(false);
         registry.register::<TetrateProvider>(true);
-        registry.register::<VeniceProvider>(false);
         registry.register::<XaiProvider>(false);
+        registry.register::<XaiOAuthProvider>(true);
     });
+    // Register cleanup functions for providers with cached state
+    registry.set_cleanup(
+        "github_copilot",
+        Arc::new(|| Box::pin(GithubCopilotProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "databricks",
+        Arc::new(|| Box::pin(DatabricksProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "databricks_v2",
+        Arc::new(|| Box::pin(DatabricksV2Provider::cleanup())),
+    );
+    registry.set_cleanup(
+        "kimi_code",
+        Arc::new(|| Box::pin(KimiCodeProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "chatgpt_codex",
+        Arc::new(|| Box::pin(ChatGptCodexProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "gemini_oauth",
+        Arc::new(|| Box::pin(GeminiOAuthProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "xai_oauth",
+        Arc::new(|| Box::pin(XaiOAuthProvider::cleanup())),
+    );
+    registry.set_cleanup(
+        "huggingface",
+        Arc::new(|| Box::pin(HuggingFaceProvider::cleanup())),
+    );
+
     if let Err(e) = load_custom_providers_into_registry(&mut registry) {
         tracing::warn!("Failed to load custom providers: {}", e);
     }
@@ -103,7 +161,7 @@ pub async fn refresh_custom_providers() -> Result<()> {
     Ok(())
 }
 
-async fn get_from_registry(name: &str) -> Result<ProviderEntry> {
+pub async fn get_from_registry(name: &str) -> Result<ProviderEntry> {
     let guard = get_registry().await.read().unwrap();
     guard
         .entries
@@ -112,20 +170,29 @@ async fn get_from_registry(name: &str) -> Result<ProviderEntry> {
         .cloned()
 }
 
+pub async fn inventory_identity(name: &str) -> Result<super::inventory::InventoryIdentityInput> {
+    get_from_registry(name).await?.inventory_identity()
+}
+
 pub async fn create(
     name: &str,
     model: ModelConfig,
     extensions: Vec<ExtensionConfig>,
 ) -> Result<Arc<dyn Provider>> {
-    let config = crate::config::Config::global();
+    let entry = get_from_registry(name).await?;
+    entry.create(model, extensions).await
+}
 
-    if let Ok(lead_model_name) = config.get_param::<String>("GOOSE_LEAD_MODEL") {
-        tracing::info!("Creating lead/worker provider from environment variables");
-        return create_lead_worker_from_env(name, &model, &lead_model_name, extensions).await;
-    }
-
-    let constructor = get_from_registry(name).await?.constructor.clone();
-    constructor(model, extensions).await
+pub async fn create_with_working_dir(
+    name: &str,
+    model: ModelConfig,
+    extensions: Vec<ExtensionConfig>,
+    working_dir: PathBuf,
+) -> Result<Arc<dyn Provider>> {
+    let entry = get_from_registry(name).await?;
+    entry
+        .create_with_working_dir(model, extensions, working_dir)
+        .await
 }
 
 pub async fn create_with_default_model(
@@ -138,186 +205,203 @@ pub async fn create_with_default_model(
         .await
 }
 
+pub async fn cleanup_provider(name: &str) -> Result<()> {
+    let cleanup_fn = {
+        let registry = get_registry().await.read().unwrap();
+        registry
+            .entries
+            .get(name)
+            .and_then(|entry| entry.cleanup.clone())
+    };
+    if let Some(cleanup) = cleanup_fn {
+        return cleanup().await;
+    }
+    Ok(())
+}
+
 pub async fn create_with_named_model(
     provider_name: &str,
     model_name: &str,
     extensions: Vec<ExtensionConfig>,
 ) -> Result<Arc<dyn Provider>> {
-    let config = ModelConfig::new(model_name)?.with_canonical_limits(provider_name);
+    let config = ModelConfig::new(model_name)?;
     create(provider_name, config, extensions).await
 }
 
-async fn create_lead_worker_from_env(
-    default_provider_name: &str,
-    default_model: &ModelConfig,
-    lead_model_name: &str,
-    extensions: Vec<ExtensionConfig>,
-) -> Result<Arc<dyn Provider>> {
-    let config = crate::config::Config::global();
-
-    let lead_provider_name = config
-        .get_param::<String>("GOOSE_LEAD_PROVIDER")
-        .unwrap_or_else(|_| default_provider_name.to_string());
-
-    let lead_turns = config
-        .get_param::<usize>("GOOSE_LEAD_TURNS")
-        .unwrap_or(DEFAULT_LEAD_TURNS);
-    let failure_threshold = config
-        .get_param::<usize>("GOOSE_LEAD_FAILURE_THRESHOLD")
-        .unwrap_or(DEFAULT_FAILURE_THRESHOLD);
-    let fallback_turns = config
-        .get_param::<usize>("GOOSE_LEAD_FALLBACK_TURNS")
-        .unwrap_or(DEFAULT_FALLBACK_TURNS);
-
-    let lead_model_config = ModelConfig::new_with_context_env(
-        lead_model_name.to_string(),
-        &lead_provider_name,
-        Some("GOOSE_LEAD_CONTEXT_LIMIT"),
-    )?;
-
-    let worker_model_config = create_worker_model_config(default_model, default_provider_name)?;
-
-    let registry = get_registry().await;
-
-    let lead_constructor = {
-        let guard = registry.read().unwrap();
-        guard
-            .entries
-            .get(&lead_provider_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", lead_provider_name))?
-            .constructor
-            .clone()
-    };
-
-    let worker_constructor = {
-        let guard = registry.read().unwrap();
-        guard
-            .entries
-            .get(default_provider_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", default_provider_name))?
-            .constructor
-            .clone()
-    };
-
-    let lead_provider = lead_constructor(lead_model_config, extensions.clone()).await?;
-    let worker_provider = worker_constructor(worker_model_config, extensions).await?;
-
-    Ok(Arc::new(LeadWorkerProvider::new_with_settings(
-        lead_provider,
-        worker_provider,
-        lead_turns,
-        failure_threshold,
-        fallback_turns,
-    )))
-}
-
-fn create_worker_model_config(
-    default_model: &ModelConfig,
+/// Create a provider with an explicit API key (for per-session provider switching).
+/// Supports anthropic and openai providers. Others will return an error.
+///
+/// `model_config` should already be fully prepared (with canonical limits,
+/// context limit, request_params, etc.) by the caller.
+///
+/// `host` overrides the provider's default API base URL (e.g. pass
+/// `"https://api.deepseek.com"` to route an openai-compatible session to DeepSeek).
+pub fn create_with_api_key(
     provider_name: &str,
-) -> Result<ModelConfig> {
-    let mut worker_config = ModelConfig::new_or_fail(&default_model.model_name)
-        .with_canonical_limits(provider_name)
-        .with_context_limit(default_model.context_limit)
-        .with_temperature(default_model.temperature)
-        .with_max_tokens(default_model.max_tokens)
-        .with_toolshim(default_model.toolshim)
-        .with_toolshim_model(default_model.toolshim_model.clone());
-
-    let global_config = crate::config::Config::global();
-
-    if let Ok(limit) = global_config.get_param::<usize>("GOOSE_WORKER_CONTEXT_LIMIT") {
-        worker_config = worker_config.with_context_limit(Some(limit));
-    } else if let Ok(limit) = global_config.get_param::<usize>("GOOSE_CONTEXT_LIMIT") {
-        worker_config = worker_config.with_context_limit(Some(limit));
+    model_config: ModelConfig,
+    api_key: &str,
+    host: Option<&str>,
+) -> Result<Arc<dyn Provider>> {
+    match provider_name {
+        "anthropic" => {
+            let provider = AnthropicProvider::from_api_key(model_config, api_key, host)?;
+            Ok(Arc::new(provider))
+        }
+        "openai" => {
+            let provider = OpenAiProvider::from_api_key(model_config, api_key, host)?;
+            Ok(Arc::new(provider))
+        }
+        _ => Err(anyhow::anyhow!(
+            "Provider '{}' does not support runtime API key injection. \
+             Supported providers: anthropic, openai",
+            provider_name
+        )),
     }
-
-    Ok(worker_config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::paths::Paths;
+    use std::fs;
 
-    #[test_case::test_case(None, None, None, DEFAULT_LEAD_TURNS, DEFAULT_FAILURE_THRESHOLD, DEFAULT_FALLBACK_TURNS ; "defaults")]
-    #[test_case::test_case(Some("7"), Some("4"), Some("3"), 7, 4, 3 ; "custom")]
     #[tokio::test]
-    async fn test_create_lead_worker_provider(
-        lead_turns: Option<&str>,
-        failure_threshold: Option<&str>,
-        fallback_turns: Option<&str>,
-        expected_turns: usize,
-        expected_failure: usize,
-        expected_fallback: usize,
-    ) {
-        let _guard = env_lock::lock_env([
-            ("GOOSE_LEAD_MODEL", Some("gpt-4o")),
-            ("GOOSE_LEAD_PROVIDER", None),
-            ("GOOSE_LEAD_TURNS", lead_turns),
-            ("GOOSE_LEAD_FAILURE_THRESHOLD", failure_threshold),
-            ("GOOSE_LEAD_FALLBACK_TURNS", fallback_turns),
-            ("OPENAI_API_KEY", Some("fake-openai-no-keyring")),
-            ("OPENAI_CUSTOM_HEADERS", Some("")),
-        ]);
+    async fn test_tanzu_declarative_provider_registry_wiring() {
+        let providers_list = providers().await;
+        let tanzu = providers_list
+            .iter()
+            .find(|(m, _)| m.name == "tanzu_ai")
+            .expect("tanzu_ai provider should be registered");
+        let (meta, provider_type) = tanzu;
 
-        let provider = create(
-            "openai",
-            ModelConfig::new_or_fail("gpt-4o-mini").with_canonical_limits("openai"),
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-        let lw = provider.as_lead_worker().unwrap();
-        let (lead, worker) = lw.get_model_info();
-        assert_eq!(lead, "gpt-4o");
-        assert_eq!(worker, "gpt-4o-mini");
-        assert_eq!(
-            lw.get_settings(),
-            (expected_turns, expected_failure, expected_fallback)
+        // Should be a Declarative (fixed) provider
+        assert_eq!(*provider_type, ProviderType::Declarative);
+
+        assert_eq!(meta.display_name, "VMware Tanzu Platform");
+        assert_eq!(meta.default_model, "openai/gpt-oss-120b");
+
+        // First config key should be TANZU_AI_API_KEY (secret, required)
+        let api_key = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "TANZU_AI_API_KEY")
+            .expect("TANZU_AI_API_KEY config key should exist");
+        assert!(
+            api_key.required,
+            "API key should be required for fixed declarative provider"
+        );
+        assert!(api_key.secret, "API key should be secret");
+
+        // Should have TANZU_AI_ENDPOINT config key (not secret, required)
+        let endpoint = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "TANZU_AI_ENDPOINT")
+            .expect("TANZU_AI_ENDPOINT config key should exist");
+        assert!(endpoint.required, "Endpoint should be required");
+        assert!(!endpoint.secret, "Endpoint should not be secret");
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_provider_registry_wiring() {
+        let huggingface = get_from_registry("huggingface")
+            .await
+            .expect("huggingface provider should be registered");
+        let meta = huggingface.metadata();
+
+        assert_eq!(huggingface.provider_type(), ProviderType::Preferred);
+        assert_eq!(meta.display_name, "Hugging Face");
+        assert_eq!(meta.default_model, "Qwen/Qwen3-Coder-480B-A35B-Instruct");
+        assert!(meta
+            .config_keys
+            .iter()
+            .any(|key| key.name == "HF_TOKEN" && key.secret));
+    }
+
+    #[tokio::test]
+    async fn test_nvidia_declarative_provider_registry_wiring() {
+        let nvidia = get_from_registry("nvidia")
+            .await
+            .expect("nvidia provider should be registered");
+        let meta = nvidia.metadata();
+
+        assert_eq!(nvidia.provider_type(), ProviderType::Declarative);
+        assert!(nvidia.supports_inventory_refresh());
+        assert_eq!(meta.display_name, "NVIDIA");
+        assert_eq!(meta.default_model, "z-ai/glm-4.7");
+        assert_eq!(meta.model_doc_link, "https://build.nvidia.com/models");
+        assert!(!meta.setup_steps.is_empty());
+
+        let api_key = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "NVIDIA_API_KEY")
+            .expect("NVIDIA_API_KEY config key should exist");
+        assert!(api_key.required, "NVIDIA_API_KEY should be required");
+        assert!(api_key.secret, "NVIDIA_API_KEY should be secret");
+        assert!(api_key.primary, "NVIDIA_API_KEY should be primary");
+        assert!(
+            !meta.config_keys.iter().any(|k| k.name == "OPENAI_HOST"),
+            "NVIDIA should not expose OpenAI host configuration"
+        );
+        assert!(
+            !meta
+                .config_keys
+                .iter()
+                .any(|k| k.name == "OPENAI_BASE_PATH"),
+            "NVIDIA should not expose OpenAI base path configuration"
         );
     }
 
     #[tokio::test]
-    async fn test_create_regular_provider_without_lead_config() {
-        let _guard = env_lock::lock_env([
-            ("GOOSE_LEAD_MODEL", None),
-            ("GOOSE_LEAD_PROVIDER", None),
-            ("GOOSE_LEAD_TURNS", None),
-            ("GOOSE_LEAD_FAILURE_THRESHOLD", None),
-            ("GOOSE_LEAD_FALLBACK_TURNS", None),
-            ("OPENAI_API_KEY", Some("fake-openai-no-keyring")),
-            ("OPENAI_CUSTOM_HEADERS", Some("")),
-        ]);
+    async fn test_nearai_declarative_provider_registry_wiring() {
+        let nearai = get_from_registry("nearai")
+            .await
+            .expect("nearai provider should be registered");
+        let meta = nearai.metadata();
 
-        let provider = create(
-            "openai",
-            ModelConfig::new_or_fail("gpt-4o-mini").with_canonical_limits("openai"),
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-        assert!(provider.as_lead_worker().is_none());
-        assert_eq!(provider.get_model_config().model_name, "gpt-4o-mini");
+        assert_eq!(nearai.provider_type(), ProviderType::Declarative);
+        assert!(nearai.supports_inventory_refresh());
+        assert_eq!(meta.display_name, "NEAR AI Cloud");
+        assert_eq!(meta.default_model, "zai-org/GLM-5.1-FP8");
+        assert_eq!(meta.model_doc_link, "https://docs.near.ai/");
+        assert!(!meta.setup_steps.is_empty());
+
+        let api_key = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "NEARAI_API_KEY")
+            .expect("NEARAI_API_KEY config key should exist");
+        assert!(api_key.required, "NEARAI_API_KEY should be required");
+        assert!(api_key.secret, "NEARAI_API_KEY should be secret");
+        assert!(api_key.primary, "NEARAI_API_KEY should be primary");
     }
 
-    #[test_case::test_case(None, None, 16_000 ; "no overrides uses default")]
-    #[test_case::test_case(Some("32000"), None, 32_000 ; "worker limit overrides default")]
-    #[test_case::test_case(Some("32000"), Some("64000"), 32_000 ; "worker limit takes priority over global")]
-    fn test_worker_model_context_limit(
-        worker_limit: Option<&str>,
-        global_limit: Option<&str>,
-        expected_limit: usize,
-    ) {
-        let _guard = env_lock::lock_env([
-            ("GOOSE_WORKER_CONTEXT_LIMIT", worker_limit),
-            ("GOOSE_CONTEXT_LIMIT", global_limit),
-        ]);
+    #[tokio::test]
+    async fn test_alibaba_declarative_provider_registry_wiring() {
+        let alibaba = get_from_registry("alibaba")
+            .await
+            .expect("alibaba provider should be registered");
+        let meta = alibaba.metadata();
 
-        let default_model = ModelConfig::new_or_fail("gpt-3.5-turbo")
-            .with_canonical_limits("openai")
-            .with_context_limit(Some(16_000));
+        assert_eq!(alibaba.provider_type(), ProviderType::Declarative);
+        assert!(alibaba.supports_inventory_refresh());
+        assert_eq!(meta.display_name, "Alibaba (Qwen)");
+        assert_eq!(meta.default_model, "qwen3.7-max");
+        assert_eq!(
+            meta.model_doc_link,
+            "https://www.alibabacloud.com/help/en/model-studio/models"
+        );
+        assert!(!meta.setup_steps.is_empty());
 
-        let result = create_worker_model_config(&default_model, "openai").unwrap();
-        assert_eq!(result.context_limit, Some(expected_limit));
+        let api_key = meta
+            .config_keys
+            .iter()
+            .find(|k| k.name == "DASHSCOPE_API_KEY")
+            .expect("DASHSCOPE_API_KEY config key should exist");
+        assert!(api_key.required, "DASHSCOPE_API_KEY should be required");
+        assert!(api_key.secret, "DASHSCOPE_API_KEY should be secret");
+        assert!(api_key.primary, "DASHSCOPE_API_KEY should be primary");
     }
 
     #[tokio::test]
@@ -371,5 +455,61 @@ mod tests {
                 "OPENAI_API_KEY should be secret"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_custom_provider_context_limit_is_applied_from_file() {
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", None::<&str>)]);
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        std::env::set_var("GOOSE_PATH_ROOT", temp_dir.path());
+
+        let custom_dir = Paths::config_dir().join("custom_providers");
+        fs::create_dir_all(&custom_dir).expect("custom providers dir should be created");
+
+        let custom_inf = r#"{
+  "name": "custom_inf",
+  "engine": "openai",
+  "display_name": "Custom Inf",
+  "description": "test provider",
+  "api_key_env": "",
+  "base_url": "https://example.invalid/v1/chat/completions",
+  "models": [
+    {"name": "kimi-k2.5", "context_limit": 256000}
+  ],
+  "requires_auth": false
+}"#;
+        fs::write(custom_dir.join("custom_inf.json"), custom_inf)
+            .expect("custom_inf.json should be written");
+
+        let custom_zero = r#"{
+  "name": "custom_zero",
+  "engine": "openai",
+  "display_name": "Custom Zero",
+  "description": "test provider",
+  "api_key_env": "",
+  "base_url": "https://example.invalid/v1/chat/completions",
+  "models": [
+    {"name": "zero-model", "context_limit": 0}
+  ],
+  "requires_auth": false
+}"#;
+        fs::write(custom_dir.join("custom_zero.json"), custom_zero)
+            .expect("custom_zero.json should be written");
+
+        refresh_custom_providers()
+            .await
+            .expect("custom providers should refresh");
+
+        let provider = create_with_named_model("custom_inf", "kimi-k2.5", Vec::new())
+            .await
+            .expect("custom_inf provider should be creatable");
+        assert_eq!(provider.get_model_config().context_limit, Some(256_000));
+
+        let zero_provider = create_with_named_model("custom_zero", "zero-model", Vec::new())
+            .await
+            .expect("custom_zero provider should be creatable");
+        assert_eq!(zero_provider.get_model_config().context_limit, None);
+
+        std::env::remove_var("GOOSE_PATH_ROOT");
     }
 }

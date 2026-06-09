@@ -42,7 +42,7 @@ When you reach the auto-compaction threshold:
   3. Continue the session. Your previous conversation remains visible, but only the compacted conversion is included in the active context for goose.
 
 :::tip Customize Compaction
-You can customize how goose summarizes conversations during compaction by editing the `compaction.md` [prompt template](/docs/guides/prompt-templates).
+You can customize how goose summarizes conversations during compaction by editing the `compaction.md` [prompt template](/docs/guides/context-engineering/prompt-templates).
 :::
 
 :::tip Tool Output Summarization
@@ -293,9 +293,7 @@ Context limits are automatically detected based on your model name, but goose pr
 | Model | Description | Best For | Setting |
 |-------|-------------|----------|---------|
 | **Main** | Set context limit for the main model (also serves as fallback for other models) | LiteLLM proxies, custom models with non-standard names | `GOOSE_CONTEXT_LIMIT` |
-| **Lead** | Set larger context for planning in [lead/worker mode](/docs/tutorials/lead-worker) | Complex planning tasks requiring more context | `GOOSE_LEAD_CONTEXT_LIMIT` |
-| **Worker** | Set smaller context for execution in lead/worker mode | Cost optimization during execution phase | `GOOSE_WORKER_CONTEXT_LIMIT` |
-| **Planner** | Set context for [planner models](/docs/guides/creating-plans) | Large planning tasks requiring extensive context | `GOOSE_PLANNER_CONTEXT_LIMIT` |
+| **Planner** | Set context for [planner models](/docs/guides/context-engineering/creating-plans) | Large planning tasks requiring extensive context | `GOOSE_PLANNER_CONTEXT_LIMIT` |
 
 :::info
 This setting only affects the displayed token usage and progress indicators. Actual context management is handled by your LLM, so you may experience more or less usage than the limit you set, regardless of what the display shows.
@@ -311,7 +309,7 @@ This feature is particularly useful with:
 goose resolves context limits with the following precedence (highest to lowest):
 
 1. Explicit context_limit in model configuration (if set programmatically)
-2. Specific environment variable (e.g., `GOOSE_LEAD_CONTEXT_LIMIT`)
+2. Specific environment variable (e.g., `GOOSE_PLANNER_CONTEXT_LIMIT`)
 3. Global environment variable (`GOOSE_CONTEXT_LIMIT`)
 4. Model-specific default based on name pattern matching
 5. Global default (128,000 tokens)
@@ -348,13 +346,12 @@ export GOOSE_MODEL="my-custom-gpt4-proxy"
 export GOOSE_CONTEXT_LIMIT=200000  # Override the 32k default
 ```
 
-2. Lead/worker setup with different context limits
+2. Planner setup with a different context limit
 
 ```bash
-# Different context limits for planning vs execution
-export GOOSE_LEAD_MODEL="claude-opus-custom"
-export GOOSE_LEAD_CONTEXT_LIMIT=500000    # Large context for planning
-export GOOSE_WORKER_CONTEXT_LIMIT=128000  # Smaller context for execution
+# Set a larger context window for planning
+export GOOSE_PLANNER_MODEL="claude-opus-custom"
+export GOOSE_PLANNER_CONTEXT_LIMIT=500000
 ```
 
 3. Planner with large context
@@ -364,6 +361,23 @@ export GOOSE_WORKER_CONTEXT_LIMIT=128000  # Smaller context for execution
 export GOOSE_PLANNER_MODEL="gpt-4-custom"
 export GOOSE_PLANNER_CONTEXT_LIMIT=1000000
 ```
+
+## Credit Balance Monitoring
+
+goose monitors your API provider balance and warns you when credits are running low or exhausted. When this happens, you'll see an **Insufficient Credits** notification.
+
+For providers that support it (such as [Tetrate Agent Router Service](https://router.tetrate.ai)), the notification includes an **Add credits** button that takes you directly to your provider's billing page.
+
+**What to do:**
+1. Click the **Add credits** button (if available) to top up your account
+2. Or visit your provider's dashboard manually to add credits
+3. Once credits are added, resend your message to continue the conversation
+
+:::tip
+goose detects low balance conditions automatically, so you won't lose your conversation context—just add credits and pick up where you left off.
+:::
+
+**Supported providers:** Tetrate Agent Router Service, OpenRouter, and other providers that report balance information via HTTP 402 responses.
 
 ## Cost Tracking
 Display real-time estimated costs of your session.

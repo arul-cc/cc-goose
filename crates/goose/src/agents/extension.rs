@@ -206,6 +206,7 @@ pub enum ExtensionConfig {
     Platform {
         /// The name used to identify this extension
         name: String,
+        #[serde(default)]
         #[serde(deserialize_with = "deserialize_null_with_default")]
         #[schema(required)]
         description: String,
@@ -220,6 +221,7 @@ pub enum ExtensionConfig {
     StreamableHttp {
         /// The name used to identify this extension
         name: String,
+        #[serde(default)]
         #[serde(deserialize_with = "deserialize_null_with_default")]
         #[schema(required)]
         description: String,
@@ -230,9 +232,18 @@ pub enum ExtensionConfig {
         env_keys: Vec<String>,
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// List of allowed header names that can be passed from websocket
+        #[serde(default)]
+        allowed_headers: Vec<String>,
         // NOTE: set timeout to be optional for compatibility.
         // However, new configurations should include this field.
         timeout: Option<u64>,
+        /// Optional Unix domain socket path for HTTP-over-UDS transport.
+        /// When set, the HTTP connection is routed through this socket while
+        /// `uri` is used for the Host header and path.
+        /// Use `@name` for Linux abstract sockets.
+        #[serde(default)]
+        socket: Option<String>,
         #[serde(default)]
         bundled: Option<bool>,
         #[serde(default)]
@@ -243,6 +254,7 @@ pub enum ExtensionConfig {
     Frontend {
         /// The name used to identify this extension
         name: String,
+        #[serde(default)]
         #[serde(deserialize_with = "deserialize_null_with_default")]
         #[schema(required)]
         description: String,
@@ -260,6 +272,7 @@ pub enum ExtensionConfig {
     InlinePython {
         /// The name used to identify this extension
         name: String,
+        #[serde(default)]
         #[serde(deserialize_with = "deserialize_null_with_default")]
         #[schema(required)]
         description: String,
@@ -301,8 +314,10 @@ impl ExtensionConfig {
             envs: Envs::default(),
             env_keys: Vec::new(),
             headers: HashMap::new(),
+            allowed_headers: Vec::new(),
             description: description.into(),
             timeout: Some(timeout.into()),
+            socket: None,
             bundled: None,
             available_tools: Vec::new(),
         }
@@ -456,8 +471,10 @@ impl ExtensionConfig {
                 env_keys,
                 headers,
                 timeout,
+                socket,
                 bundled,
                 available_tools,
+                allowed_headers,
             } => {
                 let merged = merge_environments(&envs, &env_keys, &name, config).await?;
                 let headers = headers
@@ -467,19 +484,32 @@ impl ExtensionConfig {
                         (k, v)
                     })
                     .collect();
+                let socket = socket.map(|s| substitute_env_vars(&s, &merged));
                 Ok(Self::StreamableHttp {
                     name,
                     description,
-                    uri,
+                    uri: substitute_env_vars(&uri, &merged),
                     envs: Envs::new(merged),
                     env_keys: vec![],
                     headers,
                     timeout,
+                    socket,
                     bundled,
                     available_tools,
+                    allowed_headers,
                 })
             }
             other => Ok(other),
+        }
+    }
+
+    /// Get allowed headers for this extension
+    pub fn allowed_headers(&self) -> Vec<String> {
+        match self {
+            Self::StreamableHttp {
+                allowed_headers, ..
+            } => allowed_headers.clone(),
+            _ => Vec::new(),
         }
     }
 }
@@ -490,8 +520,14 @@ impl std::fmt::Display for ExtensionConfig {
             ExtensionConfig::Sse { name, .. } => {
                 write!(f, "SSE({}: unsupported)", name)
             }
-            ExtensionConfig::StreamableHttp { name, uri, .. } => {
-                write!(f, "StreamableHttp({}: {})", name, uri)
+            ExtensionConfig::StreamableHttp {
+                name, uri, socket, ..
+            } => {
+                if let Some(socket) = socket {
+                    write!(f, "StreamableHttp({}: {} via {})", name, uri, socket)
+                } else {
+                    write!(f, "StreamableHttp({}: {})", name, uri)
+                }
             }
             ExtensionConfig::Stdio {
                 name, cmd, args, ..
@@ -544,6 +580,9 @@ pub struct ToolInfo {
     pub description: String,
     pub parameters: Vec<String>,
     pub permission: Option<PermissionLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 impl ToolInfo {
@@ -558,7 +597,13 @@ impl ToolInfo {
             description: description.to_string(),
             parameters,
             permission,
+            input_schema: None,
         }
+    }
+
+    pub fn with_input_schema(mut self, schema: serde_json::Value) -> Self {
+        self.input_schema = Some(schema);
+        self
     }
 }
 
@@ -666,8 +711,10 @@ available_tools: []
             .into_iter()
             .collect(),
             timeout: None,
+            socket: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -686,8 +733,10 @@ available_tools: []
             .into_iter()
             .collect(),
             timeout: None,
+            socket: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "header_substitution"
     )]
@@ -759,8 +808,10 @@ available_tools: []
             .into_iter()
             .collect(),
             timeout: None,
+            socket: None,
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         },
         ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -776,10 +827,45 @@ available_tools: []
                 .into_iter()
                 .collect(),
             timeout: None,
+            socket: None,
+            bundled: None,
+            available_tools: vec![],
+            allowed_headers: vec![],
+        }
+        ; "http_env_key_and_header_substitution"
+    )]
+    #[test_case(
+        ExtensionConfig::StreamableHttp {
+            name: "test".into(),
+            description: String::new(),
+            uri: "https://example.com/mcp?api_key=$MY_SECRET".into(),
+            envs: extension::Envs::default(),
+            env_keys: vec!["MY_SECRET".into()],
+            headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
+            timeout: None,
+            socket: None,
+            bundled: None,
+            available_tools: vec![],
+        },
+        ExtensionConfig::StreamableHttp {
+            name: "test".into(),
+            description: String::new(),
+            uri: "https://example.com/mcp?api_key=secret_value".into(),
+            envs: extension::Envs::new({
+                let mut m = std::collections::HashMap::new();
+                m.insert("MY_SECRET".to_string(), "secret_value".to_string());
+                m
+            }),
+            env_keys: vec![],
+            headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
+            timeout: None,
+            socket: None,
             bundled: None,
             available_tools: vec![],
         }
-        ; "http_env_key_and_header_substitution"
+        ; "http_env_key_uri_substitution"
     )]
     #[test_case(
         ExtensionConfig::Stdio {
@@ -824,5 +910,47 @@ available_tools: []
         .unwrap();
         cfg.set("MY_SECRET", &"secret_value", true).unwrap();
         assert_eq!(config.resolve(&cfg).await.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_display_streamable_http_with_socket() {
+        let config = ExtensionConfig::StreamableHttp {
+            name: "test".into(),
+            description: String::new(),
+            uri: "http://localhost:8080/mcp".into(),
+            envs: extension::Envs::default(),
+            env_keys: vec![],
+            headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
+            timeout: None,
+            socket: Some("@egress.sock".to_string()),
+            bundled: None,
+            available_tools: vec![],
+        };
+        assert_eq!(
+            config.to_string(),
+            "StreamableHttp(test: http://localhost:8080/mcp via @egress.sock)"
+        );
+    }
+
+    #[test]
+    fn test_display_streamable_http_without_socket() {
+        let config = ExtensionConfig::StreamableHttp {
+            name: "test".into(),
+            description: String::new(),
+            uri: "http://localhost:8080/mcp".into(),
+            envs: extension::Envs::default(),
+            env_keys: vec![],
+            headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
+            timeout: None,
+            socket: None,
+            bundled: None,
+            available_tools: vec![],
+        };
+        assert_eq!(
+            config.to_string(),
+            "StreamableHttp(test: http://localhost:8080/mcp)"
+        );
     }
 }
