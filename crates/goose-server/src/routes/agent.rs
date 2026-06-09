@@ -51,6 +51,9 @@ pub struct UpdateProviderRequest {
     context_limit: Option<usize>,
     request_params: Option<std::collections::HashMap<String, serde_json::Value>>,
     api_key: Option<String>,
+    /// Base URL for the provider API (e.g. "https://api.deepseek.com" for DeepSeek).
+    /// When omitted, falls back to the provider's default host from global config.
+    host: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -655,16 +658,28 @@ async fn update_agent_provider(
     model_config.reasoning = Some(model_info.reasoning);
 
     let new_provider = if let Some(ref api_key) = payload.api_key {
-        create_with_api_key(&payload.provider, &model, api_key).map_err(|e| {
+        create_with_api_key(
+            &payload.provider,
+            model_config,
+            api_key,
+            payload.host.as_deref(),
+        )
+        .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("Failed to create {} provider with api_key: {}", &payload.provider, e),
+                format!(
+                    "Failed to create {} provider with api_key: {}",
+                    &payload.provider, e
+                ),
             )
         })?
     } else {
-        let extensions =
-            EnabledExtensionsState::for_session(state.session_manager(), &payload.session_id, config)
-                .await;
+        let extensions = EnabledExtensionsState::for_session(
+            state.session_manager(),
+            &payload.session_id,
+            config,
+        )
+        .await;
 
         create(&payload.provider, model_config, extensions)
             .await

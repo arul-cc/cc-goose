@@ -302,7 +302,6 @@ impl Default for ExtensionConfig {
 }
 
 impl ExtensionConfig {
-
     pub fn streamable_http<S: Into<String>, T: Into<u64>>(
         name: S,
         uri: S,
@@ -507,7 +506,9 @@ impl ExtensionConfig {
     /// Get allowed headers for this extension
     pub fn allowed_headers(&self) -> Vec<String> {
         match self {
-            Self::StreamableHttp { allowed_headers, .. } => allowed_headers.clone(),
+            Self::StreamableHttp {
+                allowed_headers, ..
+            } => allowed_headers.clone(),
             _ => Vec::new(),
         }
     }
@@ -920,6 +921,7 @@ available_tools: []
             envs: extension::Envs::default(),
             env_keys: vec![],
             headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
             timeout: None,
             socket: Some("@egress.sock".to_string()),
             bundled: None,
@@ -940,6 +942,7 @@ available_tools: []
             envs: extension::Envs::default(),
             env_keys: vec![],
             headers: std::collections::HashMap::new(),
+            allowed_headers: vec![],
             timeout: None,
             socket: None,
             bundled: None,

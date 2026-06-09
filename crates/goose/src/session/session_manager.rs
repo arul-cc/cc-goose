@@ -681,7 +681,9 @@ impl SessionStorage {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(50);
 
-        SqlitePoolOptions::new().max_connections(max_connections).connect_lazy_with(options)
+        SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect_lazy_with(options)
     }
 
     pub fn new(data_dir: PathBuf) -> Self {

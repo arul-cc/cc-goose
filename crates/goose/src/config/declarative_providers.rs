@@ -105,6 +105,11 @@ pub struct DeclarativeProviderConfig {
     pub fast_model: Option<String>,
     #[serde(default)]
     pub preserves_thinking: bool,
+    /// Default request parameters merged into the model config for every request.
+    /// These are injected into the API request payload (e.g. `{"thinking": {"type": "disabled"}}`
+    /// for DeepSeek v4 models). Values here can be overridden by per-session `request_params`.
+    #[serde(default)]
+    pub default_request_params: Option<HashMap<String, serde_json::Value>>,
 }
 
 fn default_requires_auth() -> bool {
@@ -322,6 +327,7 @@ pub fn create_custom_provider(
         setup_steps: vec![],
         fast_model: None,
         preserves_thinking,
+        default_request_params: None,
     };
 
     let custom_providers_dir = custom_providers_dir();
@@ -402,6 +408,7 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
             setup_steps: existing_config.setup_steps,
             fast_model: existing_config.fast_model.clone(),
             preserves_thinking,
+            default_request_params: existing_config.default_request_params,
         };
 
         let file_path = custom_provider_file_path(&updated_config.name)?;
@@ -720,6 +727,7 @@ mod tests {
             setup_steps: Vec::new(),
             fast_model: None,
             preserves_thinking: true,
+            default_request_params: None,
         }
     }
 

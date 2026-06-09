@@ -230,20 +230,25 @@ pub async fn create_with_named_model(
 
 /// Create a provider with an explicit API key (for per-session provider switching).
 /// Supports anthropic and openai providers. Others will return an error.
+///
+/// `model_config` should already be fully prepared (with canonical limits,
+/// context limit, request_params, etc.) by the caller.
+///
+/// `host` overrides the provider's default API base URL (e.g. pass
+/// `"https://api.deepseek.com"` to route an openai-compatible session to DeepSeek).
 pub fn create_with_api_key(
     provider_name: &str,
-    model_name: &str,
+    model_config: ModelConfig,
     api_key: &str,
+    host: Option<&str>,
 ) -> Result<Arc<dyn Provider>> {
-    let model_config = ModelConfig::new(model_name)?.with_canonical_limits(provider_name);
-
     match provider_name {
         "anthropic" => {
-            let provider = AnthropicProvider::from_api_key(model_config, api_key)?;
+            let provider = AnthropicProvider::from_api_key(model_config, api_key, host)?;
             Ok(Arc::new(provider))
         }
         "openai" => {
-            let provider = OpenAiProvider::from_api_key(model_config, api_key)?;
+            let provider = OpenAiProvider::from_api_key(model_config, api_key, host)?;
             Ok(Arc::new(provider))
         }
         _ => Err(anyhow::anyhow!(
@@ -253,8 +258,6 @@ pub fn create_with_api_key(
         )),
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

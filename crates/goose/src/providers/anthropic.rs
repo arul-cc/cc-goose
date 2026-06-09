@@ -15,7 +15,6 @@ use super::formats::anthropic::{
     create_request_with_options, response_to_streaming_message, thinking_type,
     AnthropicFormatOptions, ThinkingType,
 };
-use serde_json::json;
 use super::inventory::{config_secret_value, serialize_string_map, InventoryIdentityInput};
 use super::openai_compatible::handle_status;
 use super::openai_compatible::map_http_error_to_provider_error;
@@ -26,6 +25,7 @@ use crate::model::ModelConfig;
 use crate::providers::utils::RequestLog;
 use futures::future::BoxFuture;
 use rmcp::model::Tool;
+use serde_json::json;
 use std::collections::HashMap;
 
 const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
@@ -183,10 +183,17 @@ impl AnthropicProvider {
     }
 
     /// Create an AnthropicProvider with an explicit API key (for per-session provider switching).
-    pub fn from_api_key(model: ModelConfig, api_key: &str) -> Result<Self> {
-        let host = crate::config::Config::global()
-            .get_param("ANTHROPIC_HOST")
-            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    pub fn from_api_key(
+        model: ModelConfig,
+        api_key: &str,
+        host_override: Option<&str>,
+    ) -> Result<Self> {
+        let host = match host_override {
+            Some(h) => h.to_string(),
+            None => crate::config::Config::global()
+                .get_param("ANTHROPIC_HOST")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+        };
 
         let auth = AuthMethod::ApiKey {
             header_name: "x-api-key".to_string(),
@@ -309,6 +316,7 @@ impl AnthropicProvider {
                 Err(map_http_error_to_provider_error(
                     response.status,
                     response.payload,
+                    "v1/messages",
                 ))
             }
         }
@@ -543,6 +551,7 @@ mod tests {
             dynamic_models,
             skip_canonical_filtering: false,
             format_options: AnthropicFormatOptions::default(),
+            custom_headers: None,
         }
     }
 
@@ -571,6 +580,7 @@ mod tests {
             setup_steps: vec![],
             fast_model: None,
             preserves_thinking: false,
+            default_request_params: None,
         }
     }
 

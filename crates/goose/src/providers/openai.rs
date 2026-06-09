@@ -301,15 +301,33 @@ impl OpenAiProvider {
     }
 
     /// Create an OpenAiProvider with an explicit API key (for per-session provider switching).
-    pub fn from_api_key(model: ModelConfig, api_key: &str) -> Result<Self> {
-        let config = crate::config::Config::global();
-        let host: String = config
-            .get_param("OPENAI_HOST")
-            .unwrap_or_else(|_| "https://api.openai.com".to_string());
+    ///
+    /// `host_override` sets the API base URL. When provided, `preserve_thinking_context`
+    /// is derived from whether the host is OpenAI's own API. Non-OpenAI hosts (DeepSeek,
+    /// OpenRouter, etc.) get `true` so `reasoning_content` is round-tripped.
+    pub fn from_api_key(
+        model: ModelConfig,
+        api_key: &str,
+        host_override: Option<&str>,
+    ) -> Result<Self> {
+        let host = match host_override {
+            Some(h) => h.to_string(),
+            None => {
+                let config = crate::config::Config::global();
+                config
+                    .get_param("OPENAI_HOST")
+                    .unwrap_or_else(|_| "https://api.openai.com".to_string())
+            }
+        };
+
+        let is_openai = url::Url::parse(&host)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+            .map(|h| h == "api.openai.com" || h.ends_with(".api.openai.com"))
+            .unwrap_or(false);
 
         let auth = AuthMethod::BearerToken(api_key.to_string());
-        let api_client =
-            ApiClient::with_timeout(host, auth, std::time::Duration::from_secs(600))?;
+        let api_client = ApiClient::with_timeout(host, auth, std::time::Duration::from_secs(600))?;
 
         Ok(Self {
             api_client,
@@ -323,7 +341,7 @@ impl OpenAiProvider {
             custom_models: None,
             dynamic_models: None,
             skip_canonical_filtering: false,
-            preserve_thinking_context: false,
+            preserve_thinking_context: !is_openai,
         })
     }
 
@@ -442,11 +460,15 @@ impl OpenAiProvider {
             api_client = api_client.with_headers(header_map)?;
         }
 
-        let model = if let Some(ref fast_model_name) = config.fast_model {
+        let mut model = if let Some(ref fast_model_name) = config.fast_model {
             model.with_fast(fast_model_name, &config.name)?
         } else {
             model
         };
+
+        if let Some(default_params) = config.default_request_params {
+            model = model.with_merged_request_params(default_params);
+        }
 
         Ok(Self {
             api_client,
@@ -1337,6 +1359,7 @@ mod tests {
             setup_steps: vec![],
             fast_model: None,
             preserves_thinking: false,
+            default_request_params: None,
         }
     }
 

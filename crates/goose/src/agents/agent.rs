@@ -773,14 +773,22 @@ impl Agent {
     /// Get the provider for a specific session.
     /// If the session has a per-session provider override, returns that.
     /// Otherwise falls back to the default shared provider.
-    pub async fn provider_for_session(&self, session_id: &str) -> Result<Arc<dyn Provider>, anyhow::Error> {
+    pub async fn provider_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<dyn Provider>, anyhow::Error> {
         // Check session-specific providers first.
         // std::sync::Mutex is used here — lock is held only for a HashMap lookup (nanoseconds).
         {
-            let providers = self.session_providers.lock()
+            let providers = self
+                .session_providers
+                .lock()
                 .map_err(|e| anyhow::anyhow!("session_providers lock poisoned: {}", e))?;
             if let Some(provider) = providers.get(session_id) {
-                tracing::trace!("[SESSION_PROVIDER] Using session-specific provider for {}", session_id);
+                tracing::trace!(
+                    "[SESSION_PROVIDER] Using session-specific provider for {}",
+                    session_id
+                );
                 return Ok(Arc::clone(provider));
             }
         }
@@ -793,11 +801,21 @@ impl Agent {
     /// If all three are present, creates a new provider and caches it for this session.
     /// If headers changed since last call, recreates the provider.
     pub async fn ensure_session_provider(&self, session_id: &str) -> Result<()> {
-        tracing::debug!("[SESSION_PROVIDER] ensure_session_provider called for {}", session_id);
+        tracing::debug!(
+            "[SESSION_PROVIDER] ensure_session_provider called for {}",
+            session_id
+        );
 
-        let session = self.config.session_manager.get_session(session_id, false).await?;
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
 
-        let ws_headers = match session.extension_data.get_extension_state("websocket_headers", "v0") {
+        let ws_headers = match session
+            .extension_data
+            .get_extension_state("websocket_headers", "v0")
+        {
             Some(headers) => headers,
             None => return Ok(()), // No websocket headers, use default provider
         };
@@ -831,12 +849,18 @@ impl Agent {
         // Check if we already have a cached provider with the same config.
         // std::sync::Mutex — held only for a HashMap lookup (nanoseconds).
         {
-            let providers = self.session_providers.lock()
+            let providers = self
+                .session_providers
+                .lock()
                 .map_err(|e| anyhow::anyhow!("session_providers lock poisoned: {}", e))?;
             if let Some(existing) = providers.get(session_id) {
                 let existing_config = existing.get_model_config();
-                if existing.get_name() == provider_name && existing_config.model_name == model_name {
-                    tracing::debug!("[SESSION_PROVIDER] Reusing cached provider for session {}", session_id);
+                if existing.get_name() == provider_name && existing_config.model_name == model_name
+                {
+                    tracing::debug!(
+                        "[SESSION_PROVIDER] Reusing cached provider for session {}",
+                        session_id
+                    );
                     return Ok(()); // Same provider/model, keep using cached
                 }
             }
@@ -845,14 +869,21 @@ impl Agent {
         // Create a new provider for this session (outside any lock)
         tracing::info!(
             "[SESSION_PROVIDER] Creating provider for session {}: provider={}, model={}",
-            session_id, provider_name, model_name
+            session_id,
+            provider_name,
+            model_name
         );
 
-        let provider = crate::providers::create_with_api_key(&provider_name, &model_name, &api_key)?;
+        let model_config =
+            crate::model::ModelConfig::new(&model_name)?.with_canonical_limits(&provider_name);
+        let provider =
+            crate::providers::create_with_api_key(&provider_name, model_config, &api_key, None)?;
 
         // Brief lock just for the insert (nanoseconds).
         {
-            let mut providers = self.session_providers.lock()
+            let mut providers = self
+                .session_providers
+                .lock()
                 .map_err(|e| anyhow::anyhow!("session_providers lock poisoned: {}", e))?;
             providers.insert(session_id.to_string(), provider);
         }
@@ -867,11 +898,16 @@ impl Agent {
 
     /// Remove the session-specific provider (cleanup on disconnect).
     pub async fn remove_session_provider(&self, session_id: &str) {
-        let removed = self.session_providers.lock()
+        let removed = self
+            .session_providers
+            .lock()
             .map(|mut providers| providers.remove(session_id).is_some())
             .unwrap_or(false);
         if removed {
-            tracing::info!("[SESSION_PROVIDER] Removed provider for session {}", session_id);
+            tracing::info!(
+                "[SESSION_PROVIDER] Removed provider for session {}",
+                session_id
+            );
         }
     }
 
@@ -1652,13 +1688,9 @@ impl Agent {
         // Resolve the provider once for this request to avoid repeated lock acquisitions.
         let session_provider = self.provider_for_session(&session_config.id).await?;
 
-        let needs_auto_compact = check_if_compaction_needed(
-            session_provider.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
+        let needs_auto_compact =
+            check_if_compaction_needed(session_provider.as_ref(), &conversation, None, &session)
+                .await?;
 
         let conversation_to_compact = conversation.clone();
 
@@ -1893,7 +1925,7 @@ impl Agent {
                 ).await;
 
                 let mut stream = Self::stream_response_from_provider(
-                    Arc::clone(&session_provider),
+                    Arc::clone(&provider),
                     &session_config.id,
                     &system_prompt,
                     conversation_with_moim.messages(),
@@ -1930,6 +1962,13 @@ impl Agent {
                 // thinking so a later tool-call chunk can suppress replayed
                 // reasoning without hiding final-only non-streaming thoughts.
                 let mut surfaced_thinking_in_turn = false;
+
+                // Accumulate thinking/reasoning content across all streamed
+                // chunks so it can be attached to the final tool-call message.
+                // DeepSeek and Kimi stream reasoning in early chunks and tool
+                // calls in later ones; without accumulation the reasoning is
+                // lost from the conversation history.
+                let mut accumulated_thinking: Vec<MessageContent> = Vec::new();
 
                 while let Some(next) = stream.next().await {
                     if is_token_cancelled(&cancel_token) || exit_chat {
@@ -1980,6 +2019,14 @@ impl Agent {
                                     },
                                 );
 
+                                // Collect thinking content from every chunk so it
+                                // survives into the tool-call message later.
+                                accumulated_thinking.extend(
+                                    response.content.iter()
+                                        .filter(|c| matches!(c, MessageContent::Thinking(_)))
+                                        .cloned()
+                                );
+
                                 yield AgentEvent::Message(filtered_response.clone());
                                 tokio::task::yield_now().await;
 
@@ -1989,7 +2036,24 @@ impl Agent {
                                     if !text.is_empty() {
                                         last_assistant_text = text;
                                     }
-                                    messages_to_add.push(response);
+                                    // Push only non-thinking content as standalone messages;
+                                    // thinking is accumulated separately and will be attached
+                                    // to the tool-call message if one follows.
+                                    let non_thinking_content: Vec<MessageContent> = response.content.iter()
+                                        .filter(|c| !matches!(c, MessageContent::Thinking(_)))
+                                        .cloned()
+                                        .collect();
+                                    if !non_thinking_content.is_empty() {
+                                        let mut msg = Message::new(
+                                            response.role.clone(),
+                                            response.created,
+                                            non_thinking_content,
+                                        );
+                                        if let Some(ref id) = response.id {
+                                            msg = msg.with_id(id.clone());
+                                        }
+                                        messages_to_add.push(msg);
+                                    }
                                     continue;
                                 }
 
@@ -2162,27 +2226,20 @@ impl Agent {
                                     }
                                 }
 
-                                // Preserve thinking/reasoning content from the original response
-                                // Gemini (and other thinking models) require thinking to be echoed back
-                                // Kimi/DeepSeek require reasoning_content on assistant tool call messages
-                                let thinking_content: Vec<MessageContent> = response.content.iter()
-                                    .filter(|c| matches!(c, MessageContent::Thinking(_)))
-                                    .cloned()
-                                    .collect();
-                                if !thinking_content.is_empty() {
+                                // Use accumulated thinking from ALL streamed chunks
+                                // (not just the last one). DeepSeek/Kimi stream
+                                // reasoning in early chunks before tool calls arrive.
+                                if !accumulated_thinking.is_empty() {
                                     let thinking_msg = Message::new(
                                         response.role.clone(),
                                         response.created,
-                                        thinking_content,
+                                        accumulated_thinking.clone(),
                                     ).with_id(format!("msg_{}", Uuid::new_v4()));
                                     messages_to_add.push(thinking_msg);
                                 }
 
-                                // Collect reasoning content to attach to tool request messages
-                                let reasoning_content: Vec<MessageContent> = response.content.iter()
-                                    .filter(|c| matches!(c, MessageContent::Thinking(_)))
-                                    .cloned()
-                                    .collect();
+                                // Attach accumulated reasoning to each tool request message
+                                let reasoning_content = accumulated_thinking.clone();
 
                                 for request in frontend_requests.iter().chain(remaining_requests.iter()) {
                                     if request.tool_call.is_ok() {
@@ -2259,7 +2316,7 @@ impl Agent {
                             );
 
                             match compact_messages(
-                                session_provider.as_ref(),
+                                provider.as_ref(),
                                 &session_config.id,
                                 &conversation,
                                 false,

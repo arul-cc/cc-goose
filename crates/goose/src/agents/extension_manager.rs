@@ -541,7 +541,9 @@ impl DynamicHeaderClient {
 
     /// Read the current session's websocket headers, filtered by allowed_headers.
     /// Returns them as HTTP HeaderName/HeaderValue pairs ready to inject.
-    async fn get_dynamic_headers(&self) -> HashMap<axum::http::HeaderName, axum::http::HeaderValue> {
+    async fn get_dynamic_headers(
+        &self,
+    ) -> HashMap<axum::http::HeaderName, axum::http::HeaderValue> {
         let mut result = HashMap::new();
 
         let sid = {
@@ -556,14 +558,24 @@ impl DynamicHeaderClient {
             return result;
         }
 
-        let allowed_lower: Vec<String> = self.allowed_headers.iter().map(|h| h.to_lowercase()).collect();
+        let allowed_lower: Vec<String> = self
+            .allowed_headers
+            .iter()
+            .map(|h| h.to_lowercase())
+            .collect();
 
-        let session = match crate::session::SessionManager::instance().get_session(&sid, false).await {
+        let session = match crate::session::SessionManager::instance()
+            .get_session(&sid, false)
+            .await
+        {
             Ok(s) => s,
             Err(_) => return result,
         };
 
-        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
+        if let Some(headers_value) = session
+            .extension_data
+            .get_extension_state("websocket_headers", "v0")
+        {
             if let Some(headers_obj) = headers_value.as_object() {
                 for (key, value) in headers_obj {
                     if !allowed_lower.contains(&key.to_lowercase()) {
@@ -574,7 +586,10 @@ impl DynamicHeaderClient {
                             axum::http::HeaderName::try_from(key.as_str()),
                             axum::http::HeaderValue::from_str(val_str),
                         ) {
-                            eprintln!("[DynamicHeaderClient] Injecting header '{}' for session {}", key, sid);
+                            eprintln!(
+                                "[DynamicHeaderClient] Injecting header '{}' for session {}",
+                                key, sid
+                            );
                             result.insert(hname, hval);
                         }
                     }
@@ -584,14 +599,18 @@ impl DynamicHeaderClient {
 
         eprintln!(
             "[DynamicHeaderClient] Injecting {} headers for session {}",
-            result.len(), sid
+            result.len(),
+            sid
         );
 
         result
     }
 
     /// Merge dynamic session headers into the custom_headers map.
-    async fn merge_headers(&self, custom_headers: &mut HashMap<axum::http::HeaderName, axum::http::HeaderValue>) {
+    async fn merge_headers(
+        &self,
+        custom_headers: &mut HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) {
         let dynamic = self.get_dynamic_headers().await;
         custom_headers.extend(dynamic);
     }
@@ -638,7 +657,10 @@ impl rmcp::transport::streamable_http_client::StreamableHttpClient for DynamicHe
         auth_token: Option<String>,
         mut custom_headers: HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
     ) -> Result<
-        futures::stream::BoxStream<'static, Result<sse_stream::Sse, rmcp::transport::streamable_http_client::SseError>>,
+        futures::stream::BoxStream<
+            'static,
+            Result<sse_stream::Sse, rmcp::transport::streamable_http_client::SseError>,
+        >,
         StreamableHttpError<Self::Error>,
     > {
         self.merge_headers(&mut custom_headers).await;
@@ -987,217 +1009,220 @@ impl ExtensionManager {
             .or_else(|| std::env::var("GOOSE_WORKING_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-        let (client, resolved_headers): (Box<dyn McpClientTrait>, Option<HashMap<String, String>>) = match &config {
-            ExtensionConfig::Sse { .. } => {
-                return Err(ExtensionError::ConfigError(
-                    "SSE is unsupported, migrate to streamable_http".to_string(),
-                ));
-            }
-            ExtensionConfig::StreamableHttp {
-                uri,
-                timeout,
-                headers,
-                name,
-                envs,
-                env_keys,
-                socket,
-                allowed_headers,
-                ..
-            } => {
-                let config = Config::global();
-                let all_envs = merge_environments(envs, env_keys, &sanitized_name, config).await?;
-                let resolved_uri = substitute_env_vars(uri, &all_envs);
-                let resolved_headers: HashMap<String, String> = headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), substitute_env_vars(v, &all_envs)))
-                    .collect();
-                let resolved_socket = socket.as_ref().map(|s| substitute_env_vars(s, &all_envs));
-                let session_id = crate::session_context::current_session_id();
-                let client = create_streamable_http_client(
-                    &resolved_uri,
-                    *timeout,
-                    &resolved_headers,
+        let (client, resolved_headers): (Box<dyn McpClientTrait>, Option<HashMap<String, String>>) =
+            match &config {
+                ExtensionConfig::Sse { .. } => {
+                    return Err(ExtensionError::ConfigError(
+                        "SSE is unsupported, migrate to streamable_http".to_string(),
+                    ));
+                }
+                ExtensionConfig::StreamableHttp {
+                    uri,
+                    timeout,
+                    headers,
                     name,
-                    resolved_socket.as_deref(),
-                    Box::new(GooseCredentialStore::new(name.to_string())),
-                    self.provider.clone(),
-                    self.client_name.clone(),
-                    self.mcp_client_capabilities(),
-                    &effective_working_dir,
+                    envs,
+                    env_keys,
+                    socket,
                     allowed_headers,
-                    session_id.as_deref(),
-                )
-                .await?;
-                (client, Some(resolved_headers))
-            }
-            ExtensionConfig::Builtin { ref name, .. }
-            | ExtensionConfig::Platform { ref name, .. } => {
-                let timeout = if let ExtensionConfig::Builtin { timeout, .. } = &config {
-                    *timeout
-                } else {
-                    None
-                };
-                let normalized_name = name_to_key(name);
+                    ..
+                } => {
+                    let config = Config::global();
+                    let all_envs =
+                        merge_environments(envs, env_keys, &sanitized_name, config).await?;
+                    let resolved_uri = substitute_env_vars(uri, &all_envs);
+                    let resolved_headers: HashMap<String, String> = headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), substitute_env_vars(v, &all_envs)))
+                        .collect();
+                    let resolved_socket =
+                        socket.as_ref().map(|s| substitute_env_vars(s, &all_envs));
+                    let session_id = crate::session_context::current_session_id();
+                    let client = create_streamable_http_client(
+                        &resolved_uri,
+                        *timeout,
+                        &resolved_headers,
+                        name,
+                        resolved_socket.as_deref(),
+                        Box::new(GooseCredentialStore::new(name.to_string())),
+                        self.provider.clone(),
+                        self.client_name.clone(),
+                        self.mcp_client_capabilities(),
+                        &effective_working_dir,
+                        allowed_headers,
+                        session_id.as_deref(),
+                    )
+                    .await?;
+                    (client, Some(resolved_headers))
+                }
+                ExtensionConfig::Builtin { ref name, .. }
+                | ExtensionConfig::Platform { ref name, .. } => {
+                    let timeout = if let ExtensionConfig::Builtin { timeout, .. } = &config {
+                        *timeout
+                    } else {
+                        None
+                    };
+                    let normalized_name = name_to_key(name);
 
-                if let Some(def) = PLATFORM_EXTENSIONS.get(normalized_name.as_str()) {
-                    // Platform extension: create via in-process client factory
-                    let mut context = self.context.clone();
-                    context.extension_manager = Some(Arc::downgrade(self));
-                    if let Some(id) = session_id {
-                        if let Ok(session) =
-                            self.context.session_manager.get_session(id, false).await
-                        {
-                            context.session = Some(Arc::new(session));
+                    if let Some(def) = PLATFORM_EXTENSIONS.get(normalized_name.as_str()) {
+                        // Platform extension: create via in-process client factory
+                        let mut context = self.context.clone();
+                        context.extension_manager = Some(Arc::downgrade(self));
+                        if let Some(id) = session_id {
+                            if let Ok(session) =
+                                self.context.session_manager.get_session(id, false).await
+                            {
+                                context.session = Some(Arc::new(session));
+                            }
+                        }
+                        ((def.client_factory)(context), None)
+                    } else {
+                        // Builtin MCP server extension
+                        let timeout_secs = resolve_timeout(timeout);
+                        let extension_fn = get_builtin_extension(normalized_name.as_str())
+                            .ok_or_else(|| {
+                                ExtensionError::ConfigError(format!("Unknown extension: {}", name))
+                            })?;
+
+                        if let Some(container) = container {
+                            let container_id = container.id();
+                            tracing::info!(
+                                container = %container_id,
+                                builtin = %name,
+                                "Starting builtin extension inside Docker container"
+                            );
+                            let command = Command::new("docker").configure(|command| {
+                                command
+                                    .arg("exec")
+                                    .arg("-i")
+                                    .arg(container_id)
+                                    .arg("goose")
+                                    .arg("mcp")
+                                    .arg(&normalized_name);
+                            });
+
+                            let client = child_process_client(
+                                command,
+                                &Some(timeout_secs),
+                                self.provider.clone(),
+                                &effective_working_dir,
+                                Some(container_id.to_string()),
+                                self.client_name.clone(),
+                                self.mcp_client_capabilities(),
+                            )
+                            .await?;
+                            (Box::new(client) as Box<dyn McpClientTrait>, None)
+                        } else {
+                            let (server_read, client_write) = tokio::io::duplex(65536);
+                            let (client_read, server_write) = tokio::io::duplex(65536);
+                            extension_fn(server_read, server_write);
+
+                            let client = McpClient::connect(
+                                (client_read, client_write),
+                                Duration::from_secs(timeout_secs),
+                                self.provider.clone(),
+                                self.client_name.clone(),
+                                self.mcp_client_capabilities(),
+                                effective_working_dir.clone(),
+                            )
+                            .await?;
+                            (Box::new(client) as Box<dyn McpClientTrait>, None)
                         }
                     }
-                    ((def.client_factory)(context), None)
-                } else {
-                    // Builtin MCP server extension
-                    let timeout_secs = resolve_timeout(timeout);
-                    let extension_fn =
-                        get_builtin_extension(normalized_name.as_str()).ok_or_else(|| {
-                            ExtensionError::ConfigError(format!("Unknown extension: {}", name))
-                        })?;
+                }
+                ExtensionConfig::Stdio {
+                    cmd,
+                    args,
+                    envs,
+                    env_keys,
+                    timeout,
+                    ..
+                } => {
+                    let config = Config::global();
+                    let mut all_envs =
+                        merge_environments(envs, env_keys, &sanitized_name, config).await?;
 
-                    if let Some(container) = container {
+                    if let Some(sid) = session_id {
+                        all_envs.insert("AGENT_SESSION_ID".to_string(), sid.to_string());
+                    }
+
+                    // Check for malicious packages before launching the process
+                    extension_malware_check::deny_if_malicious_cmd_args(cmd, args).await?;
+
+                    let command = if let Some(container) = container {
                         let container_id = container.id();
                         tracing::info!(
                             container = %container_id,
-                            builtin = %name,
-                            "Starting builtin extension inside Docker container"
+                            cmd = %cmd,
+                            "Starting stdio extension inside Docker container"
                         );
-                        let command = Command::new("docker").configure(|command| {
-                            command
-                                .arg("exec")
-                                .arg("-i")
-                                .arg(container_id)
-                                .arg("goose")
-                                .arg("mcp")
-                                .arg(&normalized_name);
-                        });
-
-                        let client = child_process_client(
-                            command,
-                            &Some(timeout_secs),
-                            self.provider.clone(),
-                            &effective_working_dir,
-                            Some(container_id.to_string()),
-                            self.client_name.clone(),
-                            self.mcp_client_capabilities(),
-                        )
-                        .await?;
-                        (Box::new(client) as Box<dyn McpClientTrait>, None)
+                        Command::new("docker").configure(|command| {
+                            command.arg("exec").arg("-i");
+                            for (key, value) in &all_envs {
+                                command.arg("-e").arg(format!("{}={}", key, value));
+                            }
+                            command.arg(container_id);
+                            command.arg(cmd);
+                            command.args(args);
+                        })
                     } else {
-                        let (server_read, client_write) = tokio::io::duplex(65536);
-                        let (client_read, server_write) = tokio::io::duplex(65536);
-                        extension_fn(server_read, server_write);
+                        let cmd = resolve_command(cmd);
+                        Command::new(cmd).configure(|command| {
+                            command.args(args).envs(all_envs);
+                        })
+                    };
 
-                        let client = McpClient::connect(
-                            (client_read, client_write),
-                            Duration::from_secs(timeout_secs),
-                            self.provider.clone(),
-                            self.client_name.clone(),
-                            self.mcp_client_capabilities(),
-                            effective_working_dir.clone(),
-                        )
-                        .await?;
-                        (Box::new(client) as Box<dyn McpClientTrait>, None)
-                    }
+                    let client = child_process_client(
+                        command,
+                        timeout,
+                        self.provider.clone(),
+                        &effective_working_dir,
+                        container.map(|c| c.id().to_string()),
+                        self.client_name.clone(),
+                        self.mcp_client_capabilities(),
+                    )
+                    .await?;
+                    (Box::new(client) as Box<dyn McpClientTrait>, None)
                 }
-            }
-            ExtensionConfig::Stdio {
-                cmd,
-                args,
-                envs,
-                env_keys,
-                timeout,
-                ..
-            } => {
-                let config = Config::global();
-                let mut all_envs =
-                    merge_environments(envs, env_keys, &sanitized_name, config).await?;
-
-                if let Some(sid) = session_id {
-                    all_envs.insert("AGENT_SESSION_ID".to_string(), sid.to_string());
-                }
-
-                // Check for malicious packages before launching the process
-                extension_malware_check::deny_if_malicious_cmd_args(cmd, args).await?;
-
-                let command = if let Some(container) = container {
-                    let container_id = container.id();
-                    tracing::info!(
-                        container = %container_id,
-                        cmd = %cmd,
-                        "Starting stdio extension inside Docker container"
-                    );
-                    Command::new("docker").configure(|command| {
-                        command.arg("exec").arg("-i");
-                        for (key, value) in &all_envs {
-                            command.arg("-e").arg(format!("{}={}", key, value));
-                        }
-                        command.arg(container_id);
-                        command.arg(cmd);
-                        command.args(args);
-                    })
-                } else {
-                    let cmd = resolve_command(cmd);
-                    Command::new(cmd).configure(|command| {
-                        command.args(args).envs(all_envs);
-                    })
-                };
-
-                let client = child_process_client(
-                    command,
+                ExtensionConfig::InlinePython {
+                    name,
+                    code,
                     timeout,
-                    self.provider.clone(),
-                    &effective_working_dir,
-                    container.map(|c| c.id().to_string()),
-                    self.client_name.clone(),
-                    self.mcp_client_capabilities(),
-                )
-                .await?;
-                (Box::new(client) as Box<dyn McpClientTrait>, None)
-            }
-            ExtensionConfig::InlinePython {
-                name,
-                code,
-                timeout,
-                dependencies,
-                ..
-            } => {
-                let dir = tempdir()?;
-                let file_path = dir.path().join(format!("{}.py", name));
-                temp_dir = Some(dir);
-                std::fs::write(&file_path, code)?;
+                    dependencies,
+                    ..
+                } => {
+                    let dir = tempdir()?;
+                    let file_path = dir.path().join(format!("{}.py", name));
+                    temp_dir = Some(dir);
+                    std::fs::write(&file_path, code)?;
 
-                let command = Command::new("uvx").configure(|command| {
-                    command.arg("--with").arg("mcp");
-                    dependencies.iter().flatten().for_each(|dep| {
-                        command.arg("--with").arg(dep);
+                    let command = Command::new("uvx").configure(|command| {
+                        command.arg("--with").arg("mcp");
+                        dependencies.iter().flatten().for_each(|dep| {
+                            command.arg("--with").arg(dep);
+                        });
+                        command.arg("python").arg(file_path.to_str().unwrap());
                     });
-                    command.arg("python").arg(file_path.to_str().unwrap());
-                });
 
-                let client = child_process_client(
-                    command,
-                    timeout,
-                    self.provider.clone(),
-                    &effective_working_dir,
-                    container.map(|c| c.id().to_string()),
-                    self.client_name.clone(),
-                    self.mcp_client_capabilities(),
-                )
-                .await?;
+                    let client = child_process_client(
+                        command,
+                        timeout,
+                        self.provider.clone(),
+                        &effective_working_dir,
+                        container.map(|c| c.id().to_string()),
+                        self.client_name.clone(),
+                        self.mcp_client_capabilities(),
+                    )
+                    .await?;
 
-                (Box::new(client) as Box<dyn McpClientTrait>, None)
-            }
-            ExtensionConfig::Frontend { .. } => {
-                return Err(ExtensionError::ConfigError(
+                    (Box::new(client) as Box<dyn McpClientTrait>, None)
+                }
+                ExtensionConfig::Frontend { .. } => {
+                    return Err(ExtensionError::ConfigError(
                     "Invalid extension type: Frontend extensions cannot be added as server extensions".to_string()
                 ));
-            }
-        };
+                }
+            };
 
         let server_info = client.get_info().cloned();
 
@@ -1228,10 +1253,10 @@ impl ExtensionManager {
         temp_dir: Option<TempDir>,
     ) {
         let normalized = name_to_key(&name);
-        self.extensions
-            .write()
-            .await
-            .insert(normalized, Extension::new(config.clone(), config.clone(), client, None, info, temp_dir));
+        self.extensions.write().await.insert(
+            normalized,
+            Extension::new(config.clone(), config.clone(), client, None, info, temp_dir),
+        );
         self.invalidate_tools_cache_and_bump_version().await;
     }
 
@@ -1740,9 +1765,12 @@ impl ExtensionManager {
             let owner = name_to_key(prefix);
             if let Some(client) = self.get_server_client(&owner, Some(session_id)).await {
                 return Ok(ResolvedTool {
+                    tool_name: tool_name.to_string(),
                     extension_name: owner,
                     actual_tool_name: actual.to_string(),
                     client,
+                    tool_meta: None,
+                    resource_uri: None,
                 });
             }
         }
@@ -1775,13 +1803,16 @@ impl ExtensionManager {
                 .unwrap_or(tool_name)
                 .to_string();
 
-            let client = self.get_server_client(&owner, Some(session_id)).await.ok_or_else(|| {
-                ErrorData::new(
-                    ErrorCode::RESOURCE_NOT_FOUND,
-                    format!("Extension '{}' not found for tool '{}'", owner, tool_name),
-                    None,
-                )
-            })?;
+            let client = self
+                .get_server_client(&owner, Some(session_id))
+                .await
+                .ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::RESOURCE_NOT_FOUND,
+                        format!("Extension '{}' not found for tool '{}'", owner, tool_name),
+                        None,
+                    )
+                })?;
 
             return Ok(ResolvedTool {
                 tool_name: tool.name.to_string(),
@@ -1795,7 +1826,7 @@ impl ExtensionManager {
 
         if let Some((prefix, actual)) = tool_name.split_once("__") {
             let owner = name_to_key(prefix);
-            if let Some(client) = self.get_server_client(&owner).await {
+            if let Some(client) = self.get_server_client(&owner, Some(session_id)).await {
                 return Ok(ResolvedTool {
                     tool_name: tool_name.to_string(),
                     extension_name: owner,
@@ -1853,9 +1884,9 @@ impl ExtensionManager {
 
                 // Get allowed headers based on extension type
                 match &extension.config {
-                    ExtensionConfig::StreamableHttp { allowed_headers, .. } => {
-                        Some(allowed_headers.clone())
-                    }
+                    ExtensionConfig::StreamableHttp {
+                        allowed_headers, ..
+                    } => Some(allowed_headers.clone()),
                     _ => None,
                 }
             } else {
@@ -1879,7 +1910,10 @@ impl ExtensionManager {
         );
 
         // Capture session_id before entering async closure to preserve context
-        tracing::debug!("[EXTENSION_MANAGER] Using session_id for tool call: {}", ctx.session_id);
+        tracing::debug!(
+            "[EXTENSION_MANAGER] Using session_id for tool call: {}",
+            ctx.session_id
+        );
 
         let fut = async move {
             tracing::debug!(
@@ -1889,7 +1923,13 @@ impl ExtensionManager {
                 owned_ctx.working_dir,
             );
             let mut result = client
-                .call_tool(&owned_ctx, &actual_tool_name, arguments, cancellation_token, allowed_headers)
+                .call_tool(
+                    &owned_ctx,
+                    &actual_tool_name,
+                    arguments,
+                    cancellation_token,
+                    allowed_headers,
+                )
                 .await
                 .map_err(|e| match e {
                     ServiceError::McpError(error_data) => error_data,
@@ -2086,7 +2126,11 @@ impl ExtensionManager {
         Ok(vec![Content::text(output_parts.join("\n"))])
     }
 
-    async fn get_server_client(&self, name: impl Into<String>, session_id: Option<&str>) -> Option<McpClientBox> {
+    async fn get_server_client(
+        &self,
+        name: impl Into<String>,
+        session_id: Option<&str>,
+    ) -> Option<McpClientBox> {
         let normalized = name_to_key(&name.into());
         let (fallback_client, config, resolved_headers, session_clients) = {
             let extensions = self.extensions.read().await;
@@ -2107,7 +2151,15 @@ impl ExtensionManager {
         // websocket headers from the session on every HTTP request, making this
         // multi-tenant safe (different users get their own headers per-request).
         if let Some(sid) = session_id {
-            if let ExtensionConfig::StreamableHttp { uri, timeout, name, allowed_headers, .. } = &config {
+            if let ExtensionConfig::StreamableHttp {
+                uri,
+                timeout,
+                name,
+                allowed_headers,
+                socket,
+                ..
+            } = &config
+            {
                 {
                     let lock = session_clients.lock().await;
                     if let Some(c) = lock.get(sid) {
@@ -2119,6 +2171,7 @@ impl ExtensionManager {
 
                 let capability = GooseMcpClientCapabilities {
                     mcpui: self.capabilities.mcpui,
+                    host_info: self.capabilities.host_info.clone(),
                 };
 
                 let roots_dir = std::env::var("GOOSE_WORKING_DIR")
@@ -2130,13 +2183,17 @@ impl ExtensionManager {
                     *timeout,
                     &headers,
                     name,
+                    socket.as_deref(),
+                    Box::new(GooseCredentialStore::new(name.to_string())),
                     self.provider.clone(),
                     self.client_name.clone(),
                     capability,
                     &roots_dir,
                     allowed_headers,
                     Some(sid),
-                ).await {
+                )
+                .await
+                {
                     Ok(new_client) => {
                         let arc_client: McpClientBox = Arc::from(new_client);
                         let mut lock = session_clients.lock().await;
@@ -2144,7 +2201,11 @@ impl ExtensionManager {
                         return Some(arc_client);
                     }
                     Err(e) => {
-                        tracing::error!("Failed to create per-session StreamableHttp client for {}: {}", name, e);
+                        tracing::error!(
+                            "Failed to create per-session StreamableHttp client for {}: {}",
+                            name,
+                            e
+                        );
                     }
                 }
             }
@@ -2269,7 +2330,8 @@ mod tests {
                 bundled: None,
                 available_tools,
             };
-            let extension = Extension::new(config.clone(), config.clone(), client, None, None, None);
+            let extension =
+                Extension::new(config.clone(), config.clone(), client, None, None, None);
             self.extensions
                 .write()
                 .await
@@ -3003,6 +3065,8 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            &[],
+            None,
         )
         .await;
 
@@ -3038,6 +3102,8 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            &[],
+            None,
         )
         .await;
 
@@ -3084,6 +3150,8 @@ mod tests {
             "goose-test".to_string(),
             capabilities,
             temp_dir.path(),
+            &[],
+            None,
         )
         .await;
 

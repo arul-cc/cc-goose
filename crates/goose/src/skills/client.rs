@@ -84,6 +84,7 @@ impl McpClientTrait for SkillsClient {
         name: &str,
         arguments: Option<JsonObject>,
         _cancellation_token: CancellationToken,
+        _allowed_headers: Option<Vec<String>>,
     ) -> Result<CallToolResult, Error> {
         if name != "load_skill" {
             return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -284,7 +285,13 @@ mod tests {
         let args: JsonObject =
             serde_json::from_value(serde_json::json!({"name": "my-skill"})).unwrap();
         let result = client
-            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(args),
+                CancellationToken::new(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -311,7 +318,13 @@ mod tests {
         let args: JsonObject =
             serde_json::from_value(serde_json::json!({"name": "nonexistent"})).unwrap();
         let result = client
-            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(args),
+                CancellationToken::new(),
+                None,
+            )
             .await
             .unwrap();
 

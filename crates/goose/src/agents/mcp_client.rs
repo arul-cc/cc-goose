@@ -591,7 +591,8 @@ impl McpClientTrait for McpClient {
                     let mut req = RequestOptionalParam::with_param(
                         PaginatedRequestParams::default().with_cursor(cursor),
                     );
-                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ListResourcesRequest(req)
                 },
                 cancel_token,
@@ -616,7 +617,8 @@ impl McpClientTrait for McpClient {
                 None,
                 {
                     let mut req = Request::new(ReadResourceRequestParams::new(uri.to_string()));
-                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ReadResourceRequest(req)
                 },
                 cancel_token,
@@ -643,7 +645,8 @@ impl McpClientTrait for McpClient {
                     let mut req = RequestOptionalParam::with_param(
                         PaginatedRequestParams::default().with_cursor(cursor),
                     );
-                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ListToolsRequest(req)
                 },
                 cancel_token,
@@ -673,7 +676,8 @@ impl McpClientTrait for McpClient {
             Default::default(),
             &ctx.session_id,
             allowed_headers,
-        ).await;
+        )
+        .await;
         let mut req = Request::new(params);
         req.extensions = extensions;
         let request = ClientRequest::CallToolRequest(req);
@@ -707,7 +711,8 @@ impl McpClientTrait for McpClient {
                     let mut req = RequestOptionalParam::with_param(
                         PaginatedRequestParams::default().with_cursor(cursor),
                     );
-                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::ListPromptsRequest(req)
                 },
                 cancel_token,
@@ -741,7 +746,8 @@ impl McpClientTrait for McpClient {
                 None,
                 {
                     let mut req = Request::new(params);
-                    req.extensions = inject_session_context_into_extensions(Default::default(), None, None);
+                    req.extensions =
+                        inject_session_context_into_extensions(Default::default(), None, None);
                     ClientRequest::GetPromptRequest(req)
                 },
                 cancel_token,
@@ -825,23 +831,36 @@ async fn inject_session_headers_into_extensions(
     let allowed_lower: Vec<String> = match &allowed_headers {
         Some(list) if !list.is_empty() => list.iter().map(|h| h.to_lowercase()).collect(),
         _ => {
-            eprintln!("[MCP_CLIENT DEBUG] No allowed_headers configured — skipping all websocket headers");
-            tracing::debug!("[MCP_CLIENT] No allowed_headers configured — skipping all websocket headers");
+            eprintln!(
+                "[MCP_CLIENT DEBUG] No allowed_headers configured — skipping all websocket headers"
+            );
+            tracing::debug!(
+                "[MCP_CLIENT] No allowed_headers configured — skipping all websocket headers"
+            );
             extensions.insert(Meta(meta_map));
             return extensions;
         }
     };
 
     // Inject dynamic headers from session if available
-    if let Ok(session) = crate::session::SessionManager::instance().get_session(session_id, false).await {
-        if let Some(headers_value) = session.extension_data.get_extension_state("websocket_headers", "v0") {
+    if let Ok(session) = crate::session::SessionManager::instance()
+        .get_session(session_id, false)
+        .await
+    {
+        if let Some(headers_value) = session
+            .extension_data
+            .get_extension_state("websocket_headers", "v0")
+        {
             if let Some(headers_obj) = headers_value.as_object() {
                 let mut headers_map = serde_json::Map::new();
                 for (key, value) in headers_obj {
                     // Case-insensitive comparison: stored keys are lowercase (from Go),
                     // config values may be mixed-case (e.g., "X-Origin-Host").
                     if !allowed_lower.contains(&key.to_lowercase()) {
-                        tracing::debug!("[MCP_CLIENT] Skipping header '{}' — not in allowed_headers", key);
+                        tracing::debug!(
+                            "[MCP_CLIENT] Skipping header '{}' — not in allowed_headers",
+                            key
+                        );
                         continue;
                     }
                     headers_map.insert(key.clone(), value.clone());
@@ -852,10 +871,15 @@ async fn inject_session_headers_into_extensions(
                     headers_obj.len()
                 );
                 if !headers_map.is_empty() {
-                    eprintln!("[MCP_CLIENT DEBUG] Injecting websocket_headers into _meta: {:?}", headers_map.keys().collect::<Vec<_>>());
+                    eprintln!(
+                        "[MCP_CLIENT DEBUG] Injecting websocket_headers into _meta: {:?}",
+                        headers_map.keys().collect::<Vec<_>>()
+                    );
                     meta_map.insert("websocket_headers".to_string(), Value::Object(headers_map));
                 } else {
-                    eprintln!("[MCP_CLIENT DEBUG] No matching websocket headers found after filtering");
+                    eprintln!(
+                        "[MCP_CLIENT DEBUG] No matching websocket headers found after filtering"
+                    );
                 }
             }
         }

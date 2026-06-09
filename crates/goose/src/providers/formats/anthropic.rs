@@ -339,12 +339,15 @@ pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
         if !disable_cache {
             let mut cache_control = json!({ TYPE_FIELD: "ephemeral" });
             if let Ok(ttl) = std::env::var("ANTHROPIC_CACHE_TTL") {
-                cache_control.as_object_mut().unwrap().insert("ttl".to_string(), json!(ttl));
+                cache_control
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("ttl".to_string(), json!(ttl));
             }
-            last_tool.as_object_mut().unwrap().insert(
-                CACHE_CONTROL_FIELD.to_string(),
-                cache_control,
-            );
+            last_tool
+                .as_object_mut()
+                .unwrap()
+                .insert(CACHE_CONTROL_FIELD.to_string(), cache_control);
         }
     }
 
@@ -362,14 +365,17 @@ pub fn format_system(system: &str) -> Value {
     if !disable_cache {
         let mut cache_control = json!({ TYPE_FIELD: "ephemeral" });
         if let Ok(ttl) = std::env::var("ANTHROPIC_CACHE_TTL") {
-            cache_control.as_object_mut().unwrap().insert("ttl".to_string(), json!(ttl));
-        }
-        system_obj.as_object_mut().unwrap().insert(
-            CACHE_CONTROL_FIELD.to_string(),
             cache_control
-        );
+                .as_object_mut()
+                .unwrap()
+                .insert("ttl".to_string(), json!(ttl));
+        }
+        system_obj
+            .as_object_mut()
+            .unwrap()
+            .insert(CACHE_CONTROL_FIELD.to_string(), cache_control);
     }
-    
+
     json!([system_obj])
 }
 
@@ -647,7 +653,11 @@ pub fn create_request_with_options(
     let tool_specs = format_tools(tools);
     {
         let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
-        eprintln!("[ANTHROPIC_TOOLS] Sending {} tools to LLM: {:?}", tools.len(), names);
+        eprintln!(
+            "[ANTHROPIC_TOOLS] Sending {} tools to LLM: {:?}",
+            tools.len(),
+            names
+        );
     }
     let system_spec = format_system(system);
 
@@ -1220,7 +1230,7 @@ mod tests {
         config.max_tokens = Some(4096);
         config.request_params = Some(params);
         let messages = vec![Message::user().with_text("Hello")];
-        let payload = create_request(&config, "system", &messages, &[], None)?;
+        let payload = create_request(&config, "system", &messages, &[])?;
 
         assert_eq!(payload["thinking"]["type"], "adaptive");
         assert_eq!(payload["output_config"]["effort"], "high");
@@ -1240,7 +1250,7 @@ mod tests {
         config.max_tokens = Some(4096);
 
         let messages = vec![Message::user().with_text("Hello")];
-        let payload = create_request(&config, "system", &messages, &[], None)?;
+        let payload = create_request(&config, "system", &messages, &[])?;
 
         assert_eq!(payload["thinking"]["type"], "enabled");
         let budget = payload["thinking"]["budget_tokens"].as_i64().unwrap();
@@ -1259,7 +1269,7 @@ mod tests {
 
         let config = cfg_with_effort("claude-sonnet-4-20250514", "off");
         let messages = vec![Message::user().with_text("Hello")];
-        let payload = create_request(&config, "system", &messages, &[], None)?;
+        let payload = create_request(&config, "system", &messages, &[])?;
 
         assert!(payload.get("thinking").is_none());
         assert!(payload.get("output_config").is_none());

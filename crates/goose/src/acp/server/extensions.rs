@@ -294,6 +294,7 @@ fn goose_extension_to_config(
                     .into_iter()
                     .map(|header| (header.name, header.value))
                     .collect(),
+                allowed_headers: vec![],
                 timeout,
                 socket,
                 bundled,
@@ -472,6 +473,7 @@ mod tests {
                 "Authorization".to_string(),
                 "Bearer ${API_TOKEN}".to_string(),
             )]),
+            allowed_headers: vec![],
             timeout: Some(99),
             socket: Some("@egress.sock".to_string()),
             bundled: None,
@@ -681,6 +683,7 @@ mod tests {
             envs,
             env_keys,
             headers,
+            allowed_headers: _,
             timeout,
             socket,
             bundled,
