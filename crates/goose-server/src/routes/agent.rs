@@ -24,7 +24,7 @@ use goose::providers::{create, create_with_api_key};
 use goose::recipe::Recipe;
 use goose::recipe_deeplink;
 use goose::session::session_manager::SessionType;
-use goose::session::{EnabledExtensionsState, ExtensionState, Session};
+use goose::session::{EnabledExtensionsState, ExtensionData, ExtensionState, Session};
 use goose::{
     agents::{extension::ToolInfo, extension_manager::get_parameter_names},
     config::permission::PermissionLevel,
@@ -79,6 +79,12 @@ pub struct StartAgentRequest {
     recipe_deeplink: Option<String>,
     #[serde(default)]
     extension_overrides: Option<Vec<ExtensionConfig>>,
+    /// Initial session extension state (e.g. `websocket_headers.v0`,
+    /// `cow_tenant.v0`) supplied by CowGooseService. Stored before background
+    /// extension loading so the first MCP handshake carries forwarded headers,
+    /// avoiding a race with a follow-up PUT /sessions/{id}/extension_data.
+    #[serde(default)]
+    extension_data: Option<ExtensionData>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -211,6 +217,7 @@ async fn start_agent(
         recipe_id,
         recipe_deeplink,
         extension_overrides,
+        extension_data: initial_extension_data,
     } = payload;
 
     let original_recipe = if let Some(deeplink) = recipe_deeplink {
@@ -275,23 +282,34 @@ async fn start_agent(
         resolve_extensions_for_new_session(recipe_extensions, extension_overrides);
 
     let mut extension_data = session.extension_data.clone();
+
+    // Merge caller-supplied extension data (e.g. websocket_headers.v0 /
+    // cow_tenant.v0 from CowGooseService) so it is persisted up front — before
+    // background extension loading — letting the initial MCP handshake carry
+    // forwarded headers without racing a follow-up PUT.
+    if let Some(initial) = initial_extension_data {
+        for (key, value) in initial.extension_states {
+            extension_data.extension_states.insert(key, value);
+        }
+    }
+
     let extensions_state = EnabledExtensionsState::new(extensions_to_use);
     if let Err(e) = extensions_state.to_extension_data(&mut extension_data) {
         tracing::warn!("Failed to initialize session with extensions: {}", e);
-    } else {
-        manager
-            .update(&session.id)
-            .extension_data(extension_data.clone())
-            .apply()
-            .await
-            .map_err(|err| {
-                error!("Failed to save initial extension state: {}", err);
-                ErrorResponse {
-                    message: format!("Failed to save initial extension state: {}", err),
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                }
-            })?;
     }
+
+    manager
+        .update(&session.id)
+        .extension_data(extension_data.clone())
+        .apply()
+        .await
+        .map_err(|err| {
+            error!("Failed to save initial extension state: {}", err);
+            ErrorResponse {
+                message: format!("Failed to save initial extension state: {}", err),
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })?;
 
     if let Some(recipe) = original_recipe {
         let mut update = manager.update(&session.id).recipe(Some(recipe.clone()));
