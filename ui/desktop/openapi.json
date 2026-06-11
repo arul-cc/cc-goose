@@ -4862,6 +4862,12 @@
             "type": "string",
             "nullable": true
           },
+          "default_request_params": {
+            "type": "object",
+            "description": "Default request parameters merged into the model config for every request.\nThese are injected into the API request payload (e.g. `{\"thinking\": {\"type\": \"disabled\"}}`\nfor DeepSeek v4 models). Values here can be overridden by per-session `request_params`.",
+            "additionalProperties": {},
+            "nullable": true
+          },
           "description": {
             "type": "string",
             "nullable": true
@@ -5366,6 +5372,13 @@
               "type"
             ],
             "properties": {
+              "allowed_headers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of allowed header names that can be passed from websocket"
+              },
               "available_tools": {
                 "type": "array",
                 "items": {
@@ -8629,6 +8642,14 @@
           "working_dir"
         ],
         "properties": {
+          "extension_data": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ExtensionData"
+              }
+            ],
+            "nullable": true
+          },
           "extension_overrides": {
             "type": "array",
             "items": {
@@ -9323,10 +9344,19 @@
           "session_id"
         ],
         "properties": {
+          "api_key": {
+            "type": "string",
+            "nullable": true
+          },
           "context_limit": {
             "type": "integer",
             "nullable": true,
             "minimum": 0
+          },
+          "host": {
+            "type": "string",
+            "description": "Base URL for the provider API (e.g. \"https://api.deepseek.com\" for DeepSeek).\nWhen omitted, falls back to the provider's default host from global config.",
+            "nullable": true
           },
           "model": {
             "type": "string",
