@@ -473,6 +473,7 @@ mod tests {
             scopes: vec![],
             bundled: Some(false),
             available_tools: vec![],
+            allowed_headers: vec![],
         };
         let mut extension_data = session.extension_data.clone();
         EnabledExtensionsState::new(vec![extension])

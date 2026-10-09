@@ -3057,6 +3057,7 @@ mod tests {
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "name_from_host"
     )]
@@ -3076,6 +3077,7 @@ mod tests {
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "port_and_path"
     )]
@@ -3095,6 +3097,7 @@ mod tests {
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }
         ; "different_port_and_path"
     )]
