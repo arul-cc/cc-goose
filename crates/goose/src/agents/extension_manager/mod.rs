@@ -783,6 +783,7 @@ impl ExtensionManager {
                     client_id,
                     client_secret_key,
                     scopes,
+                    allowed_headers,
                     ..
                 },
             ) => {
@@ -797,6 +798,8 @@ impl ExtensionManager {
                     name: name.clone(),
                     headers: headers.clone(),
                     static_oauth_client,
+                    allowed_headers: allowed_headers.clone(),
+                    session_id: Some(session_id.to_string()),
                     ctx: ctx(*timeout, client_working_dir),
                 };
                 streamable_http::connect(

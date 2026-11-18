@@ -102,3 +102,16 @@ sessions/
 # Generated files
 ui/desktop/openapi.json
 ui/desktop/src/api/
+
+# Python virtualenvs and build output — a local .venv in mcp-servers/ would
+# otherwise be copied into the build context and baked into the image.
+**/.venv/
+**/dist/
+**/__pycache__/
+**/.pytest_cache/
+
+# Not needed by Dockerfile.server, which builds only the goose binary. These are
+# ~320MB of the build context, most of it documentation videos, and every byte is
+# uploaded to the daemon on every build.
+documentation/
+ui/

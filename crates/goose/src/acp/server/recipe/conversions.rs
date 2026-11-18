@@ -360,6 +360,7 @@ fn extension_from_dto(dto: RecipeExtensionDto) -> Result<ExtensionConfig> {
             scopes,
             bundled,
             available_tools: available_tools.unwrap_or_default(),
+            allowed_headers: Vec::new(),
         }),
     })
 }
@@ -431,6 +432,7 @@ fn extension_to_dto(extension: ExtensionConfig) -> Result<RecipeExtensionDto> {
             scopes,
             bundled,
             available_tools,
+            allowed_headers: _,
         }) => RecipeExtensionDto::StreamableHttp {
             name,
             description: Some(description),

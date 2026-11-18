@@ -34,6 +34,11 @@ pub static EXTENSION_NAME: &str = "summon";
 
 const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
+/// Session extension state a subagent inherits from its parent: the tenant
+/// context and the forwarded headers, so the subagent's MCP calls carry the
+/// same identity as the parent's.
+const INHERITED_SUBAGENT_EXTENSION_STATES: &[&str] = &["cow_tenant.v0", "websocket_headers.v0"];
+
 fn kind_plural(kind: SourceType) -> &'static str {
     match kind {
         SourceType::Subrecipe => "Subrecipes",
@@ -527,8 +532,7 @@ impl SummonClient {
             }
         });
 
-        Tool::new(
-            "delegate",
+        let description = String::from(
             "Delegate a task to a subagent that runs independently with its own context.\n\n\
              Modes:\n\
              1. Ad-hoc: Provide `instructions` for a custom task\n\
@@ -540,10 +544,10 @@ impl SummonClient {
              - Delegates cannot coordinate. Same-file work = conflicts.\n\
              - You get a delegate's result back once it finishes.\n\n\
              Research (read-only): delegates explore and report back.\n\
-             Work (writes): partition files strictly - no two delegates touch the same file."
-                .to_string(),
-            schema.as_object().unwrap().clone(),
-        )
+             Work (writes): partition files strictly - no two delegates touch the same file.",
+        );
+
+        Tool::new("delegate", description, schema.as_object().unwrap().clone())
     }
 
     fn working_dir(&self, ctx: &ToolCallContext) -> PathBuf {
@@ -978,6 +982,16 @@ impl SummonClient {
             .to_extension_data(&mut extension_data)
             .map_err(|e| format!("Failed to save delegate extensions: {e}"))?;
 
+        // The subagent's own MCP calls must carry the same tenant identity as the
+        // parent's; without these it would call cow-mcp with no tenant headers.
+        for key in INHERITED_SUBAGENT_EXTENSION_STATES {
+            if let Some(state) = parent.extension_data.extension_states.get(*key) {
+                extension_data
+                    .extension_states
+                    .insert((*key).to_string(), state.clone());
+            }
+        }
+
         let child = self
             .create_subagent_session(
                 &subagent_config.working_dir,
@@ -985,6 +999,9 @@ impl SummonClient {
                 "Delegated task".to_string(),
             )
             .await?;
+        // The credentials themselves live only in process memory (§14), so the
+        // child needs its own copy; extension_data never carries them.
+        crate::session::session_secrets::copy(&parent.id, &child.id);
         let task = recipe
             .prompt
             .clone()
@@ -2992,5 +3009,137 @@ You review code."#;
         assert!(error
             .to_string()
             .contains("No model configured for provider 'lmstudio'"));
+    }
+
+    // ---- ComplianceCow fork: §12 subagent tenancy and resume, ported onto
+    // upstream's foreground-subagent flow. ----
+
+    /// Removes sessions' in-memory credentials when the test ends, even if an
+    /// assertion fails. Session ids are sequential per database, so a leaked
+    /// entry would be inherited by an unrelated test's session with the same id.
+    struct SecretsGuard(Vec<String>);
+
+    impl Drop for SecretsGuard {
+        fn drop(&mut self) {
+            for id in &self.0 {
+                crate::session::session_secrets::remove(id);
+            }
+        }
+    }
+
+    async fn tenant_parent(manager: &Arc<crate::session::SessionManager>, dir: &Path) -> Session {
+        let parent = manager
+            .create_session(
+                dir.to_path_buf(),
+                "Parent".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let mut data = ExtensionData::default();
+        data.extension_states.insert(
+            "cow_tenant.v0".to_string(),
+            serde_json::json!({"domain": "tenant-a"}),
+        );
+        data.extension_states.insert(
+            "websocket_headers.v0".to_string(),
+            serde_json::json!({"x-domain-name": "tenant-a"}),
+        );
+        data.extension_states
+            .insert("unrelated.v0".to_string(), serde_json::json!({"x": 1}));
+        manager
+            .update(&parent.id)
+            .provider_name("openai")
+            .model_config(goose_providers::model::ModelConfig::new("test-model"))
+            .extension_data(data)
+            .apply()
+            .await
+            .unwrap();
+        manager.get_session(&parent.id, false).await.unwrap()
+    }
+
+    /// Runs `delegate` as the model would and returns the child's session id.
+    async fn delegate(
+        client: &SummonClient,
+        parent: &Session,
+        dir: &Path,
+        extra: serde_json::Value,
+    ) -> Result<String, String> {
+        let mut args = serde_json::json!({
+            "provider": "openai",
+            "model": "test-model",
+            "extensions": [],
+            "max_turns": 3
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        args.extend(extra.as_object().unwrap().clone());
+
+        let _env =
+            env_lock::lock_env([("OPENAI_HOST", None), ("OPENAI_BASE_URL", Some("http://"))]);
+        let result = client.handle_delegate(&parent.id, dir, Some(args)).await?;
+        Ok(result.meta.as_ref().unwrap().0["subagent_session_id"]
+            .as_str()
+            .unwrap()
+            .to_string())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_session_inherits_only_parent_tenant_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = Arc::new(crate::session::SessionManager::new(
+            temp_dir.path().to_path_buf(),
+        ));
+        let parent = tenant_parent(&manager, temp_dir.path()).await;
+        let mut guard = SecretsGuard(vec![parent.id.clone()]);
+        let mut secrets = serde_json::Map::new();
+        secrets.insert("x-api-key".to_string(), serde_json::json!("tenant-key-1"));
+        crate::session::session_secrets::store(&parent.id, secrets);
+
+        let client =
+            SummonClient::new(create_test_context_with_session_manager(manager.clone())).unwrap();
+        let child_id = delegate(
+            &client,
+            &parent,
+            temp_dir.path(),
+            serde_json::json!({"instructions": "Review the change"}),
+        )
+        .await
+        .unwrap();
+        guard.0.push(child_id.clone());
+
+        let child = manager.get_session(&child_id, false).await.unwrap();
+        let states = &child.extension_data.extension_states;
+        for key in INHERITED_SUBAGENT_EXTENSION_STATES {
+            assert_eq!(
+                states.get(*key),
+                parent.extension_data.extension_states.get(*key),
+                "{key} must reach the subagent unchanged"
+            );
+        }
+        assert!(
+            !states.contains_key("unrelated.v0"),
+            "only tenant state is inherited, not the parent's whole extension data"
+        );
+        assert!(
+            EnabledExtensionsState::from_extension_data(&child.extension_data).is_some(),
+            "the subagent still gets its own extension selection"
+        );
+
+        // The credential moves to the child in memory only.
+        let held = crate::session::session_secrets::get(&child_id)
+            .expect("the subagent must hold the parent's credentials");
+        assert_eq!(
+            held.get("x-api-key").and_then(|v| v.as_str()),
+            Some("tenant-key-1")
+        );
+        let persisted = serde_json::to_string(&child.extension_data).unwrap();
+        assert!(
+            !persisted.contains("tenant-key-1"),
+            "a credential was written to the subagent's extension_data"
+        );
     }
 }

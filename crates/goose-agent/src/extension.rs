@@ -236,6 +236,12 @@ pub enum ExtensionConfig {
         #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         available_tools: Vec<String>,
+        /// Session `websocket_headers.v0` entries with these names (case-insensitive)
+        /// are forwarded as HTTP headers on every request to this MCP server.
+        /// Empty means no dynamic header forwarding.
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        allowed_headers: Vec<String>,
     },
 }
 
@@ -260,6 +266,7 @@ impl ExtensionConfig {
             scopes: Vec::new(),
             bundled: None,
             available_tools: Vec::new(),
+            allowed_headers: Vec::new(),
         }
     }
 
@@ -328,6 +335,17 @@ impl ExtensionConfig {
         .to_string()
     }
 
+    /// Names of session headers this extension may forward to its MCP server.
+    /// Only meaningful for `StreamableHttp`; empty for other transports.
+    pub fn allowed_headers(&self) -> Vec<String> {
+        match self {
+            Self::StreamableHttp {
+                allowed_headers, ..
+            } => allowed_headers.clone(),
+            Self::Stdio { .. } => Vec::new(),
+        }
+    }
+
     pub fn is_tool_available(&self, tool_name: &str) -> bool {
         let available_tools = match self {
             Self::StreamableHttp {
@@ -383,6 +401,7 @@ impl ExtensionConfig {
                 scopes,
                 bundled,
                 available_tools,
+                allowed_headers,
             } => {
                 // Resolve the OAuth client secret alongside env_keys so that
                 // rotating it changes the resolved config, which is what
@@ -413,6 +432,7 @@ impl ExtensionConfig {
                     scopes,
                     bundled,
                     available_tools,
+                    allowed_headers,
                 })
             }
         }

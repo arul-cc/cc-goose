@@ -38,6 +38,85 @@ impl AcpConnection {
         Ok(EmptyResponse {})
     }
 
+    /// ComplianceCow custom method: attach a recipe's extensions to a session
+    /// that was created without them. Sessions predating the platform's recipe
+    /// wiring carry no recipe extensions, so resuming one gives the model none
+    /// of the recipe's tools.
+    ///
+    /// The session ends up with the same extension set `session/new` builds for
+    /// a recipe — configured builtins plus the recipe's. It replaces rather than
+    /// merges, so it is only correct where the recipe owns the session's
+    /// extensions, which is exactly the platform's case.
+    pub(super) async fn on_apply_session_recipe(
+        &self,
+        req: ApplySessionRecipeRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        let session = self
+            .services
+            .session_manager
+            .get_session(&req.session_id, false)
+            .await
+            .internal_err()?;
+
+        let (recipe, _recipe_dir) = self.load_recipe_by_id(&req.recipe_id).await?;
+
+        let config = Config::global();
+        let extension_data = self.build_enabled_extensions_data(
+            config,
+            &session,
+            Vec::new(),
+            None,
+            recipe.extensions.as_deref(),
+        )?;
+
+        self.services
+            .session_manager
+            .update(&req.session_id)
+            .extension_data(extension_data)
+            .apply()
+            .await
+            .internal_err()?;
+
+        Ok(EmptyResponse {})
+    }
+
+    /// ComplianceCow custom method: merge raw key/value entries into a session's
+    /// `extension_data` (e.g. `websocket_headers.v0`). Merges so a partial update
+    /// doesn't clobber other extension state. This is the source the
+    /// `DynamicHeaderClient` reads when forwarding allow-listed MCP headers.
+    pub(super) async fn on_set_session_extension_data(
+        &self,
+        req: SetSessionExtensionDataRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        let session = self
+            .services
+            .session_manager
+            .get_session(&req.session_id, false)
+            .await
+            .internal_err()?;
+
+        let mut merged = session.extension_data;
+        for (key, mut value) in req.extension_data {
+            if key == crate::session::session_secrets::WEBSOCKET_HEADERS_KEY {
+                if let Some(headers) = value.as_object_mut() {
+                    let secrets = crate::session::session_secrets::split_secret_headers(headers);
+                    crate::session::session_secrets::store(&req.session_id, secrets);
+                }
+            }
+            merged.extension_states.insert(key, value);
+        }
+
+        self.services
+            .session_manager
+            .update(&req.session_id)
+            .extension_data(merged)
+            .apply()
+            .await
+            .internal_err()?;
+
+        Ok(EmptyResponse {})
+    }
+
     pub(super) async fn on_get_config_extensions(
         &self,
     ) -> Result<GetConfigExtensionsResponse, agent_client_protocol::Error> {
@@ -199,6 +278,7 @@ fn config_to_goose_extension(
             scopes: vec![],
             bundled: *bundled,
             available_tools: available_tools_to_wire(available_tools),
+            allowed_headers: Vec::new(),
         },
         ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name,
@@ -213,6 +293,7 @@ fn config_to_goose_extension(
             scopes,
             bundled,
             available_tools,
+            allowed_headers,
             ..
         }) => {
             let headers = headers
@@ -232,6 +313,7 @@ fn config_to_goose_extension(
                 scopes: scopes.clone(),
                 bundled: *bundled,
                 available_tools: available_tools_to_wire(available_tools),
+                allowed_headers: allowed_headers.clone(),
             }
         }
     };
@@ -287,6 +369,7 @@ fn goose_extension_to_config(
             scopes,
             bundled,
             available_tools,
+            allowed_headers,
         } => match *server {
             McpServer::Stdio(stdio) => {
                 if socket.is_some() {
@@ -337,6 +420,7 @@ fn goose_extension_to_config(
                     scopes,
                     bundled,
                     available_tools: available_tools.unwrap_or_default(),
+                    allowed_headers,
                 })
             }
             McpServer::Sse(_) => {
@@ -542,6 +626,7 @@ mod tests {
             scopes,
             bundled,
             available_tools,
+            allowed_headers: _,
         } = extension
         else {
             panic!("expected mcp extension");
@@ -590,6 +675,7 @@ mod tests {
                 scopes: vec!["scope.read".to_string()],
                 bundled: None,
                 available_tools: vec!["fetch".to_string()],
+                allowed_headers: vec![],
             });
 
         let extension = config_to_goose_extension(&config)
@@ -607,6 +693,7 @@ mod tests {
             scopes,
             bundled,
             available_tools,
+            allowed_headers: _,
         } = extension
         else {
             panic!("expected mcp extension");
@@ -649,6 +736,7 @@ mod tests {
             scopes: vec![],
             bundled: Some(true),
             available_tools: Some(vec!["run".to_string()]),
+            allowed_headers: Vec::new(),
         };
 
         let conversion = goose_extension_to_config(extension).expect("conversion should succeed");
@@ -708,6 +796,7 @@ mod tests {
             scopes: vec![],
             bundled: Some(true),
             available_tools: None,
+            allowed_headers: Vec::new(),
         };
 
         let conversion = goose_extension_to_config(extension).expect("conversion should succeed");
@@ -759,6 +848,7 @@ mod tests {
             scopes: vec!["scope.read".to_string()],
             bundled: Some(true),
             available_tools: Some(vec!["fetch".to_string()]),
+            allowed_headers: Vec::new(),
         };
 
         let conversion = goose_extension_to_config(extension).expect("conversion should succeed");
@@ -778,6 +868,7 @@ mod tests {
             scopes,
             bundled,
             available_tools,
+            allowed_headers: _,
         }) = conversion.config
         else {
             panic!("expected streamable http config");
@@ -888,6 +979,7 @@ mod tests {
             scopes: vec![],
             bundled: None,
             available_tools: None,
+            allowed_headers: Vec::new(),
         };
 
         assert!(goose_extension_to_config(extension).is_err());

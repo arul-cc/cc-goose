@@ -13,6 +13,7 @@ use crate::session::extension_data::{EnabledExtensionsState, ExtensionData, Exte
 use crate::session::session_naming::{
     generate_session_name, MSG_COUNT_FOR_SESSION_NAME_GENERATION,
 };
+use crate::session::session_secrets;
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::TryStreamExt;
@@ -567,7 +568,9 @@ impl SessionManager {
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<()> {
-        self.storage.delete_session(id).await
+        self.storage.delete_session(id).await?;
+        session_secrets::remove(id);
+        Ok(())
     }
 
     pub async fn get_insights(&self) -> Result<SessionInsights> {
@@ -671,15 +674,6 @@ impl SessionManager {
             return Ok(None);
         }
 
-        if let Some(recipe) = &session.recipe {
-            let name = recipe.title.trim().to_string();
-            if name.is_empty() || session.name == name {
-                return Ok(None);
-            }
-
-            return Ok(Some(self.system_generated_name_update(id, name).await?));
-        }
-
         let model_config = match session.model_config.clone() {
             Some(model_config) => model_config,
             None => {
@@ -705,10 +699,12 @@ impl SessionManager {
             .filter(|m| matches!(m.role, Role::User) && m.is_user_visible())
             .count();
 
+        // A session with no user messages has nothing to name from, so skip it
+        // rather than asking the model to name an empty conversation.
         let should_generate_name = if provider.manages_own_context() {
             user_message_count == 1
         } else {
-            user_message_count <= MSG_COUNT_FOR_SESSION_NAME_GENERATION
+            user_message_count > 0 && user_message_count <= MSG_COUNT_FOR_SESSION_NAME_GENERATION
         };
 
         if should_generate_name {
@@ -1080,6 +1076,14 @@ async fn insert_usage_ledger_row(
 }
 
 impl SessionStorage {
+    // sqlx defaults to 5 connections, which many concurrent sessions on one server exhaust.
+    fn max_connections() -> u32 {
+        std::env::var("GOOSE_DB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(50)
+    }
+
     fn create_pool(path: &Path, pool_options: SqlitePoolOptions) -> Pool<Sqlite> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("Failed to create session database directory");
@@ -1132,7 +1136,10 @@ impl SessionStorage {
                     }
                 }
                 bootstrap.close().await;
-                Ok::<_, anyhow::Error>(Self::create_pool(&db_path, SqlitePoolOptions::new()))
+                Ok::<_, anyhow::Error>(Self::create_pool(
+                    &db_path,
+                    SqlitePoolOptions::new().max_connections(Self::max_connections()),
+                ))
             })
             .await
     }
@@ -2911,7 +2918,8 @@ impl SessionStorage {
     }
 
     async fn export_session(&self, id: &str) -> Result<String> {
-        let session = self.get_session(id, true).await?;
+        let mut session = self.get_session(id, true).await?;
+        super::session_secrets::redact(&mut session.extension_data);
         serde_json::to_string_pretty(&session).map_err(Into::into)
     }
 
@@ -3935,8 +3943,12 @@ mod tests {
         assert!(reloaded.user_set_name);
     }
 
+    // ComplianceCow divergence from upstream: a recipe session is named from its
+    // conversation, not from the recipe title. Every ComplianceCow session runs a
+    // `cow-<type>` recipe, so upstream's behaviour collapsed every session in the
+    // list to one identical name.
     #[tokio::test]
-    async fn test_maybe_update_name_uses_recipe_title_for_recipe_session() {
+    async fn test_maybe_update_name_generates_name_for_recipe_session() {
         let temp_dir = TempDir::new().unwrap();
         let sm = SessionManager::new(temp_dir.path().to_path_buf());
 
@@ -3963,18 +3975,51 @@ mod tests {
             .unwrap();
         assert_eq!(
             update.as_ref().map(|update| update.name.as_str()),
-            Some("Recipe title")
+            Some(GENERATED_SESSION_NAME),
+            "a recipe session must be named from its conversation, not the recipe"
         );
 
         let reloaded = sm.get_session(&session.id, false).await.unwrap();
-        assert_eq!(reloaded.name, "Recipe title");
+        assert_eq!(reloaded.name, GENERATED_SESSION_NAME);
         assert!(!reloaded.user_set_name);
+    }
+
+    // A title the user typed still wins over conversation-based naming, recipe or not.
+    #[tokio::test]
+    async fn test_maybe_update_name_respects_user_set_name_on_recipe_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let session = sm
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "New Chat".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+
+        sm.update(&session.id)
+            .recipe(Some(test_recipe("Recipe title")))
+            .apply()
+            .await
+            .unwrap();
+        sm.update(&session.id)
+            .user_provided_name("Manual title".to_string())
+            .apply()
+            .await
+            .unwrap();
+        add_user_message(&sm, &session.id).await;
 
         let update = sm
             .maybe_update_name(&session.id, naming_test_provider())
             .await
             .unwrap();
         assert!(update.is_none());
+
+        let reloaded = sm.get_session(&session.id, false).await.unwrap();
+        assert_eq!(reloaded.name, "Manual title");
     }
 
     #[tokio::test]

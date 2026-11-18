@@ -1,0 +1,1188 @@
+# ComplianceCow Fork — Feature Registry
+
+This document tracks every ComplianceCow-specific customization layered on top of
+upstream `goose`, plus the companion changes in **CowGooseService** (the Go
+WebSocket↔SSE bridge). Use it as the single source of truth when rebasing onto a
+new upstream, onboarding, or restoring a feature.
+
+- **goose fork (Rust):** `/Users/Arul/Documents/rust/goose/` — branch
+  `sync-upstream-20261118`, re-ported onto `block/goose` `main` **2026-11-18**
+  (upstream `196698819`, goose 1.60.0); `acp-migration` still holds the 2026-10-20 base
+  until the synced branch is adopted
+- **CowGooseService (Go):** `/Users/Arul/Documents/projects/continube/ComplianceCow/src/cowgooseservice/`
+- **cow-mcp (Python):** `http://0.0.0.0:45678/mcp`
+
+> **Upstream is `block/goose`** (the `upstream` remote → `https://github.com/block/goose`,
+> which GitHub redirects to `aaif-goose/goose` — same repo). Follow
+> `.agents/workflows/sync-upstream.md` to run a sync; this registry is its
+> feature checklist.
+
+> **⚠️ 2026-07-07 — upstream removed the REST `goose-server` crate (#10224); it is
+> now ACP-only.** A straight sync past that point deletes the REST interface
+> CowGooseService depends on. Decision: **migrate to ACP (Option C)** — see
+> `ACP_MIGRATION.md` for the plan and the feature→ACP-home mapping. Behavioral
+> baseline is tagged `golden/rest-features-20260707`; do not sync `main` past
+> `651dc973c` (last REST-capable) until the ACP migration lands.
+
+## 2026-07-05 sync — major upstream refactor
+
+Upstream **relocated the entire provider layer into new crates**, and has since
+**independently absorbed (or re-implemented, often better) most of the fork's
+features**. This changed the sync from a mechanical rebase into a
+feature-by-feature reconciliation. New crate layout:
+
+| Old (pre-refactor) | New (`block/goose`) |
+|---|---|
+| `crates/goose/src/providers/anthropic.rs` | `crates/goose-providers/src/anthropic.rs` |
+| `crates/goose/src/providers/openai.rs` | `crates/goose-providers/src/openai.rs` |
+| `crates/goose/src/providers/formats/anthropic.rs` | `crates/goose-provider-types/src/formats/anthropic.rs` |
+| `crates/goose/src/providers/formats/openai.rs` | `crates/goose-provider-types/src/formats/openai.rs` |
+| `crates/goose/src/providers/declarative/deepseek.json` | `crates/goose-providers/src/declarative/definitions/deepseek.json` |
+| `ModelConfig` | `crates/goose-provider-types/src/model.rs` |
+| built-in provider construction | `crates/goose/src/providers/{openai_def,anthropic_def}.rs` (via builders) |
+| `crates/goose/src/providers/init.rs` | *same path* |
+| `crates/goose/src/agents/*.rs`, `crates/goose-server/src/routes/*.rs` | *same paths* |
+
+---
+
+## Sync log
+
+### 2026-11-18 — 197 upstream commits (1.55.0 → 1.60.0), re-ported instead of rebased
+
+Upstream moved `ExtensionConfig`'s transports into the GDK crate `goose-agent` (wrapped as
+`ExtensionConfig::External(..)` in goose) and replaced the agent with `StateMachineServices`.
+Only 28 files overlapped with the fork and none had been deleted, but the second fork
+commit alone conflicted in 10 files, so the work was done as the doc's path 4b: the fork's
+whole delta (`9920efa16..acp-migration`, 94 files) applied 3-way onto `upstream/main`,
+every conflict resolved once. History stays on `acp-migration` and
+`backup/pre-sync-20261118`; the new branch is one commit.
+
+- **§4:** `allowed_headers` now lives in `goose-agent`'s `StreamableHttp` variant (the fork
+  edits a GDK crate here — the next upstream change to that variant will conflict).
+- **§1-3:** `on_update_session_provider` uses `self.services` (`model_config_for_session`,
+  `update_provider`, `switch_provider`) and releases the cached provider before a
+  non-key switch, as upstream's own switch does.
+- **§12:** the fork's resume dropped in favour of upstream's `resume` (see §12).
+- **DB pool:** `GOOSE_DB_MAX_CONNECTIONS` applies to the main pool only; upstream's bootstrap
+  pool must stay at one connection.
+- `acp-schema.json` / `acp-meta.json` regenerated.
+- Machine trap: cmake picks up the Intel `/usr/local/bin/ccache` ("Bad CPU type"); a
+  pass-through `ccache` shim first on PATH fixes the `llama-cpp-sys-2` build.
+
+### 2026-10-20 — 26 upstream commits (1.55.0, no version bump), one trivial conflict
+
+Rebased onto `upstream/main` at `9920efa16`. 138 files changed upstream, **8 shared with
+the fork**. 69 fork commits replayed: 67 identical under `range-diff`, 2 changed, none
+missing, none new. The merge commit made when `feat/tool-scoring` was merged into
+`acp-migration` is dropped by a linear rebase; its six scoring commits are replayed one by
+one. §1-3, §4, §9, §12, §14, §15 and §16 survived with their tests green.
+
+**The conflict (`crates/goose/Cargo.toml`, replaying the §4 client commit).** Both sides
+appended a dependency to the end of the same list: upstream's #12952 added `boa_engine`
+(it replaces the PCTX code-mode runtime), the fork added `sse-stream`. Kept both.
+
+**The other changed commit (`fix: extension passing in delegate`, §12).** It rebased
+without a conflict, but upstream edited the lines around it. Its `summon.rs` part is now
+dropped in a follow-up commit (`b6d722b6b`) — see #12938 below. Its Dockerfile and
+`build-image.sh` parts stay.
+
+**Upstream changes that matter to the fork, checked**
+- **#12938 (`21d873eec`) — recipe extensions load for slash commands and delegation**
+  (`summon.rs`, §12). `resolve_subagent_config` now starts from
+  `resolve_extensions_for_new_session`, which uses the recipe's declared extensions and
+  filters out the unavailable ones. The fork's own earlier fix for the same problem
+  (`2d4f836f9`) merged the recipe's extensions onto the parent's afterwards. That loop
+  was redundant with upstream's change, and it re-added extensions the availability filter
+  had dropped, so it was **removed (`b6d722b6b`)** and upstream's behaviour now applies.
+  **Behaviour change:** a delegated recipe that declares extensions gets exactly those,
+  not the parent's plus its own. A recipe that declares none still inherits the parent's.
+  The ComplianceCow sub-recipes declare their own (`todo` and the cow-mcp server), so they
+  are unaffected on paper; a live delegate with a real model has not confirmed it.
+- **#12992 (`0742c80de`) — a subagent's turn limit falls back to the global limit.** With
+  the image default `GOOSE_MAX_TURNS=25`, subagents are now capped at 25 turns too. Not
+  exercised live.
+- **#12946 — `GOOSE_MAX_CONCURRENT_SUBAGENTS`** limits concurrent subagents. The fork sets
+  nothing for it.
+- **#12998 (`75e13d7ba`) — subagent sessions are linkable and view-only.** Touches
+  `acp/server.rs` and `extension_manager/mod.rs` (§4's file). Auto-merged; the §4 header
+  forwarding tests pass.
+- **#12940 — faster list-sessions query** (`session_manager.rs`). Auto-merged. The session
+  list the Go bridge relies on was not exercised live.
+- **#12952 — code mode now runs on Boa instead of PCTX.** Large `Cargo.lock` change. The
+  fork's image features (`rustls-tls,acp-http,scheduler`) do not include `code-mode`.
+- #12935 (skills discovery into the GDK), #12949 (removes the `enable_subagents` prompt
+  variable), #12928 (OSC 7501 session status), #12962 (ACP loads the live model catalog),
+  #12595 (tests gated on their features) and the desktop and provider fixes touched shared
+  files or none, and needed nothing from the fork.
+
+**Verification:** 45/45 fork markers, `range-diff` as above, `compliancecow_features_test`
+11/11, `cargo fmt --check` clean, `clippy -D warnings` clean on `goose` (CI's feature set)
+and `goose-cli`. `summon` and `session_secrets` tests: 49 passed, including upstream's
+`delegate_extension_selection`, re-run after the loop was removed (49 passed, fork feature
+test 11/11, clippy clean, 45/45 markers). `cargo test -p goose --lib` with that set and
+`RUST_MIN_STACK=8388608`, skipping the hang-prone upstream test, run after the removal:
+**2277 passed / 2 failed**, both known: `provider_lifecycle` (asserts "agent called goose";
+the fork rebrands the agent) and the load-sensitive `rejected_retry_surfaces_the_error`,
+which passes alone (and passed in the run before the removal). The count is 11 below the last sync's
+2289; #12595 gates tests behind feature flags, which probably accounts for it (not checked
+test by test). The identifier audit in `sync-upstream.md` step 5 shows the same three
+names missing before and after (`update_extension_data`, `cache_control_disabled`,
+`ANTHROPIC_CACHE_TTL`), so the sync did not change it.
+Release image built from the synced branch (revision `b6d722b6b`, with the
+`--with-tool-scoring` layer): **3m59s** at `--jobs 2`, no out-of-memory failure, the
+`goose serve` check and the 5 fork-code markers both passing, provenance
+`sync-upstream-20261020 @ b6d722b6b54d`. In the image: goose 1.55.0, `GOOSE_MAX_TURNS=25`,
+and the scoring hook, which allows in shadow mode and blocks a credential read in enforce
+mode.
+
+**Full-stack validation, on that image (`scripts/validate-compliancecow.py`, the real bridge,
+vault and cow-mcp): 16 passed, 0 failed, 1 skipped.** goose ran from the image on :3000
+behind the live CowGooseService. Passing: session list, rename and info, fork and delete
+(ACP); `extension_data/set` (§4); a real turn on `deepseek-v4-pro` through the bridge whose
+tool call to cow-mcp came back authorised, with the tool result reaching the browser and
+the text streaming (§4); §1-3 per-session provider; §6 `metadata.user_id`; §9 thinking
+disabled; §12 `cow_tenant.v0` populated; §13 the session named from its conversation, not
+from the recipe title; §14 no credential in `sessions.db` while the non-secret headers are
+kept; the recipe attached. **Skipped: the §4 negative control** (same prompt without
+headers, which cow-mcp must refuse) — the model called no tools in that turn, so it proved
+nothing either way.
+
+**Operational notes**
+- **`/usr/local/bin/cmake` is an Intel binary too** ("Bad CPU type"), alongside the Intel
+  git and ccache noted before. `llama-cpp-sys-2` runs it when `goose-cli` is built. The
+  repo's Hermit `bin/cmake` (4.2.3) works; put a wrapper that runs it first on `PATH`, and a
+  pass-through `ccache` (`exec "$@"`) as well, or the cold build fails with error 126.
+- **`scripts/build-image.sh` could not read git when run in the background.** The Intel
+  git failed with "Bad CPU type" and the script's `|| echo unknown` fallbacks then tagged
+  the image `unknown-unknown`. It now puts `/usr/bin` first for git and refuses to push an
+  image whose branch or revision it cannot read.
+- **`git rebase --autostash`** set the one modified tracked file aside and restored it.
+- **Validating an image rather than the host's binary took several setup steps**, each of
+  which failed the validator with a misleading error until fixed. None was an image fault.
+  - Pass the security context as **one line**. Newlines in the `X-Cow-Security-Context`
+    header give a bare HTTP 400 that never reaches the bridge's log.
+  - The context must carry **`OrgID`** (and the rest of a real login's fields); with only
+    `ID`, `DomainID` and `AuthToken` the bridge's provider lookup fails with
+    `Invalid operation : 'OrgID'`.
+  - The bridge sends its own `working_directory` with `session/new`, and goose refuses a
+    path that does not exist (`-32602 invalid directory path`). Mount that directory in the
+    container at the same path.
+  - goose numbers sessions `YYYYMMDD_N` within its own database, and the bridge's mapping
+    table has a unique constraint on that id. A fresh container database restarts at `_1`
+    and collides with the ids already mapped (`UNIQUE constraint failed:
+    session_mapping.goose_session_id`). Create a few throwaway sessions first so the counter
+    passes them. This is the §14 caveat about ids being unique per database, not per bridge.
+  - The recipes point cow-mcp at `0.0.0.0:45678`, which inside a container is the container.
+    Use a copy with `host.docker.internal`; the real recipes are untouched.
+  - Run it as `goose serve --host 0.0.0.0 --port 3000 --platform desktop --enable-scheduler
+    --dangerously-unauthenticated` with `GOOSE_MODE=auto` and placeholder provider settings;
+    the bridge supplies the real provider per session. Use the default `rules` session type,
+    not `rules-auto`, whose gate would keep sending the agent back on the validator's
+    read-only prompt.
+
+**Not verified — read before relying on it**
+- `GOOSE_SUBAGENT_RESUME` under the live loop, and `delegate` with a real model, as on the
+  last two syncs.
+- The subagent turn cap (#12992) with `GOOSE_MAX_TURNS=25`, and a list-sessions call from
+  the Go bridge (#12940).
+- The §4 negative control (above): that cow-mcp refuses a call made without headers was not
+  confirmed on this image.
+
+Follow-ups, none actioned:
+- Add the validator-on-an-image setup above to `sync-upstream.md` step 6, or script it.
+- Make the validator's negative control reliable (a prompt that forces a tool call).
+- Update the `Dockerfile.server` comment about login-shell PATH (carried over).
+
+### 2026-10-15 — 34 upstream commits (1.54.0 → 1.55.0), one conflict, in §12
+
+Rebased onto `upstream/main` at `716bb92ce`. 261 files changed upstream, **20 shared
+with the fork**. 56 fork commits replayed: 52 identical under `range-diff`, 4 changed
+(§4's `extension_manager` follow-up, §14, the 1.54.0 API follow-up, and the §12 port —
+all because upstream edited the files around them), and **one real conflict**, in
+`summon.rs`. One commit was added on top. §1-3, §4, §9, §14, §15 and the Go bridge's
+contract survived with their tests green.
+
+**The conflict (§12, `summon.rs`).** Upstream's #12802 (`6ead9cb60`, "Bind subagents by
+their parent's hooks, mode and approvals") touched the same tail of the delegate path:
+- `handle_foreground_delegate` is now **`create_subagent`**.
+- The child session takes the **parent's `goose_mode`** (it was hard-coded to `Auto`).
+- The `"foreground_subagent"` result marker became the named constant
+  **`DELEGATED_META_KEY`** (`state_machine/ops_subagent.rs`, renamed from
+  `ops_foreground_subagent.rs`). The value is unchanged, but it is the key the agent
+  loop uses to recognise a delegation, so the fork's result helper must keep emitting it.
+- The result text is now "Delegated to subagent <id>".
+
+Resolved by keeping the fork's structure (`resume_foreground_delegate` and the shared
+`foreground_delegate_result` helper) and making the helper use `DELEGATED_META_KEY` and
+upstream's wording. Auto-merge carried the tenant-inheritance code across the rename.
+
+**What needed fixing that the textual merge did not show**
+- `execution/manager.rs`: upstream turned the extension in
+  `concurrent_session_creation_initializes_extensions_once` into a `Builtin`, which has
+  no `allowed_headers`. The fork's earlier addition of that field to the old literal had
+  merged onto the new one — a compile error in the lib tests only. Dropped the line
+  (separate commit `1d2d223a3`). Same trap as 2026-08-27 and 2026-10-09: struct
+  literals in tests.
+
+**Upstream changes that matter to the fork, checked**
+- **#12799 (`e9e0ab62c`) — "Leave the login-shell PATH to whoever launches goose."**
+  Going by its title and the rewrite of `developer/shell.rs` (the behaviour was not read
+  line by line), goose no longer resolves the login-shell PATH itself.
+  `Dockerfile.server` explains `--platform desktop` as doing that, so that comment is
+  probably stale. Checked on the new image: the shell tool runs and
+  the scoring hook, which runs through `uv`, finds it, so the container's own `PATH` is
+  enough. The flag itself is still accepted.
+- **#12775 (`903743ee0`) — a session's extension selection is leased and each extension
+  starts on first use** (touches `extension_manager`, §4's file). Auto-merged; the two §4
+  header-forwarding tests in `compliancecow_features_test` pass.
+- **#12846 (`3295f5e0f`) — a malformed `GOOSE_MODE` is now rejected** by the ACP
+  providers. The fork's configs set `GOOSE_MODE: auto`, which is valid.
+- #12420 (`prompt_cache_key` on OpenAI Responses requests), #12587 (provider
+  `x-request-id`), #12697 (W3C trace context to MCP tool calls), #12792 (foreground
+  subagents in the GDK crate) and #12692 (compaction) touched shared files or none, and
+  needed nothing from the fork.
+
+**Not verified — read before relying on it**
+- **`GOOSE_SUBAGENT_RESUME` under the live loop** is still covered only at session level,
+  as on 2026-10-09. Try a resume on dev.
+- **`delegate` was exercised with a stand-in model**, not a real one. The call completes
+  through the new loop and the container logs are clean, but the stand-in never calls the
+  "final output" tool, so the child made several requests before ending — most likely
+  upstream's loop nudging a model that does not comply (not confirmed), not a fork fault.
+- A full turn with a real LLM and tool call was not run; no provider keys were present.
+- `scripts/validate-compliancecow.py` (needs goose and CowGooseService up together).
+
+**Verification:** 45/45 fork markers, `range-diff` as above,
+`compliancecow_features_test` 11/11, `cargo fmt --check` clean, `clippy -D warnings` clean
+on `goose` and `goose-cli` with CI's feature set. `cargo test -p goose --lib` with that
+set and `RUST_MIN_STACK=8388608`: **2289 passed / 2 failed**, both known —
+`acp::provider::tests::rejected_retry_surfaces_the_error` (load-sensitive; passes alone)
+and `agents::state_machine::tests::provider_lifecycle`, which asserts the prompt says
+"agent called goose" while the fork rebrands the agent (§Branding). The three
+`plugins::tests` that failed on the Intel git last time passed; this run had `/usr/bin`
+first on `PATH`, so the Intel git was most likely not picked up (not isolated). Release image built from the branch: **6m33s**, with the
+`goose serve` check and the 5 fork-code markers both passing.
+
+**Operational notes**
+- **One upstream test hung the first full run.**
+  `acp::provider::tests::streamed_error_after_bare_retry_consumes_handoff_context` sat
+  idle (0% CPU) for 15 minutes under the parallel run, and passes alone in 0.56s. It is
+  upstream's, from #11204, and the fork changes nothing it exercises. Skip it with
+  `-- --skip <name>` in a full run and run it alone; do not wait on a run that has gone
+  quiet.
+- **`/usr/local/bin/ccache` is an Intel binary** ("Bad CPU type"). llama.cpp's cmake step
+  in `llama-cpp-sys-2` picks it up and a cold debug build fails there with error 126. A
+  pass-through `ccache` shim first on `PATH` works around it; the fix is to remove or
+  replace the binary, like the Intel git.
+- **The sync ran with uncommitted work in the tree.** `git rebase --autostash` set the
+  two modified tracked files aside and restored them afterwards; untracked files were
+  never in the way.
+
+Follow-ups, none actioned:
+- Update the `Dockerfile.server` comment about login-shell PATH (above).
+- Exercise a real multi-step `delegate` and a resume on dev.
+- Add `deepseek-flash` to §9 or rely on the Go-side injection (carried over).
+- Remove the Intel git and the Intel ccache from `/usr/local/bin` (carried over, extended).
+
+### 2026-10-09 — 29 upstream commits (1.53.0 → 1.54.0), the first that needed hand-porting
+
+Rebased onto `upstream/main` at `7bdeadb91` (not the `v1.54.0` tag, which is not an
+ancestor of `main`). 268 files changed upstream, **22 shared with the fork**. 53 fork
+commits replayed: 47 identical under `range-diff`, 4 resolved by hand, and the two
+§12 commits that touched only `summon.rs` reduced to upstream's file and re-done as one
+deliberate commit (below). Three commits were added on top. Everything else — §4, §9,
+§14, §15 and the Go bridge's contract — survived with its tests green.
+
+**Why this one was different.** Upstream deleted the legacy agent loop, routed every
+session's provider through a new `ProviderManager`, moved extensions to per-inference
+leases, removed background subagents and the `orchestrator` extension, and rebuilt
+`delegate` as a foreground child that runs from its saved session record. Earlier syncs
+were conflicts to resolve; this one changed the thing §12 was written against.
+
+**Conflicts, and how each was resolved**
+- `formats/anthropic.rs` (§9/§6): both sides added a function in the same spot. Kept both.
+- `extension_manager/mod.rs` (§4): `add_extension_if_current` now takes `session_id: &str`
+  and renamed `working_dir`. Our `ConnectParams` still wants an `Option`, so it is
+  wrapped as `Some(session_id.to_string())`. An extension connection can no longer be
+  created without a session id, which only strengthens §4's per-session isolation.
+- `providers/init.rs` + `mod.rs` (§1-3): upstream deleted `create_with_working_dir` and
+  `create_with_named_model`. Kept `create_with_api_key`; dropped the dead context copies.
+- `summon.rs` (§12, three commits): not mergeable line by line. Took upstream's file and
+  re-applied the behaviour afterwards — see §12 for the new homes. The original
+  code is on `backup/pre-sync-20261009`.
+
+**What needed fixing that the textual merge did not show**
+- `Agent::recreate_provider_for_session` no longer exists. The §1-3 handler's no-key
+  branch now calls `switch_provider`, as upstream's own provider switch does. The
+  with-key branch still builds the provider and installs it through `update_provider`,
+  which places it in `ProviderManager`'s per-session slot — checked, not assumed.
+- Five new upstream struct literals of `ExtensionConfig::StreamableHttp` lacked
+  `allowed_headers` (the trap the 2026-08-27 entry predicted); all in test code.
+- **A subagent would have run on the deployment's own key.** `ProviderManager` builds a
+  session's provider from the shared global-config path whenever its slot is empty, and a
+  new subagent's slot is always empty. §12 is therefore enforced inside
+  `ProviderManager::provider_for`, before that path. See §12.
+- `rust-toolchain.toml` now pins 1.99.0; `Dockerfile.server` built on 1.96, so rustup
+  downloaded the compiler inside every build. The base image is now `rust:1.99-bookworm`.
+
+**Checked and unaffected**
+- §6 `metadata` forwarding: upstream's new generic forwarding applies params declared on a
+  *custom model* in provider config, a different source from the session's
+  `request_params`. No overlap.
+- §9 precedence: an explicit `request_params["thinking"]` still returns before upstream's
+  new adaptive-thinking logic, so DeepSeek's `thinking: disabled` and no `output_config`.
+- The recipe-session extension set, the thing the "client extension selection is the exact
+  set" change (`540df77c3`) could have broken. Same probe against the published
+  pre-sync image and the new one, both next to a real cow-mcp: `session/new` with the
+  recipe id and an empty `mcpServers` gives `cow-rules` + `todo`, unchanged after the
+  tenant headers are seeded, and `recipe/apply` on an older chat is identical and
+  idempotent. No `developer` extension appears.
+
+**Not verified — read before relying on it**
+- **`delegate` changed shape.** The child now runs in the foreground inside the loop, and
+  the old `async: true` / `load(taskId)` pattern is gone. `cow-orchestrator` lists no
+  extensions of its own and never used those, so nothing in the recipes breaks, but a
+  multi-step delegation was not run. Try one on dev.
+- **`GOOSE_SUBAGENT_RESUME` under the live loop.** Only the session-level behaviour is
+  tested (the follow-up reaches the right child; another session's is refused). The dev
+  manifest sets it to `true`.
+- A full turn with a real LLM and tool call was not re-run for this sync: the provider
+  keys had been removed from the environment.
+- The `orchestrator` platform extension is gone upstream. Configs that list it as
+  `enabled: false` are harmless; one that enables it would now point at nothing.
+
+**Verification:** 45/45 fork markers (three added, two moved — see §12), `range-diff`
+as above, `compliancecow_features_test` 11/11, clippy and `cargo fmt --check` clean.
+`cargo test -p goose --lib` with CI's feature set and `RUST_MIN_STACK=8388608`: **2264
+passed / 5 failed** — the four known (`state_machine::provider_lifecycle`, three
+`plugins::tests` on the Intel git) plus `acp::provider::tests::rejected_retry_surfaces_the_error`,
+the load-sensitive flake, which passes 3/3 in isolation. The total fell from 2352 to 2269
+because upstream deleted the legacy loop and its scenario tests. Provider crates: 917
+passed, 0 failed. The new §12 safeguards were each mutation-checked: removing one turned
+exactly its test red. Release image built from the branch: 7m12s cold, both build checks
+passed.
+
+**Operational notes**
+- **A full disk kills Docker Desktop's VM.** At 98% the build died silently mid-compile
+  and Docker would not restart; the stuck backend (up three days, ignoring SIGTERM) had to
+  be force-killed. When a build log stops advancing, check the daemon first.
+- `cargo test`/`check` runs with several feature sets leave one copy of every dependency
+  each: `target/` reached 84 GB. `scripts/clean-goose.sh` frees the 16–21 GB of
+  incremental caches without touching dependencies.
+- The Docker build cache is keyed to the compiler; changing the base image's Rust version
+  forces a full recompile (about seven minutes).
+
+Follow-ups, none actioned:
+- Exercise a real multi-step `delegate` and a resume on dev.
+- Add `deepseek-flash` to §9 or rely on the Go-side injection (carried over).
+- Remove the Intel git at `/usr/local/bin/git` (carried over).
+
+### 2026-10-03 — 44 upstream commits (1.52.0 → 1.53.0)
+
+Rebased onto `upstream/main` at `591edd47c`. **46 fork commits replayed, zero
+conflicts**, with twenty files touched by both sides — the most so far. The
+shared set includes `acp/server.rs`, `custom_dispatch.rs`, `custom_requests.rs`,
+`extension_manager/mod.rs`, `streamable_http.rs`, `session_manager.rs`,
+`session/mod.rs`, `providers/init.rs`, `providers/mod.rs`, both provider formats,
+`goose-providers/anthropic.rs`, and the generated `acp-schema.json` / `acp-meta.json`.
+
+**Target was `main`, not the `v1.53.0` tag** — again not an ancestor of `main`
+(`git merge-base --is-ancestor v1.53.0 upstream/main` fails).
+
+range-diff: 44 `=`, 2 `!`. Both `!` are context drift only, no fork-added line
+differs: #4 (§4) because upstream renamed `ServerInfo` to `ServerConfig` in the
+`rmcp` import beside our hunk, #42 (§14) because an upstream `mod` line beside our
+`session_secrets` line moved. The tree-diff check from 2026-09-21 also holds: the
+changed-file set after the rebase equals upstream's exactly (173 files).
+
+The stale-index halt recurred, at the §12 test commit (`summon.rs`), and cleared
+with `git update-index --refresh` then `git rebase --continue`.
+
+**`online-model-meta` is on by default in `goose-cli`.** `4dea9b483` makes every
+CLI start, including `goose serve`, send a GET to `https://models.dev/api.json`
+and cache the result under the data dir (`model_catalog/`), where it overrides the
+bundled model metadata (context limits, cost, vision). No tenant data is sent and a
+failed fetch only logs a warning. There is no runtime switch; opting out means
+building `goose-cli` without the feature. `deepseek-v4-pro[1m]` metadata can now
+differ from the bundled copy.
+
+**rmcp 3.2 → 3.4.1** (`a5a297fc5`) changed only a type name in `extension_manager`.
+`DynamicHeaderClient`'s `StreamableHttpClient` impl is untouched and the §4
+forwarding tests pass against the real client. The new HTML session export
+(`9012eac3b`) builds its session with empty `extension_data` and renders no headers
+or secrets, so §14 is unaffected.
+
+**Two environmental traps in the test build, neither from the sync** (the
+pre-sync tree behaves identically):
+- With empty default features, `libsqlx_macros` links with a "mis-aligned LINKEDIT
+  string pool" and cannot be loaded, so a bare
+  `cargo test -p goose --test compliancecow_features_test` fails to compile. The
+  Command Line Tools were updated on 2026-09-25. Passing CI's feature set builds a
+  loadable one, so run that test with `--no-default-features --features $F`.
+- `agents::state_machine::tests::agent_reply::bang_shell_visibility_is_enforced_when_state_machine_is_enabled`
+  overflows its stack in a debug test build and aborts the whole lib test binary.
+  It passes on the pre-sync tree, so something in this range raised stack use
+  (`state_machine` was touched by `add40e765` and `98c626d74`; cause not isolated).
+  Upstream CI sets `RUST_MIN_STACK=8388608`; so must the lib run.
+
+Verification after: 42/42 fork markers, 11/11 fork feature tests, clippy and
+`cargo fmt --check` clean. `cargo test -p goose --lib` with CI's feature set and
+`RUST_MIN_STACK=8388608`: 2348 passed / 4 failed — the same four as last time
+(`state_machine::provider_lifecycle` and three `plugins::tests` failing with
+`Bad CPU type in executable`). `acp::provider::tests::rejected_retry_surfaces_the_error`
+failed once under parallel load and passed in isolation and on rerun.
+
+Follow-ups this sync raised, none actioned:
+- Decide whether to build `goose-cli` without `online-model-meta` for deployment.
+- Isolate which upstream commit raised the `state_machine` test stack use.
+- Decide how `deepseek-flash` keeps thinking off: add it to the §9 default
+  pattern (covers the OpenAI-compatible format only) and/or rely on the Go-side
+  injection (covers the Anthropic route). The platform uses it today — see the
+  corrected 2026-09-24 entry.
+- Remove the Intel git at `/usr/local/bin/git` (carried over). It also breaks
+  `go build` without `-buildvcs=false`.
+
+### 2026-09-24 — 24 upstream commits (1.51.0 → 1.52.0, includes Jev)
+
+Rebased onto `upstream/main` at `80c119758`. **45 fork commits replayed, zero
+conflicts** — despite nine files touched by both sides, against one last sync:
+`Cargo.lock`, `Justfile`, `goose-cli/src/session/mod.rs`, both provider formats
+(`anthropic.rs`, `openai.rs`), `goose/Cargo.toml`, `acp/server.rs`,
+`extension_manager/mod.rs` and `extension_manager/streamable_http.rs`.
+
+**Target was `main`, not the `v1.52.0` tag.** The tag is not an ancestor of
+`main`: it sits on a release branch whose only extra commits are the
+branch-open chore (`aa5b2fcc8`) and a cherry-pick (`302b60806`) of a change
+already on `main` as `9fd1051bb`. `main` carries all of the release, is already
+versioned 1.52.0, and has seven later fixes. Basing on the tag would have left
+the next sync to unpick those duplicates.
+
+With nine shared files the tree-diff check from the last entry is weaker — it
+cannot see inside a file both sides edited. The check that carries weight here
+is range-diff, which compares every fork patch before and after:
+
+```bash
+git range-diff <old-base>..backup/pre-sync-<date> upstream/main..HEAD
+```
+
+All 45 came back `=`: every hunk applied with identical content.
+
+The stale-index halt from the last sync recurred, on the §13 commit
+(`session_manager.rs`). Same fix — `git update-index --refresh`, then
+`git rebase --continue`. Treat it as expected on this machine, not a surprise.
+
+**Jev (TypeSafe) arrived, but nothing uses it yet.** `8a460f964` adds a
+decisions provider — `goose-providers/src/decision.rs`, `typesafe.rs` (host
+`api.typesafe.ai`, model `jev-latest`) and an OpenRouter equivalent — exported
+through the GDK bindings. No part of the goose agent calls it: no routing, no
+tool gating, and no tenant data sent to TypeSafe by default. Using it means
+writing the integration ourselves.
+
+**The lib test command changed.** `e678c3b64` (lean ACP-only binary) made
+`goose`'s default features empty, so a bare `cargo test -p goose --lib` no
+longer compiles — upstream's own test code references `Scheduler`, now behind
+the `scheduler` feature. Upstream CI passes an explicit list; the verification
+commands below now do too. `goose-cli`'s defaults still enable every feature, so
+normal and deployed builds are unaffected. The new `goose-acp` binary
+(`just build-lean`) is optional.
+
+**The MCP redirect guard is safe for our setup.** `6a2c3dadf` sets
+`redirect::Policy::none()` on the streamable-HTTP client — redirects are
+surfaced, never followed. Probed against the live cow-mcp: `/mcp` returns 200,
+`/mcp/` returns 307. All ten recipes use `/mcp`, so nothing breaks. **A recipe
+URI ending in `/mcp/` will now fail to connect** instead of silently following
+the redirect. The guard also means §4's forwarded tenant headers can no longer
+reach a redirect target.
+
+**§9 gap — the platform already uses the unmatched name.** `78ab4b12b` renames
+`deepseek-v4-flash` to `deepseek-flash` in the declarative catalogue, which the §9
+default pattern `deepseek-v4` does not match. *Corrected 2026-10-05:* this entry
+first said the platform referenced only `deepseek-v4-pro`. `sessions.db` shows
+otherwise — 7 sessions on provider `anthropic` with model `deepseek-flash`
+(2026-09-17 to 2026-09-20), all carrying `thinking: disabled`. That came from
+CowGooseService's `BuildDeepSeekThinkingParams`, not from goose: on the Anthropic
+route §9 relies on an explicit `request_params["thinking"]`, and the env-pattern
+default applies only to the OpenAI-compatible format. So thinking stays off for
+`deepseek-flash` only while the Go-side injection keeps matching the name.
+The earlier `deepseek-v4-flash` rows (58 sessions, `custom_deepseek`, last
+2026-09-01) predate the rename.
+
+Verification after: 42/42 fork markers, 11/11 fork feature tests, clippy and
+`cargo fmt --check` clean. `cargo test -p goose --lib` with CI's feature set:
+2325 passed / 4 failed. With those features the four old gcpauth/JWT failures
+pass, as does `test_all_platform_extensions`. The four remaining:
+`state_machine::provider_lifecycle` (asserts upstream's branding wording) and
+three `plugins::tests` that fail with `Bad CPU type in executable`.
+
+That last one is environmental and outlives the tests. `/usr/local/bin/git` is
+an Intel-only Homebrew git 2.33.0, and macOS 27 on this machine does not run
+Intel binaries. zsh falls through to `/usr/bin/git` when exec fails, so git
+works from the shell; Rust's `Command::new("git")` takes the first `PATH` match
+and stops. Any goose feature that shells out to git fails the same way.
+
+Follow-ups this sync raised, none actioned:
+- Add `deepseek-flash` to the §9 default pattern.
+- Remove the Intel git at `/usr/local/bin/git`.
+- Rebuild the running goose to pick up these fixes. Jev stays inert either way.
+
+### 2026-09-21 — 8 upstream commits (1.51.0, no version bump)
+
+Four days of upstream, rebased onto `e629eea1d`. **44 fork commits replayed,
+zero conflicts.**
+
+Exactly one file was touched by both sides: `crates/goose-providers/src/anthropic.rs`.
+Upstream's `8fd84be23` deleted the hardcoded `ANTHROPIC_KNOWN_MODELS` list in
+favour of `known_models_from_registry()`; §6's `metadata` forwarding lives inside
+`create_request`, a different function. Git merged them without asking.
+
+The check worth repeating on every sync: after the rebase, the tree differed from
+the pre-rebase tree in **exactly** the 23 files upstream touched, and nothing
+else. That is stronger than a green test run — it proves no fork file was
+altered, dropped, or reformatted in passing.
+
+```bash
+diff <(git diff --name-only <old-base> upstream/main | sort) \
+     <(git diff --name-only backup/pre-sync-<date> HEAD | sort)
+```
+
+**Trap:** the rebase halted partway with `error: Your local changes to the
+following files would be overwritten by merge`, naming `acp/server.rs` and
+`providers/openai_def.rs` — while `git status` reported a clean tree and
+`git diff` was empty. Stale index stat data, not real changes.
+`git update-index --refresh` followed by `git rebase --continue` cleared it and
+the rebase ran to completion. Do not resolve this one by stashing or resetting;
+there is nothing to stash.
+
+Verification after: 42/42 fork markers, 11/11 fork feature tests, clippy and
+`cargo fmt --check` clean. `cargo test -p goose --lib` at 2303 passed / 6 failed
+— the identical six as before the rebase (4 rustls `CryptoProvider` in the
+gcpauth/JWT tests, `state_machine::provider_lifecycle` and
+`test_all_platform_extensions`, both asserting upstream's branding wording).
+
+Follow-ups this sync raised, neither actioned:
+- `1e83e89f5` gave upstream's OpenAI provider a custom base URL. §1-3's
+  `from_api_key(api_key, host_override)` may now be partly redundant there —
+  worth checking whether fork code can be deleted rather than carried.
+- `2090ad1c6` de-duplicates `@radix-ui` and moves `ui/pnpm-lock.yaml`; run
+  `pnpm install` before building the desktop app.
+
+### 2026-09-17 — 157 upstream commits (1.48.0 → 1.51.0) — reconstructed
+
+**This sync was never logged; the entry below is inferred from git, not from a
+record of the work.** It surfaced on 2026-09-21 because the header block still
+named `caf59517c` / 1.48.0 while `Cargo.toml` read 1.51.0. `caf59517c` was
+correct when written — the gap is this sync, which moved the merge base to
+`d213a3b13` (2026-09-17, "feat: add Live voice conversations to the desktop
+app", #12093) without updating the registry.
+
+What can be established: `backup/pre-sync-20260917` still points at the
+pre-rebase tip (`78a39736a`), and its merge base with upstream is `caf59517c`,
+which brackets the sync. Its conflicts, resolutions and verification results are
+not recoverable.
+
+The lesson is the one this file exists to enforce: **a sync that isn't logged
+here leaves the next sync guessing at its own starting point.** Write the entry
+in the same commit that moves the branch.
+
+### 2026-08-27 — 175 upstream commits (1.46.0 → 1.48.0)
+
+Nine days of upstream, rebased onto `caf59517c`. **31 fork commits replayed, one
+conflict.**
+
+The conflict was `platform_extensions/summon.rs` (§12): upstream reworked
+provider construction to fetch the registry entry first and pass a
+`provider_default_model` into a now-5-arg `resolve_model_config`, while our
+commit adds the tenant-key early return. Both survive — the early return moved
+below the new `model_config` and above upstream's `match provider_entry`.
+
+One follow-up edit was needed: upstream's new
+`test_codex_rejects_socket_backed_streamable_http` builds
+`ExtensionConfig::StreamableHttp` as a struct literal, so §4's `allowed_headers`
+field broke the *test* target while the lib itself compiled — `cargo build` did
+not catch it, `cargo test` did. Any sync adding a construction site will need the
+same one-line edit.
+
+What made this cheap: upstream touched 7 fork-critical files but **not one
+fork-owned function**. Zero commits mention `DynamicHeaderClient`,
+`filter_allowed_headers`, `allowed_headers`, `create_streamable_http_client`,
+`maybe_update_name`, or the recipe-title logic §13 removed. The overlaps were
+same-file, different-region.
+
+Verification after: 26/26 fork markers, 9/9 fork feature tests, Go 7/7 including
+the live ACP round-trip, and full-stack 16 passed / 0 failed (§1-3, §4 both
+sides, §6, §9, §12, §13, recipe selection, 37,829 bytes of authorized tenant
+data).
+
+`cargo test -p goose --lib` sits at the same pre-sync baseline — 4 crypto/JWT
+(environmental), 2 `state_machine`, and `test_all_platform_extensions` which
+needs `--features code-mode`. One extra, `tool_dispatch_records_gen_ai_span_attributes`,
+fails only under parallelism and passes single-threaded and in isolation: an
+upstream test-isolation issue in `agent.rs`, a file the fork does not touch.
+
+**Unexplained, watch for it:** the first live ACP round-trip after the bump
+returned `-32603 Internal error` from `session/fork`. Eleven subsequent runs
+passed, including immediately after a restart, and the server log from that run
+was overwritten before it could be read. Not reproduced, not explained.
+
+## Part 1 — goose fork (Rust) feature status after the sync
+
+### ✅ Now provided by upstream — NOT ported (would duplicate/regress)
+
+- **§5 Custom Anthropic provider-config header.** `from_declarative_config`
+  applies `config.headers` to the `ApiClient` via `with_headers`
+  (`goose-providers/src/anthropic.rs`). Declarative custom providers get their
+  headers for free.
+- **Recipe extensions for delegated subagents (fork commit `2d4f836f9`, dropped
+  2026-10-20).** Upstream's #12938 resolves a delegated recipe's own extensions through
+  `resolve_extensions_for_new_session` (`summon.rs`). The fork's merge of them onto the
+  parent's was removed; see the 2026-10-20 sync-log entry for the behaviour change.
+- **§7 `available_tools` filtering.** Upstream carries `available_tools` on the
+  extension config variants and filters via `ExtensionManager::filter_tools`
+  ("empty = all tools available" — identical semantics to the fork).
+- **§8 Reasoning-content accumulation (upstream issue #9675).** The agent reply
+  loop reuses thinking captured in an earlier stream chunk for tool-call-only
+  chunks (`surfaced_thinking_in_turn` / `response_thinking` in
+  `crates/goose/src/agents/agent.rs`).
+- **§11 Anthropic safety-refusal surfacing.** Upstream implements this **better**
+  than the fork did: on `stop_reason: "refusal"` it raises a typed
+  `ProviderError::Refusal { details, category }` and flushes usage
+  (`goose-provider-types/src/formats/anthropic.rs`). The fork's plain-text
+  message version was intentionally dropped.
+- **request_params plumbing.** `ModelConfig.request_params` +
+  `ModelConfig::with_merged_request_params` exist upstream, and the
+  `update_agent_provider` route already merges `request_params`. `custom_deepseek`
+  is already in `PROVIDERS_NEEDING_MAX_TOKENS_REMAP`.
+
+### ✅ Ported onto the new structure this sync
+
+- **§1–3 Dynamic per-session provider from an explicit API key + host.**
+  - `from_api_key(api_key, host_override)` added to
+    `crates/goose/src/providers/openai_def.rs` and `anthropic_def.rs` (built via
+    the new provider builders; `preserve_thinking_context` derived from whether
+    the resolved host is OpenAI's own API).
+  - `create_with_api_key(name, api_key, host)` in
+    `crates/goose/src/providers/init.rs`, exported via `providers/mod.rs`.
+  - `UpdateProviderRequest` gained `api_key` + `host`; `update_agent_provider`
+    (`crates/goose-server/src/routes/agent.rs`) branches to `create_with_api_key`
+    when `api_key` is present, else the normal `create`.
+  - **Dropped as obsolete:** the fork's `Agent::ensure_session_provider` /
+    `session_providers` map + auto-reading `websocket_headers` for provider
+    selection. Upstream now runs **one Agent per session**
+    (`agent_manager.get_or_create_agent`), so per-session isolation comes from
+    per-session Agents + `update_provider` — a shared-agent provider map is no
+    longer needed and would fight that model.
+- **§4 Dynamic header injection into MCP tool calls.**
+  - `allowed_headers: Vec<String>` field added to the `StreamableHttp` extension
+    config variant (since 2026-11-18 in the GDK crate,
+    `crates/goose-agent/src/extension.rs`; before that `crates/goose/src/agents/extension.rs`)
+    + accessor `allowed_headers()` there and on goose's `ExtensionConfig` wrapper
+    (`agents/extension_config.rs`), threaded through `resolve()` and the ACP/recipe adapters.
+  - `DynamicHeaderClient` (in `crates/goose/src/agents/extension_manager.rs`)
+    wraps the reqwest client, implements `rmcp`'s `StreamableHttpClient`, and on
+    every request injects the session's `websocket_headers.v0` entries whose
+    names appear in `allowed_headers` (case-insensitive). Header **values** are
+    read fresh per request (tokens rotate).
+  - Wired in `create_streamable_http_client` (gained `allowed_headers` +
+    `session_id` params); each MCP client serves exactly one session (enforced by
+    `GooseClient::set_session_id`'s assert), so headers cannot leak across tenants.
+  - Added `sse-stream` (0.2) as a direct dep of `goose` (needed to name
+    `sse_stream::Sse` in the trait impl).
+  - **Injection side (the source of `websocket_headers.v0`)** — required for §4 to
+    have anything to forward; ported alongside it:
+    - `StartAgentRequest.extension_data: Option<ExtensionData>` +
+      merge in `start_agent` (`crates/goose-server/src/routes/agent.rs`) — lands
+      the initial headers before background extension loading.
+    - `PUT /sessions/{session_id}/extension_data` (`update_extension_data` in
+      `crates/goose-server/src/routes/session.rs`) — CowGooseService's follow-up /
+      token-rotation path; merges keys into the session's `extension_data`.
+    - Read back via `ExtensionData::get_extension_state("websocket_headers","v0")`,
+      keyed `"websocket_headers.v0"`. `SessionManager::instance()` shares the
+      static `SESSION_STORAGE`, so the DynamicHeaderClient reads exactly what these
+      routes write.
+    - **This was missed in the first sync pass** (dropped with §1-3 Layer B),
+      which is why headers didn't forward on first test; restored 2026-07-05.
+  - **Verified end-to-end through CowGooseService on 2026-08-26** — see the
+    full-stack note below.
+- **§9 DeepSeek thinking-disable + v4 models.**
+  - `crates/goose-provider-types/src/formats/openai.rs`:
+    `thinking_disable_model_patterns()` (env `GOOSE_THINKING_DISABLE_MODELS`,
+    default `deepseek-v4`) defaults `thinking` to disabled for matching models on
+    the openai-compatible endpoint, unless `request_params` already set it.
+  - `crates/goose-provider-types/src/formats/anthropic.rs`: an explicit
+    `request_params["thinking"]` directive now takes precedence in
+    `apply_thinking_config` (for the Anthropic-compatible DeepSeek endpoint).
+  - `deepseek.json` gained `deepseek-v4-flash` / `deepseek-v4-pro`.
+  - The old declarative `default_request_params` config field was **not**
+    re-introduced — the env-based `thinking_disable_model_patterns` supersedes it.
+- **§6 (partial) Anthropic `metadata.user_id`.** Attributes Anthropic requests to
+  the ComplianceCow user. Because the provider now lives in `goose-providers`
+  (no `SessionManager` access) and `stream` has no `session_id`, this is split:
+  - `crates/goose-providers/src/anthropic.rs` — `stream` copies
+    `model_config.request_params["metadata"]` into the request body.
+  - `crates/goose-server/src/routes/agent.rs` — `update_agent_provider`, for the
+    `anthropic` provider, reads the session's `websocket_headers.v0`
+    → `x-cow-security-context` → JSON `ID`, and merges
+    `{"metadata": {"user_id": ID}}` into `request_params` (persisted in the
+    session's model_config). Helper: `anthropic_user_metadata`.
+  - **Limitation vs the old fork:** the old code read the session fresh on every
+    `stream`; this captures `user_id` when `update_provider` is called (once per
+    session — which CowGooseService always does for `anthropic`). `user_id` is
+    stable per session, so this is equivalent in practice, but a session that
+    never calls `update_provider` won't get the metadata.
+  - **Was missed in the first sync pass** (dropped with the rest of §6);
+    restored 2026-07-06.
+- **§6 (partial) Configurable Anthropic prompt caching.** Upstream inserts
+  `cache_control: {type: ephemeral}` on the system prompt, the last tool spec, and
+  message breakpoints **unconditionally**. DeepSeek's Anthropic-compatible endpoint
+  can reject `cache_control`, so the fork gated it by env:
+  - `crates/goose-provider-types/src/formats/anthropic.rs` — `cache_control_disabled()`
+    (`ANTHROPIC_DISABLE_CACHE`) skips all three insertions; `ephemeral_cache_control()`
+    honors `ANTHROPIC_CACHE_TTL`.
+  - **Was missed in the first sync pass** (part of §6); restored 2026-07-06.
+  - No env-mutating unit test added — it would race the parallel `cache_control`
+    presence tests; verified by compile + the existing suite (caching on by default).
+- **§10 Recipe instruction injection.** `start_agent`
+  (`crates/goose-server/src/routes/agent.rs`) now applies the recipe to the agent
+  (`apply_recipe_to_agent` → `extend_system_prompt("recipe", …)`), matching the
+  idiom upstream already uses in `resume_agent`/`update_from_session`/`restart`.
+  (Upstream applied recipes on those paths but not on `start_agent`.)
+
+### Branding (moocp / ComplianceCow)
+
+- **Agent self-identity rebranded** goose → **moocp**, AAIF → **ComplianceCow**, in the
+  system prompts: `crates/goose/src/prompts/system.md`,
+  `subagent_system.md`, `tiny_model_system.md`. This is the only user-facing
+  branding surface for a headless goose-server + custom-UI deployment (the API
+  returns no goose branding of its own). **Re-check these three files after each
+  upstream sync** — upstream edits them and a rebase will reintroduce "goose".
+- Deliberately NOT changed: the `GOOSE_*` env prefix, `~/.config/goose` config dir,
+  and the `goosed` binary name (internal only; users see just our UI). Set
+  `GOOSE_DISABLE_TELEMETRY=1` in deployment. Desktop/Electron branding (distros
+  guide §D) is N/A — we ship goose-server + our own UI (§E).
+
+### §12 Subagent (summon) multi-tenancy — ported 2026-07-13, re-ported 2026-10-09, adapted 2026-10-15
+
+From Surendhar's commits `49eeb4d9`, `d7cf62a6`, `7252e54e` (written on the
+pre-ACP base `0764f508c`, forward-ported onto post-ACP upstream).
+
+**Re-ported onto 1.54.0's design (2026-10-09).** Upstream deleted background
+subagents and rebuilt `delegate` as a foreground child that runs from its saved
+session record; the child's provider is no longer built in `summon.rs` but later,
+by `ProviderManager`. The old code could not be merged, so the behaviour was
+re-applied by hand — same three guarantees, new homes:
+
+**Adapted to 1.55.0 (2026-10-15).** Upstream's #12802 renamed the entry point to
+`create_subagent`, made the child take the parent's `goose_mode`, and turned the result
+marker into `DELEGATED_META_KEY`. The tenancy guarantees above are unchanged; see the
+2026-10-15 sync-log entry for the one conflict this caused.
+
+- **Subagent inherits tenant context.** `create_subagent` (named
+  `handle_foreground_delegate` until 2026-10-15; `agents/platform_extensions/summon.rs`) merges the parent's `cow_tenant.v0` +
+  `websocket_headers.v0` (`INHERITED_SUBAGENT_EXTENSION_STATES`) into the child's
+  extension data, in the same update that saves its extension selection (that
+  update *replaces*, so inheriting afterwards would be lost), and copies the
+  in-memory credentials across (§14). **Without this, §4 is broken for subagents.**
+- **Subagent uses the tenant's API key.** `ProviderManager::provider_for`
+  (`agents/provider_manager.rs`) calls `tenant_credentials()` — `x-api-key` plus
+  `x-openai-host`/`x-anthropic-host`/`x-host` — and builds the provider with
+  `create_with_api_key` (§1-3) **before** the shared global-config path. The order
+  matters: for ordinary providers the shared path is what an empty slot falls into,
+  so a subagent on `anthropic` would otherwise silently run on the deployment's own
+  key. Errors propagate deliberately.
+- **A key is used only for the provider it was issued for.** New in the re-port.
+  `delegate` can override `provider` by name; the old code would then have sent,
+  say, an Anthropic key to OpenAI. `x-provider-name` must match (the platform's
+  `gemini` counts as goose's `google`), otherwise the build fails.
+- **Subagent session resume — now upstream's.** The fork's `subagent_session_id` /
+  `GOOSE_SUBAGENT_RESUME` (default off) was dropped on 2026-11-18: upstream's #13015 and
+  #13106 added `delegate`'s `resume` parameter, on by default, with the same ownership
+  rule (`parent_session_id` must be the calling session; tested upstream). The ids are
+  still in the text ("Delegated to subagent <id>") and in the tool-result meta next to
+  `DELEGATED_META_KEY`. Behaviour change for ComplianceCow: the parameter is `resume`
+  and there is no env gate.
+- **Session naming:** skip generation when a session has no user messages.
+- **`GOOSE_LOG_CONSOLE`** enables CLI console logging (`goose-cli/src/logging.rs`).
+
+**Deliberately NOT ported** from those commits:
+- `reply_parts.rs` `tracing::info!("Sending LLM Payload: …")` — logs the full system
+  prompt and every message at info level. Unacceptable for a multi-tenant GRC
+  deployment (writes tenant conversation content to logs) and contrary to the
+  repo's logging guidance. Use `GOOSE_LOG_CONSOLE` + debug-level tracing instead.
+- Removal of the recipe-title session-naming branch — a product decision, not a bug
+  fix; upstream asserts that behavior in
+  `test_maybe_update_name_uses_recipe_title_for_recipe_session`. Raise it if
+  ComplianceCow wants LLM-generated names for recipe sessions.
+
+### §14 Session credentials held out of the database — added 2026-09-20
+
+`websocket_headers.v0` carries three tenant credentials: the LLM provider key
+(`x-api-key`), the platform auth token (`authorization`), and
+`x-cow-security-context`, which embeds another token. Those were serialized into
+`sessions.extension_data` — a plain `TEXT` column — so a stolen `sessions.db`, a
+PVC snapshot or a backup yielded live credentials. They also travelled with
+session export, session copy, and the ACP session-info response.
+
+- **Process-local store.** `session/session_secrets.rs` keys credentials by
+  session id and never serializes them. `split_secret_headers` pulls them out in
+  `on_set_session_extension_data` before the rest is persisted.
+- **Reads merge.** `merged_headers(session_id, extension_data)` layers the
+  in-memory credentials over the persisted headers. The three consumers —
+  `DynamicHeaderClient` (§4), `tenant_credentials` (§12, `provider_manager.rs`) and
+  `anthropic_user_metadata` (§6) — go through it, so their behaviour is unchanged.
+- **Subagents.** `session_secrets::copy` runs in `create_subagent` (and
+  again on resume, to pick up rotated tokens): `INHERITED_SUBAGENT_EXTENSION_STATES`
+  copies header *names*, so without this the subagent inherits an empty key and
+  silently falls back to global credentials.
+- **Export redacts.** `session_secrets::redact` strips credentials from rows
+  written before this change, which export otherwise hands out verbatim.
+- **Cleanup.** `delete_session` drops the session's entry.
+
+**The key already came from the vault** — `resolveProvider` on the Go side has
+always fetched it. The defect was that goose then wrote it to disk. The host
+re-pushes headers on every (re)connect (`connection_manager.go` — on resume, and
+on re-create after a goose restart), so the store repopulates from the vault
+rather than from disk.
+
+**Migration.** Rows written before this keep their credentials; `merged_headers`
+falls back to the persisted map so those sessions still work. Scrubbing them is
+not done — the fallback must stay until it is.
+
+⚠️ **The store is keyed by session id, which `create_session` allocates as
+`YYYYMMDD_N` counting up within one database.** That is unique for a server, which
+opens one database, but *not* across two `SessionManager`s. Anything that builds a
+second one — tests, tooling — must `session_secrets::remove` what it stores, or it
+hands those credentials to the next session that lands on the same id.
+
+⚠️ **Provider restore still ignores the session key.** It reads `GOOGLE_API_KEY`
+etc. from global config and never consulted the tenant key — before this change or
+after. Pre-existing, but it matters more now that nothing repopulates from disk.
+Open decision: fail loudly, or use the session's key.
+
+### §15 Re-applying a recipe to an existing session — added 2026-09-20
+
+goose applies a recipe only at `session/new`, via `_meta.recipeId`. A chat created
+before the platform wired recipes in carries none of the recipe's extensions, so
+resuming one leaves the model with no ComplianceCow tools. goose logs
+*"No extensions found in session … This is unexpected."* and the chat reads as
+broken for reasons the user cannot see.
+
+- **`_goose/unstable/session/recipe/apply`** (`ApplySessionRecipeRequest`,
+  `on_apply_session_recipe`) applies a recipe to an existing session, reusing
+  `build_enabled_extensions_data`.
+- **`load_recipe_by_id`** shares `resolve_recipe_path_by_id` with `session/new`, so
+  a recipe id resolves to the same file whether applied at creation or later.
+- **CowGooseService** calls it on every resume
+  (`bridge/acp_wiring.go` — `applyRecipeToResumedSession`).
+
+**Why not translate extensions on the Go side.** An extension has three shapes: the
+recipe DTO (`type: streamable_http`, `uri`), goose's internal `ExtensionConfig`
+(`StreamableHttp`), and the ACP wire type `GooseExtension` (`Mcp { server: McpServer }`).
+`session/extensions/add` takes the third and rejects the first. `McpServer` is an
+**untagged** enum owned by the external `agent-client-protocol` crate, so building
+it outside goose means tracking an upstream SDK's wire format. Keeping the
+conversion in goose is the point of this method.
+
+**It replaces, it does not merge.** The session ends up with the extension set
+`session/new` would have built — configured builtins plus the recipe's. An
+extension added by any other route is dropped. That is correct only where the
+recipe owns the session's extensions, which is the platform's case. Applying twice
+changes nothing, which is what makes it safe on every resume.
+
+### §16 Tool-call scoring and policy — added 2026-10-15 (`plugins/tool-scoring`)
+
+A goose hook plugin that scores every tool call and can refuse the dangerous ones.
+It changes no Rust: goose loads plugins from `$HOME/.agents/plugins`, so the feature
+is a directory.
+
+- **Hook.** `hooks/hooks.json` runs `scripts/score_step.py` (through
+  `uv run --no-project --no-python-downloads --python 3.12`) on `PreToolUse`,
+  `PostToolUse` and `PostToolUseFailure`. Timeout 5 s, `on_failure: allow`.
+- **Records.** One JSON line per phase in `$GOOSE_SCORE_DIR` (default
+  `~/.local/state/goose/tool-scores`), joined by `tool_call_id`. `scripts/show_scores.py`
+  reads them (`--follow`, `--min-risk`, `--blocked`). Secret-looking keys and values
+  in the arguments are redacted before anything is written or sent.
+- **Scorers** (`GOOSE_SCORER`). `rules` is the default: deterministic, no network.
+  `jev` asks TypeSafe's Jev (`POST $GOOSE_SCORER_URL/v1/systemone`) three questions —
+  risky, destructive, exfiltrates — and takes the highest probability as the risk.
+  A scorer with no key, no connection, or slower than `GOOSE_SCORER_TIMEOUT` (default
+  2 s) leaves the record with an `error` and no risk, and the call proceeds. Checked
+  2026-10-20: no key, a refused connection and a 20 s hang all exit 0 and allow; the
+  hang costs about 2 s per call.
+- **Policy** (`GOOSE_POLICY_MODE`). `shadow` is the default: it records
+  `policy.decision: block` for calls it would refuse and blocks nothing. `enforce`
+  answers `{"decision":"block","reason":...}`, and goose tells the model not to retry.
+  `off` skips the check. Rules live in `policy.json` (`tool`, `arg_pattern`,
+  `min_risk`, optional `allow_tools`). A `min_risk` rule does not match when there is
+  no score, so the deterministic rules still apply when Jev is down. In enforce mode a
+  policy that cannot be loaded blocks everything.
+- **Delivery.** Records can be POSTed to `GOOSE_SCORE_WEBHOOK` with the header
+  `X-Tool-Score-Token: $GOOSE_SCORE_WEBHOOK_TOKEN`. CowGooseService receives them
+  (Part 2 #7).
+- **Image.** Off unless built with `scripts/build-image.sh --with-tool-scoring`
+  (`ARG WITH_TOOL_SCORING=0` in `Dockerfile.server`), because each tool call then
+  spawns a short script.
+- **Local stack.** `scripts/tool-scoring-local/` runs goose, the bridge and a stand-in
+  model on one machine (`run_host.sh`, `run_bridge.sh`, `run_local.sh`, `mock_llm.py`,
+  `serve_scores.py`). `run_bridge.sh up --branch REF` builds a bridge branch in its own
+  worktree.
+- **Tests.** `python3 -m unittest discover -s plugins/tool-scoring/tests` (53).
+
+⚠️ **Enforcing is only as strong as the hook running.** If the hook cannot start
+(`uv` or Python 3.12 not on `PATH`), goose applies `on_failure`, which is `allow` as
+shipped. When enforcing, set `on_failure: block` on the `PreToolUse` hook.
+
+⚠️ **The policy rules are regexes over the arguments.** They catch accidents and
+obvious patterns, not someone trying to get around them. Shadow mode protects nothing.
+
+⚠️ **`PostToolUse` does not receive the tool's output** in goose 1.54 and 1.55, so a
+record holds the outcome (success or failure), not what the tool returned.
+
+⚠️ With `GOOSE_SCORER=jev` the redacted tool name and arguments leave the pod.
+
+⚠️ **Do not send the webhook token as `Authorization`.** The bridge's shared
+middleware treats any `Authorization` header as a user login token, which is why the
+hook uses `X-Tool-Score-Token`.
+
+### Operational tweaks (not in §1-11, found via identifier audit)
+
+- **Configurable SQLite pool size.** `crates/goose/src/session/session_manager.rs` —
+  `GOOSE_DB_MAX_CONNECTIONS` (default 50) on the session-store pool; upstream uses
+  sqlx's small default, which can exhaust under concurrent sessions.
+
+### Conscious architectural divergences (fork code deliberately NOT copied)
+
+- **`call_tool` `allowed_headers` threading.** The fork added an `allowed_headers`
+  parameter to `McpClientTrait::call_tool` and plumbed it through every impl
+  (`mcp_client.rs`, all `platform_extensions/*`, `acp/*`, `skills/client.rs`).
+  The sync instead attaches `allowed_headers` to the `DynamicHeaderClient` at
+  transport-creation time, so the signature change is unnecessary. The real
+  cow-mcp extension is a `StreamableHttp` extension routed through
+  `create_streamable_http_client` (where the client lives); platform/skills
+  clients never call cow-mcp, so they need no header forwarding.
+- **`ModelConfig.default_request_params` (declarative config field).** Replaced by
+  the env-based `GOOSE_THINKING_DISABLE_MODELS` mechanism (§9).
+
+### ❌ Intentionally not ported
+
+- **§6 (partial) — caching config + `create_session_with_id`.** Prompt caching
+  itself is upstream (`supports_cache_control` / `cache_control`). The fork's
+  `create_session_with_id` had **no caller** (dead code), and the per-request
+  `session_id` request tracking would require invasive changes to upstream's
+  shared `ApiClient` for telemetry only. Revisit only if a concrete need appears.
+  **Caveat:** the §6 commit (`1d2dec92f`) also bundled the Anthropic
+  `metadata.user_id` injection — see below; that part **was** needed and is ported.
+
+---
+
+## Part 2 — CowGooseService (Go) features
+
+Bridge architecture details: see `ARCHITECTURE.md` and `CLAUDE.md` in the
+CowGooseService repo. Unchanged by the goose sync — the Go side still drives
+per-session provider/model/key and `request_params` via the `update_provider`
+route (which the fork extended with `api_key`/`host` again).
+
+### 1. WebSocket ↔ SSE bridge (core)
+Browser WS ⇄ goose HTTP+SSE; multiplexes many goose sessions over one WS.
+- `bridge/connection_manager.go`, `bridge/session_worker.go`, `bridge/sse_ws_bridge.go`.
+
+### 2. Header forwarding
+Captures whitelisted WS-handshake headers and stores them in the goose session as
+`websocket_headers.v0` (consumed by goose §4 above). The credentials among them are
+no longer persisted goose-side (§14); they are re-pushed on every (re)connect.
+- `bridge/sse_ws_bridge.go` — `HeaderWhitelist`, `ExtractWhitelistedHeaders`.
+
+### 3. Per-session provider resolution
+Resolves provider/model/API-key per session; handshake headers first, then
+vault/prompty fallback. Sends them in the `update_provider` request body.
+- `main.go` — `resolveProvider`; `utils/llm_tools_vault.go`.
+
+### 4. Session attribution (allow-listed, §14)
+`cow_tenant.v0` records `email`, `username`, `org_id`, `group_id` and `role_name`
+alongside the ids it already held, so a session still says who ran it now that the
+security context is not persisted.
+- `bridge/sse_ws_bridge.go` — `attributionFields`, `ExtractAttribution`,
+  `BuildTenantState` (shared by the bridge and `headless/runner.go`).
+
+These five are an **allow-list, deliberately not a deny-list.** The header is a
+serialized `SecurityContext`, which embeds the whole `UserVO`: it carries
+`AuthToken` and a populated `hash` today, and `Token`, `AzureToken` and `OTP` are
+declared on the same struct. Naming what to drop means every field added upstream
+lands in the session database unnoticed — which is how the credentials got there.
+
+⚠️ `email` and `username` are PII, and `extension_data` travels with session export
+and copy.
+
+### 5. Recipe re-apply on resume (§15)
+`bridge/acp_wiring.go` — `applyRecipeToResumedSession`. Fails soft: a missing or
+unreadable recipe costs the tools, never the resume.
+
+### 6. DeepSeek thinking control (request_params injection)
+`utils/deepseek_thinking.go` — `BuildDeepSeekThinkingParams(model)` sets
+`{"thinking": {"type": "disabled"}}` (env `DEEPSEEK_THINKING_MODE`, default
+`disabled`). Threaded through `UpdateProviderRequest.RequestParams`.
+Note: goose now *also* defaults DeepSeek-v4 thinking off via
+`GOOSE_THINKING_DISABLE_MODELS` (§9), so the two are complementary defenses.
+
+### 7. Tool-call scores to the browser (§16)
+`bridge/tool_scores.go` — `/internal/tool-scores` takes the hook's records, accepts them
+only from loopback with the matching `X-Tool-Score-Token`, and sends a `tool_score`
+message (`score`: risk, label, reasons, scorer, and the policy verdict) to the session's
+WebSocket. The route exists only when `TOOL_SCORE_TOKEN` is set. The UI's handling of
+the new message type has not been checked.
+
+---
+
+## Relevant config / env reference
+| Where | Key | Purpose |
+|---|---|---|
+| goose `config.yaml` | `OPENAI_HOST=https://api.deepseek.com` | Routes `openai` provider to DeepSeek |
+| goose `config.yaml` | `ANTHROPIC_HOST=https://api.deepseek.com/anthropic` | DeepSeek's Anthropic-compatible endpoint |
+| goose `config.yaml` | `GOOSE_MODEL=deepseek-v4-pro[1m]` | Default model |
+| goose env | `GOOSE_THINKING_DISABLE_MODELS` | Comma-sep model substrings to default `thinking:disabled` (default `deepseek-v4`) |
+| goose env | `ANTHROPIC_DISABLE_CACHE` | Set to skip `cache_control` on Anthropic requests (needed for DeepSeek's Anthropic endpoint) |
+| goose env | `ANTHROPIC_CACHE_TTL` | Optional TTL applied to Anthropic `cache_control` blocks |
+| goose env | `GOOSE_DB_MAX_CONNECTIONS` | Session-store SQLite pool size (default 50; raise for high session concurrency) |
+| goose extension YAML | `allowed_headers` | Session headers forwarded to the MCP server (§4) |
+| goose env | `GOOSE_RECIPE_PATH` | Recipe search path; `session/recipe/apply` (§15) resolves ids against it |
+| CowGooseService env | `DEEPSEEK_THINKING_MODE` | `disabled` (default) / `enabled` / `passthrough` |
+| CowGooseService env | `DEEPSEEK_REASONING_EFFORT` | optional effort when enabled |
+| goose env | `GOOSE_SCORER`, `GOOSE_SCORER_API_KEY`, `GOOSE_SCORER_URL`, `GOOSE_SCORER_MODEL`, `GOOSE_SCORER_TIMEOUT` | Tool-call scorer (§16): `rules` by default; `jev` needs the key; timeout defaults to 2 s |
+| goose env | `GOOSE_POLICY_MODE`, `GOOSE_POLICY_FILE` | Policy (§16): `shadow` (default), `enforce` or `off`; rules default to `plugins/tool-scoring/policy.json` |
+| goose env | `GOOSE_SCORE_DIR`, `GOOSE_SCORE_WEBHOOK`, `GOOSE_SCORE_WEBHOOK_TOKEN` | Where score records go: a directory, and optionally a POST target with its token (§16) |
+| goose env | `GOOSE_MAX_TURNS` | Turn cap per prompt. goose's default is 1000; `Dockerfile.server` sets 25. A recipe's `settings.max_turns` is **ignored over ACP**, so this is the only limit. At the cap the agent ends with "I've reached the maximum number of actions…" and a new prompt restarts the count |
+| CowGooseService env | `TOOL_SCORE_TOKEN` | Enables `/internal/tool-scores` (Part 2 #7); the goose host posts with the same value as `GOOSE_SCORE_WEBHOOK_TOKEN` |
+
+## Verifying the fork features
+
+```bash
+# goose's default features are empty since 1.52.0, so the test targets need
+# upstream CI's feature set or they do not compile (on this machine the bare
+# feature-test command also hits a bad sqlx-macros link — see the 2026-10-03 entry):
+F=rustls-tls,code-mode,tree-sitter,live-voice,scheduler,platform-apps,chat-recall,acp-http
+cargo test -p goose --test compliancecow_features_test --no-default-features --features $F   # 11 tests
+# CI also sets RUST_MIN_STACK; without it a state_machine test overflows (1.53.0):
+export RUST_MIN_STACK=8388608
+cargo test -p goose --lib --no-default-features --features $F session_secrets   # 6 §14 tests
+cargo test -p goose --lib --no-default-features --features $F summon            # incl. 4 §12 tests
+```
+Both run **offline** — no API keys, no ports, no network — and use
+`GOOSE_PATH_ROOT` + tempdirs, so they never touch `~/.config/goose` or a real
+session database. Run them after every upstream sync; they are the executable
+half of the preservation gate in `.agents/workflows/sync-upstream.md`.
+
+| Feature | Covered by |
+|---|---|
+| §4 injection (`extension_data/set`, incl. merge on token rotation) | `set_session_extension_data_persists_and_merges_websocket_headers` |
+| §4 forwarding (allow-listed headers reach the MCP server; others never do) | `allow_listed_session_headers_are_forwarded_to_the_mcp_server` |
+| §4 forwarding for an extension registered **over ACP** (not config.yaml) | `extension_registered_over_acp_forwards_allow_listed_headers` |
+| §1-3 tenant api_key/host, §6 `metadata.user_id`, §9 `thinking` params | `update_session_provider_applies_tenant_key_request_params_and_user_id` |
+| §6 `ANTHROPIC_DISABLE_CACHE` | `anthropic_disable_cache_env_strips_cache_control` |
+| §9 deepseek-v4 thinking default | `deepseek_v4_defaults_to_thinking_disabled_on_openai_format` |
+| Branding (moocp/ComplianceCow prompts) | `agent_identity_is_rebranded_to_moocp` |
+| §12 parent tenant state and credentials reach the subagent; key never persisted | `subagent_session_inherits_only_parent_tenant_state` (`summon.rs`) |
+| §12 subagent runs on the tenant key, never the shared provider; never sent to another vendor | 4 tests in `provider_manager.rs` |
+| §12 resume reuses the child; refuses another session's subagent; off by default | 3 tests in `summon.rs` |
+
+Every one was **mutation-verified**: breaking the feature it covers makes it fail,
+so a green run is meaningful rather than vacuous.
+
+> **Follow-up:** adding `allowed_headers` to the ACP wire type changed
+> `crates/goose/acp-schema.json` (regenerated). The generated TypeScript SDK in
+> `ui/sdk/src/generated/` was **not** regenerated — `just generate-acp-types`
+> needs `npm install` in `ui/sdk` first. Harmless for us (our UI does not use
+> goose's TS SDK), but `just check-acp-schema` will fail until it is run.
+
+> **§4, §6, §9 and §1-3 verified end-to-end (2026-08-26)** against live goose +
+> cow-mcp with real tenant credentials:
+> - **§4** — with `websocket_headers.v0` planted the compliancecow tool returned
+>   386 rules (103KB); the same call with no headers returned 401. Controlled
+>   negative test, so the headers are demonstrably what made the difference.
+> - **§1-3 / §6 / §9** — after `session/provider/update`, the persisted session
+>   shows `provider_name=anthropic`, `request_params.thinking={"type":"disabled"}`
+>   (§9) and `request_params.metadata.user_id` populated from the security
+>   context's `ID` (§6).
+>
+> **Prerequisite:** the `compliancecow` extension in `config.yaml` needs
+> `allowed_headers: [Authorization, X-Cow-Security-Context]`. It had none, so §4
+> forwarded nothing and every call 401'd. **Production needs this too.**
+
+> **Full-stack run (2026-08-26)** — browser WS → CowGooseService (`COWGOOSE_USE_ACP=1`)
+> → ACP → `goose serve` → cow-mcp, with a live tenant security context:
+> - Recipe selection over ACP works: goose stored `recipe_json.title =
+>   "ComplianceCow Rules Specialist"` for session type `rules`.
+> - **§4** — `websocket_headers.v0` carried `authorization` +
+>   `x-cow-security-context`; tools returned 37,795 / 3,437 byte authorized
+>   payloads. Negative control with no headers: 401 from cow-mcp.
+> - **§12** — `cow_tenant.v0` written with `session_type` + `original_session_id`.
+> - Streaming to the browser: 391 `response`, 3 `tool_request`, 3 `tool_response`,
+>   1 `complete`.
+>
+> This run also exposed a CowGooseService bug (fixed there, not in goose): goose
+> sends `session/update.content` as an object on message chunks but as a **list**
+> on `tool_call_update`. The Go client modelled only the object form, so every
+> tool result failed to decode and was silently discarded — the browser saw tool
+> requests that never resolved. See `cowgooseservice/TRACK_B_ACP.md`.
+
+> **Non-OSC full-stack run (2026-08-26, after tunnelling cowlangservice + Postgres)**
+> — with `OSC_GOOSE=false` the whole provider-resolution chain ran: prompty config
+> returned `DeepSeek` / `deepseek-v4-pro`, the vault produced the per-session key,
+> and the bridge called `session/provider/update`. The persisted goose session shows
+> every remaining feature at once:
+> - **§1-3** — `provider_name = anthropic`, `model = deepseek-v4-pro` (DeepSeek→anthropic
+>   mapping), ephemeral vault key, never persisted as config.
+> - **§9** — `request_params.thinking = {"type": "disabled"}`.
+> - **§6** — `request_params.metadata.user_id` populated from the security context `ID`.
+> - **§12** — `cow_tenant.v0.domain_id` / `user_id` carry the real tenant ids.
+>
+> `cowauthservice` (:12300) was still unreachable, which turned out not to matter:
+> `cowcommonlibs/util.GetSecurityContextHeader` trusts `X-Cow-Security-Context`
+> directly when `Authorization` is absent, and `ExtractWhitelistedHeaders` recovers
+> the token from the context's `AuthToken` — so §4 still forwarded a working token.
+
+**Reading the session store:** goose writes `sessions.db` through SQLite **WAL**.
+Copying the `.db` file alone misses recent sessions — open it read-only with
+`file:<path>/sessions.db?mode=ro` instead.
+
+## Running locally (post-ACP: there is no more `goosed`)
+
+```bash
+source bin/activate-hermit
+export SSL_CERT_FILE=$(python3 -m certifi)   # REQUIRED, see gotcha below
+cargo build -p goose-cli                      # produces target/debug/goose
+
+# ACP server (replaces the deleted goose-server REST API)
+GOOSE_SERVER__SECRET_KEY=test ./target/debug/goose serve --host 127.0.0.1 --port 3284
+# or: just run-server   (same thing on port 3000)
+
+# interactive CLI instead of the server
+./target/debug/goose session
+```
+
+Verify it is up:
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3284/health          # 200
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3284/acp             # 401 (auth enforced)
+curl -s -o /dev/null -w '%{http_code}\n' -H 'x-secret-key: test' .../acp        # 406 (auth OK; needs WS upgrade)
+```
+ACP is JSON-RPC 2.0 over the **WebSocket at `/acp`**, authenticated with
+**`x-secret-key`** — exactly what CowGooseService's `ACPConn` speaks.
+
+### ⚠️ Build gotcha: `could not find native static library rusty_v8`
+`goose` depends on v8 (via `pctx_code_mode` → `deno_core`). Its build script
+downloads a 32 MB prebuilt `librusty_v8` from GitHub using **Python**, which on
+macOS fails with `CERTIFICATE_VERIFY_FAILED` (no CA certs) — so the build fails
+and, worse, **`goose-cli` silently never compiles**, which hides real errors from
+`cargo check --all-targets`. Fix:
+```bash
+export SSL_CERT_FILE=$(python3 -m certifi)   # or run "/Applications/Python 3.12/Install Certificates.command"
+cargo clean -p v8-goose -p v8 && cargo build -p goose-cli
+```
+(the `cargo clean` is needed once — `SSL_CERT_FILE` is not in the build script's
+`rerun-if-env-changed`, so a cached failure would otherwise persist).
+**Always build `-p goose-cli` before trusting a green check.**
+
+## Build / verify
+- **goose:** `source bin/activate-hermit && cargo build && cargo clippy --all-targets -- -D warnings && cargo fmt`
+- After goose server-route changes: `just generate-openapi` (the sync added
+  `api_key`/`host` to `UpdateProviderRequest`).
+- **CowGooseService:** `/usr/local/go/bin/go build ./... && /usr/local/go/bin/go vet ./...`

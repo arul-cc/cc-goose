@@ -46,6 +46,30 @@ impl AcpConnection {
         self.on_remove_session_extension(req).await
     }
 
+    #[custom_method(UpdateSessionProviderRequest)]
+    async fn dispatch_update_session_provider(
+        &self,
+        req: UpdateSessionProviderRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.on_update_session_provider(req).await
+    }
+
+    #[custom_method(ApplySessionRecipeRequest)]
+    async fn dispatch_apply_session_recipe(
+        &self,
+        req: ApplySessionRecipeRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.on_apply_session_recipe(req).await
+    }
+
+    #[custom_method(SetSessionExtensionDataRequest)]
+    async fn dispatch_set_session_extension_data(
+        &self,
+        req: SetSessionExtensionDataRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.on_set_session_extension_data(req).await
+    }
+
     #[custom_method(GetToolsRequest)]
     async fn dispatch_get_tools(
         &self,

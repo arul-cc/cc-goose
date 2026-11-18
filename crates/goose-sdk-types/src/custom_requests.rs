@@ -38,6 +38,25 @@ pub struct AddSessionExtensionRequest {
     pub extension: GooseExtension,
 }
 
+/// ComplianceCow: attach a recipe's extensions to an existing session.
+///
+/// goose applies a recipe only at `session/new`. Sessions created before the
+/// platform wired recipes in therefore carry none of the recipe's extensions,
+/// and resuming one leaves the model without its tools for reasons invisible to
+/// the user.
+///
+/// This leaves the session with exactly the extension set `session/new` would
+/// have given it: the configured builtins plus the recipe's own. That is a
+/// replacement, not a merge — an extension added to the session by any other
+/// route is dropped. Applying twice changes nothing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/session/recipe/apply", response = EmptyResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplySessionRecipeRequest {
+    pub session_id: String,
+    pub recipe_id: String,
+}
+
 /// Remove an extension from an active session.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(method = "_goose/unstable/session/extensions/remove", response = EmptyResponse)]
@@ -45,6 +64,38 @@ pub struct AddSessionExtensionRequest {
 pub struct RemoveSessionExtensionRequest {
     pub session_id: String,
     pub extension_key: String,
+}
+
+/// ComplianceCow: switch an active session's LLM provider using an explicit,
+/// ephemeral API key (multi-tenant — the key is never persisted to global
+/// config). `host` optionally routes to an alternate base URL (e.g. DeepSeek).
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/session/provider/update", response = EmptyResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSessionProviderRequest {
+    pub session_id: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_params: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// ComplianceCow: merge raw key/value entries into an active session's
+/// `extension_data` (e.g. `websocket_headers.v0`), the source the
+/// DynamicHeaderClient reads when forwarding allow-listed headers to MCP servers.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/session/extension_data/set", response = EmptyResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionExtensionDataRequest {
+    pub session_id: String,
+    pub extension_data: HashMap<String, serde_json::Value>,
 }
 
 /// List all tools available in a session.
@@ -533,6 +584,11 @@ pub enum GooseExtension {
         /// Tool allowlist for this extension. Omit this field to allow all tools.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_tools: Option<Vec<String>>,
+        /// Session `websocket_headers.v0` entries with these names
+        /// (case-insensitive) are forwarded as HTTP headers on every request to
+        /// this MCP server. Omit or leave empty to forward nothing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allowed_headers: Vec<String>,
     },
 }
 

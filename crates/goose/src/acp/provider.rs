@@ -4211,6 +4211,7 @@ mod tests {
             scopes: vec![],
             bundled: Some(false),
             available_tools: vec![],
+            allowed_headers: vec![],
         }),
         vec![
             McpServer::Http(
@@ -4258,6 +4259,7 @@ mod tests {
                 scopes: vec![],
                 bundled: Some(false),
                 available_tools: vec![],
+                allowed_headers: vec![],
             });
         let ordinary_http =
             ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
@@ -4274,6 +4276,7 @@ mod tests {
                 scopes: vec![],
                 bundled: Some(false),
                 available_tools: vec![],
+                allowed_headers: vec![],
             });
 
         let result = extension_configs_to_mcp_servers(&[socket_backed, ordinary_http]);
@@ -4308,6 +4311,7 @@ mod tests {
                 scopes: vec![],
                 bundled: Some(false),
                 available_tools: vec![],
+                allowed_headers: vec![],
             });
 
         let servers = extension_configs_to_mcp_servers(&[config]);

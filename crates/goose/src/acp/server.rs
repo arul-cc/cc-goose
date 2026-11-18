@@ -551,6 +551,7 @@ fn mcp_server_to_extension_config(mcp_server: McpServer) -> Result<ExtensionConf
                     scopes: vec![],
                     bundled: Some(false),
                     available_tools: vec![],
+                    allowed_headers: vec![],
                 },
             ))
         }
@@ -2581,6 +2582,95 @@ impl AcpConnection {
         Ok(())
     }
 
+    /// ComplianceCow custom method: switch a session's provider using an
+    /// explicit ephemeral API key (multi-tenant), falling back to the global
+    /// config path when no key is supplied. For the `anthropic` provider it also
+    /// attaches `metadata.user_id` derived from the session's security context.
+    async fn on_update_session_provider(
+        &self,
+        req: UpdateSessionProviderRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.open_session(&req.session_id).await?;
+        let current_model_config = self
+            .services
+            .model_config_for_session(&req.session_id)
+            .await
+            .internal_err_ctx("Failed to resolve model config")?;
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| current_model_config.model_name.clone());
+
+        let mut request_params = req.request_params.clone();
+        if req.provider == "anthropic" {
+            if let Some(metadata) = self.anthropic_user_metadata(&req.session_id).await {
+                let mut params = request_params.unwrap_or_default();
+                params.insert("metadata".to_string(), metadata);
+                request_params = Some(params);
+            }
+        }
+
+        let model_config =
+            crate::model_config::model_config_from_user_config_with_session_settings(
+                &req.provider,
+                &model,
+                Some(&current_model_config),
+                request_params,
+                req.context_limit,
+            )
+            .invalid_params_err_ctx("Invalid model config")?;
+
+        if let Some(api_key) = req.api_key.as_deref() {
+            let provider =
+                crate::providers::create_with_api_key(&req.provider, api_key, req.host.as_deref())
+                    .invalid_params_err_ctx("Failed to create provider with api_key")?;
+            self.services
+                .update_provider(provider, model_config, &req.session_id)
+                .await
+                .internal_err_ctx("Failed to update provider")?;
+        } else {
+            self.services.providers.release(&req.session_id);
+            self.services
+                .switch_provider(&req.session_id, &req.provider, model_config)
+                .await
+                .internal_err_ctx("Failed to switch provider")?;
+        }
+
+        Ok(EmptyResponse {})
+    }
+
+    /// Build Anthropic request `metadata` for a session from its forwarded
+    /// security context: reads `x-cow-security-context` out of
+    /// `websocket_headers.v0`, parses its JSON, and uses the `ID` field as
+    /// `user_id`. Returns None when the header or field is absent.
+    async fn anthropic_user_metadata(&self, session_id: &str) -> Option<serde_json::Value> {
+        let session = self
+            .services
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .ok()?;
+        let websocket_headers =
+            crate::session::session_secrets::merged_headers(session_id, &session.extension_data)?;
+
+        let user_id = websocket_headers.iter().find_map(|(key, value)| {
+            if key.eq_ignore_ascii_case("x-cow-security-context") {
+                value.as_str().and_then(|s| {
+                    serde_json::from_str::<serde_json::Value>(s)
+                        .ok()
+                        .and_then(|json| {
+                            json.get("ID")
+                                .and_then(|id| id.as_str().map(str::to_string))
+                        })
+                })
+            } else {
+                None
+            }
+        })?;
+
+        Some(serde_json::json!({ "user_id": user_id }))
+    }
+
     async fn on_fork_session(
         &self,
         cx: &ConnectionTo<Client>,
@@ -3179,6 +3269,7 @@ extensions:
             scopes: vec![],
             bundled: Some(false),
             available_tools: vec![],
+            allowed_headers: vec![],
         }))
     )]
     #[test_case(

@@ -262,6 +262,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }),
         ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -286,6 +287,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         })
         ; "header_substitution"
     )]
@@ -367,6 +369,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }),
         ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -388,6 +391,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         })
         ; "http_env_key_and_header_substitution"
     )]
@@ -406,6 +410,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }),
         ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -425,6 +430,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         })
         ; "http_env_key_uri_substitution"
     )]
@@ -478,6 +484,7 @@ timeout: 300",
             scopes: vec!["scope.read".into()],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }),
         ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -497,6 +504,7 @@ timeout: 300",
             scopes: vec!["scope.read".into()],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         })
         ; "http_client_id_substitution_and_oauth_fields_preserved"
     )]
@@ -515,6 +523,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         }),
         ExtensionConfig::External(goose_agent::extension::ExtensionConfig::StreamableHttp {
             name: "test".into(),
@@ -534,6 +543,7 @@ timeout: 300",
             scopes: vec![],
             bundled: None,
             available_tools: vec![],
+            allowed_headers: vec![],
         })
         ; "http_client_secret_key_resolved_without_env_keys_entry"
     )]
@@ -601,6 +611,7 @@ timeout: 300",
                 scopes: vec![],
                 bundled: None,
                 available_tools: vec![],
+                allowed_headers: vec![],
             });
         assert_eq!(
             config.to_string(),
@@ -625,6 +636,7 @@ timeout: 300",
                 scopes: vec![],
                 bundled: None,
                 available_tools: vec![],
+                allowed_headers: vec![],
             });
         assert_eq!(
             config.to_string(),

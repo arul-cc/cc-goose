@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{HeaderMap, HeaderName};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolResult, ErrorCode, ErrorData, GetPromptResult, ProtocolVersion, ServerConfig,
     ServerNotification,
@@ -286,6 +286,145 @@ async fn connect_with_auth(
     .await?)
 }
 
+/// Filter a session's `websocket_headers` map down to the allow-listed names
+/// (case-insensitive) and convert them to HTTP header pairs. Non-string values
+/// and names/values that aren't valid HTTP headers are skipped. An empty
+/// allow-list forwards nothing.
+fn filter_allowed_headers(
+    headers_obj: &serde_json::Map<String, serde_json::Value>,
+    allowed_headers: &[String],
+) -> HashMap<HeaderName, HeaderValue> {
+    let mut result = HashMap::new();
+    if allowed_headers.is_empty() {
+        return result;
+    }
+    let allowed_lower: Vec<String> = allowed_headers.iter().map(|h| h.to_lowercase()).collect();
+    for (key, value) in headers_obj {
+        if !allowed_lower.contains(&key.to_lowercase()) {
+            continue;
+        }
+        if let Some(val_str) = value.as_str() {
+            if let (Ok(hname), Ok(hval)) = (
+                HeaderName::try_from(key.as_str()),
+                HeaderValue::from_str(val_str),
+            ) {
+                result.insert(hname, hval);
+            }
+        }
+    }
+    result
+}
+
+/// A `StreamableHttpClient` that forwards the current session's allow-listed
+/// `websocket_headers.v0` entries onto every MCP request.
+///
+/// Header *values* are read fresh per request because tenant tokens rotate.
+/// Each client serves exactly one session (enforced by
+/// `GooseClient::set_session_id`), so a session's headers can never leak to
+/// another tenant's requests.
+#[derive(Clone, Debug)]
+struct DynamicHeaderClient {
+    inner: reqwest::Client,
+    session_id: Arc<Mutex<Option<String>>>,
+    allowed_headers: Vec<String>,
+}
+
+impl DynamicHeaderClient {
+    fn new(inner: reqwest::Client, allowed_headers: Vec<String>) -> Self {
+        Self {
+            inner,
+            session_id: Arc::new(Mutex::new(None)),
+            allowed_headers,
+        }
+    }
+
+    async fn set_session_id(&self, sid: String) {
+        *self.session_id.lock().await = Some(sid);
+    }
+
+    async fn get_dynamic_headers(&self) -> HashMap<HeaderName, HeaderValue> {
+        if self.allowed_headers.is_empty() {
+            return HashMap::new();
+        }
+
+        let sid = match self.session_id.lock().await.clone() {
+            Some(s) => s,
+            None => return HashMap::new(),
+        };
+
+        let session = match crate::session::SessionManager::instance()
+            .get_session(&sid, false)
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+
+        match crate::session::session_secrets::merged_headers(&sid, &session.extension_data) {
+            Some(headers_obj) => filter_allowed_headers(&headers_obj, &self.allowed_headers),
+            None => HashMap::new(),
+        }
+    }
+
+    async fn merge_headers(&self, custom_headers: &mut HashMap<HeaderName, HeaderValue>) {
+        custom_headers.extend(self.get_dynamic_headers().await);
+    }
+}
+
+impl rmcp::transport::streamable_http_client::StreamableHttpClient for DynamicHeaderClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_token: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<
+        rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+        StreamableHttpError<Self::Error>,
+    > {
+        self.merge_headers(&mut custom_headers).await;
+        self.inner
+            .post_message(uri, message, session_id, auth_token, custom_headers)
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_token: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        self.merge_headers(&mut custom_headers).await;
+        self.inner
+            .delete_session(uri, session_id, auth_token, custom_headers)
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_token: Option<String>,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<sse_stream::Sse, rmcp::transport::streamable_http_client::SseError>,
+        >,
+        StreamableHttpError<Self::Error>,
+    > {
+        self.merge_headers(&mut custom_headers).await;
+        self.inner
+            .get_stream(uri, session_id, last_event_id, auth_token, custom_headers)
+            .await
+    }
+}
+
 /// Connection parameters needed to re-establish an authorized streamable HTTP
 /// client after a post-initialization auth challenge (401/403).
 #[derive(Clone)]
@@ -294,6 +433,10 @@ pub(super) struct ConnectParams {
     pub(super) name: String,
     pub(super) headers: HashMap<String, String>,
     pub(super) static_oauth_client: Option<StaticOAuthClientConfig>,
+    /// §4: names this extension may receive from the session's
+    /// `websocket_headers`. Empty forwards nothing.
+    pub(super) allowed_headers: Vec<String>,
+    pub(super) session_id: Option<String>,
     pub(super) ctx: ConnectContext,
 }
 
@@ -573,9 +716,19 @@ pub(super) async fn connect(
         name,
         headers,
         static_oauth_client,
+        allowed_headers,
+        session_id,
         ctx,
     } = &params;
-    let http_client = http_client(headers, ctx.timeout)?;
+    // §4: wrap the HTTP client so allow-listed session headers are forwarded on
+    // every request. With no `allowed_headers` configured this is a transparent
+    // passthrough. Only the unauthenticated path is wrapped — the OAuth paths
+    // carry their own credentials and take static headers from `header_map`.
+    let http_client =
+        DynamicHeaderClient::new(http_client(headers, ctx.timeout)?, allowed_headers.clone());
+    if let Some(sid) = session_id {
+        http_client.set_session_id(sid.clone()).await;
+    }
 
     // If we have stored OAuth credentials, try refreshing and connecting directly.
     // This avoids the unnecessary 401 → browser re-auth cycle on every new session.
@@ -713,6 +866,8 @@ mod tests {
             name: "test-ext".to_string(),
             headers,
             static_oauth_client: None,
+            allowed_headers: Vec::new(),
+            session_id: None,
             ctx: test_ctx(working_dir),
         }
     }
@@ -1140,5 +1295,65 @@ mod tests {
 
             assert!(error.to_string().contains("MISSING_KEY"));
         }
+    }
+}
+
+#[cfg(test)]
+mod dynamic_header_tests {
+    use super::filter_allowed_headers;
+    use axum::http::{HeaderName, HeaderValue};
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn forwards_only_allow_listed_headers_case_insensitively() {
+        let headers = obj(json!({
+            "X-Api-Key": "secret",
+            "X-Tenant-Id": "acme",
+            "X-Not-Allowed": "nope",
+        }));
+        let allowed = vec!["x-api-key".to_string(), "X-TENANT-ID".to_string()];
+        let result = filter_allowed_headers(&headers, &allowed);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get(&HeaderName::from_static("x-api-key")),
+            Some(&HeaderValue::from_static("secret"))
+        );
+        assert_eq!(
+            result.get(&HeaderName::from_static("x-tenant-id")),
+            Some(&HeaderValue::from_static("acme"))
+        );
+        assert!(!result.contains_key(&HeaderName::from_static("x-not-allowed")));
+    }
+
+    #[test]
+    fn empty_allow_list_forwards_nothing() {
+        let headers = obj(json!({ "X-Api-Key": "secret" }));
+        assert!(filter_allowed_headers(&headers, &[]).is_empty());
+    }
+
+    #[test]
+    fn skips_non_string_and_invalid_values() {
+        let headers = obj(json!({
+            "X-Api-Key": 12345,
+            "X-Tenant-Id": "ok",
+            "X-Bad-Value": "line\nbreak",
+        }));
+        let allowed = vec![
+            "x-api-key".to_string(),
+            "x-tenant-id".to_string(),
+            "x-bad-value".to_string(),
+        ];
+        let result = filter_allowed_headers(&headers, &allowed);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.get(&HeaderName::from_static("x-tenant-id")),
+            Some(&HeaderValue::from_static("ok"))
+        );
     }
 }

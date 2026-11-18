@@ -102,6 +102,12 @@ impl ExtensionConfig {
     pub fn key(&self) -> String {
         name_to_key(&self.name())
     }
+    pub fn allowed_headers(&self) -> Vec<String> {
+        match self {
+            Self::External(config) => config.allowed_headers(),
+            Self::Builtin { .. } | Self::Platform { .. } => Vec::new(),
+        }
+    }
     pub fn is_tool_available(&self, name: &str) -> bool {
         match self {
             Self::External(config) => config.is_tool_available(name),
