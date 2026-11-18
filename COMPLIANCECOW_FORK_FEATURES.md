@@ -68,6 +68,8 @@ every conflict resolved once. History stays on `acp-migration` and
 - `acp-schema.json` / `acp-meta.json` regenerated.
 - Machine trap: cmake picks up the Intel `/usr/local/bin/ccache` ("Bad CPU type"); a
   pass-through `ccache` shim first on PATH fixes the `llama-cpp-sys-2` build.
+- **Verified:** `validate-compliancecow.py` 16 passed, 0 failed, 1 skipped (the §4 negative
+  control, as on 2026-10-20), and §12 live under the state-machine loop (see §12).
 
 ### 2026-10-20 — 26 upstream commits (1.55.0, no version bump), one trivial conflict
 
@@ -800,6 +802,16 @@ marker into `DELEGATED_META_KEY`. The tenancy guarantees above are unchanged; se
   still in the text ("Delegated to subagent <id>") and in the tool-result meta next to
   `DELEGATED_META_KEY`. Behaviour change for ComplianceCow: the parameter is `resume`
   and there is no env gate.
+- **Verified live under the state-machine loop (2026-11-18, goose 1.60.0).** A real
+  orchestrator chat delegated to two subagents (matcher, designer) through the bridge and
+  cow-mcp: both children held `cow_tenant.v0` + `websocket_headers.v0`; their 10 cow-mcp
+  calls all came back authorized (0 auth failures, so §4 reaches subagents); no secret-named
+  header and no token value was in any session row or message (§14); both ran on the
+  parent's provider and model. **Not isolated by this run:** the tenant-key-versus-deployment-key
+  distinction (locally the bridge supplies the key per session) is covered only by the unit
+  test `a_tenant_key_builds_its_own_provider_never_the_shared_one`, and upstream's `resume`
+  was not exercised live. The checks are in the sessions DB, readable with
+  `parent_session_id`; header values must never be printed.
 - **Session naming:** skip generation when a session has no user messages.
 - **`GOOSE_LOG_CONSOLE`** enables CLI console logging (`goose-cli/src/logging.rs`).
 
